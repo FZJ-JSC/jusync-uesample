@@ -1,0 +1,2362 @@
+#include "JUSYNCBlueprintLibrary.h"
+
+#include "JUSYNCModule.h"
+#include "JUSYNCSubsystem.h"
+#include "Engine/Engine.h"
+#include "Engine/Texture2D.h"
+#include "HAL/FileManager.h"
+#include "Kismet/GameplayStatics.h"
+#include "RealtimeMeshComponent.h"
+#include "Engine/GameInstance.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"  
+
+// Static member initialization
+TArray<FJUSYNCFileData> UJUSYNCBlueprintLibrary::ReceivedFiles;
+TArray<FString> UJUSYNCBlueprintLibrary::ReceivedMessages;
+FCriticalSection UJUSYNCBlueprintLibrary::DataMutex;
+
+TArray<FString> UJUSYNCBlueprintLibrary::LastFileList;
+FCriticalSection UJUSYNCBlueprintLibrary::LastFileListMutex;
+
+TArray<FString> UJUSYNCBlueprintLibrary::LastFileListWithSizes_Names;
+TArray<int64> UJUSYNCBlueprintLibrary::LastFileListWithSizes_Sizes;
+FCriticalSection UJUSYNCBlueprintLibrary::LastFileListWithSizesMutex;
+
+// ========== CONNECTION MANAGEMENT ==========
+
+bool UJUSYNCBlueprintLibrary::InitializeJUSYNCMiddleware(const FString& Endpoint)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return false;
+    }
+
+    bool bResult = Subsystem->InitializeMiddleware(Endpoint);
+    if (bResult)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC Middleware initialized successfully"));
+        //DisplayDebugMessage(TEXT("JUSYNC Middleware Connected"), 3.0f, FLinearColor::Green);
+    }
+    else
+    {
+        //DisplayDebugMessage(TEXT("JUSYNC Middleware Failed to Connect"), 5.0f, FLinearColor::Red);
+    }
+
+    return bResult;
+}
+
+void UJUSYNCBlueprintLibrary::ShutdownJUSYNCMiddleware()
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (Subsystem)
+    {
+        Subsystem->ShutdownMiddleware();
+        ClearReceivedData();
+        //DisplayDebugMessage(TEXT("JUSYNC Middleware Disconnected"), 3.0f, FLinearColor::Yellow);
+    }
+}
+
+bool UJUSYNCBlueprintLibrary::IsJUSYNCConnected()
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    return Subsystem ? Subsystem->IsMiddlewareConnected() : false;
+}
+
+FString UJUSYNCBlueprintLibrary::GetJUSYNCStatusInfo()
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        return TEXT("Subsystem not available");
+    }
+
+    FString Status = Subsystem->GetStatusInfo();
+
+    // Add reception statistics
+    FScopeLock Lock(&DataMutex);
+    Status += FString::Printf(TEXT("\nReceived Files: %d\nReceived Messages: %d"),
+                             ReceivedFiles.Num(), ReceivedMessages.Num());
+
+    return Status;
+}
+
+bool UJUSYNCBlueprintLibrary::StartJUSYNCReceiving()
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        return false;
+    }
+
+    bool bResult = Subsystem->StartReceiving();
+    if (bResult)
+    {
+        //DisplayDebugMessage(TEXT("JUSYNC Started Receiving Data"), 3.0f, FLinearColor::Blue);
+    }
+
+    return bResult;
+}
+
+void UJUSYNCBlueprintLibrary::StopJUSYNCReceiving()
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (Subsystem)
+    {
+        Subsystem->StopReceiving();
+        // Use FLinearColor constructor for Orange color
+        //DisplayDebugMessage(TEXT("JUSYNC Stopped Receiving Data"), 3.0f, FLinearColor(1.0f, 0.5f, 0.0f, 1.0f));
+    }
+}
+
+// ========== DEALER CLIENT FOR HPC BROKER ==========
+
+bool UJUSYNCBlueprintLibrary::ConnectToANARIUSDBroker(const FString& BrokerEndpoint, int32 TimeoutMs)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return false;
+    }
+
+    bool bResult = Subsystem->ConnectToBroker(BrokerEndpoint, TimeoutMs);
+    if (bResult)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("✅ Connected to ANARI USD broker at %s"), *BrokerEndpoint);
+        //DisplayDebugMessage(FString::Printf(TEXT("Connected to broker: %s"), *BrokerEndpoint), 3.0f, FLinearColor::Green);
+    }
+    else
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to connect to broker at %s"), *BrokerEndpoint);
+        //DisplayDebugMessage(FString::Printf(TEXT("Failed to connect to broker: %s"), *BrokerEndpoint), 5.0f, FLinearColor::Red);
+    }
+
+    return bResult;
+}
+
+void UJUSYNCBlueprintLibrary::DisconnectFromANARIUSDBroker()
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (Subsystem)
+    {
+        Subsystem->DisconnectFromBroker();
+        UE_LOG(LogJUSYNC, Log, TEXT("✅ Disconnected from ANARI USD broker"));
+        //DisplayDebugMessage(TEXT("Disconnected from broker"), 3.0f, FLinearColor::Yellow);
+    }
+}
+
+bool UJUSYNCBlueprintLibrary::IsANARIUSDBrokerConnected()
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    return Subsystem ? Subsystem->IsBrokerConnected() : false;
+}
+
+bool UJUSYNCBlueprintLibrary::RequestFileListFromBroker(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return false;
+    }
+
+    bool bResult = Subsystem->RequestFileList(TargetRank, TimeoutMs, OutFiles);
+    if (bResult)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("✅ Retrieved %d files from broker"), OutFiles.Num());
+        //DisplayDebugMessage(FString::Printf(TEXT("Retrieved %d files from broker"), OutFiles.Num()), 3.0f, FLinearColor::Green);
+        
+        // Store the retrieved file list for later retrieval
+        if (OutFiles.Num() > 0)
+        {
+            FScopeLock Lock(&LastFileListMutex);
+            LastFileList = OutFiles;
+            UE_LOG(LogJUSYNC, Log, TEXT("Stored %d files in LastFileList"), OutFiles.Num());
+        }
+    }
+    else
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to retrieve file list from broker"));
+        //DisplayDebugMessage(TEXT("Failed to retrieve file list from broker"), 5.0f, FLinearColor::Red);
+    }
+
+    return bResult;
+}
+
+bool UJUSYNCBlueprintLibrary::RequestFileListWithSizesFromBroker(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return false;
+    }
+
+    bool bResult = Subsystem->RequestFileListWithSizes(TargetRank, TimeoutMs, OutFiles, OutSizes);
+    if (bResult)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("✅ Retrieved %d files with sizes from broker"), OutFiles.Num());
+        // Optionally store the file list (without sizes) for later retrieval
+        if (OutFiles.Num() > 0)
+        {
+            FScopeLock Lock(&LastFileListMutex);
+            LastFileList = OutFiles;
+            UE_LOG(LogJUSYNC, Log, TEXT("Stored %d files in LastFileList"), OutFiles.Num());
+        }
+    }
+    else
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to retrieve file list with sizes from broker"));
+    }
+
+    return bResult;
+}
+
+bool UJUSYNCBlueprintLibrary::GetLastFileListFromBroker(TArray<FString>& OutFileList)
+{
+    FScopeLock Lock(&LastFileListMutex);
+    if (LastFileList.Num() == 0)
+    {
+        UE_LOG(LogJUSYNC, Warning, TEXT("No file list stored yet"));
+        return false;
+    }
+    OutFileList = LastFileList;
+    UE_LOG(LogJUSYNC, Log, TEXT("✅ Retrieved last file list (%d files)"), OutFileList.Num());
+    return true;
+}
+
+bool UJUSYNCBlueprintLibrary::GetLastFileListWithSizesFromBroker(TArray<FString>& OutFileList, TArray<int64>& OutFileSizes)
+{
+    FScopeLock Lock(&LastFileListWithSizesMutex);
+    if (LastFileListWithSizes_Names.Num() == 0)
+    {
+        UE_LOG(LogJUSYNC, Warning, TEXT("No file list with sizes stored yet"));
+        return false;
+    }
+    OutFileList = LastFileListWithSizes_Names;
+    OutFileSizes = LastFileListWithSizes_Sizes;
+    UE_LOG(LogJUSYNC, Log, TEXT("✅ Retrieved last file list with sizes (%d files)"), OutFileList.Num());
+    return true;
+}
+
+bool UJUSYNCBlueprintLibrary::RequestFileFromBroker(const FString& Filename, int32 TargetRank, int32 TimeoutMs, TArray<uint8>& OutData)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return false;
+    }
+
+    bool bResult = Subsystem->RequestFile(Filename, TargetRank, TimeoutMs, OutData);
+    if (bResult)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("✅ Retrieved file '%s' (%d bytes) from broker"), *Filename, OutData.Num());
+        //DisplayDebugMessage(FString::Printf(TEXT("Retrieved file: %s (%d bytes)"), *Filename, OutData.Num()), 3.0f, FLinearColor::Green);
+    }
+    else
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to retrieve file '%s' from broker"), *Filename);
+        //DisplayDebugMessage(FString::Printf(TEXT("Failed to retrieve file: %s"), *Filename), 5.0f, FLinearColor::Red);
+    }
+
+    return bResult;
+}
+
+bool UJUSYNCBlueprintLibrary::RequestFrameFromBroker(int32 FrameNumber, int32 TargetRank, int32 TimeoutMs, TArray<FJUSYNCFileData>& OutFiles)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return false;
+    }
+
+    bool bResult = Subsystem->RequestFrame(FrameNumber, TargetRank, TimeoutMs, OutFiles);
+    if (bResult)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("✅ Retrieved frame %d with %d files from broker"), FrameNumber, OutFiles.Num());
+        //DisplayDebugMessage(FString::Printf(TEXT("Retrieved frame %d with %d files"), FrameNumber, OutFiles.Num()), 3.0f, FLinearColor::Green);
+    }
+    else
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to retrieve frame %d from broker"), FrameNumber);
+        //DisplayDebugMessage(FString::Printf(TEXT("Failed to retrieve frame %d"), FrameNumber), 5.0f, FLinearColor::Red);
+    }
+
+    return bResult;
+}
+
+// ========== WORKER STATUS QUERIES ==========
+
+bool UJUSYNCBlueprintLibrary::RequestWorkerStatusFromBroker(int32 TargetRank, int32 TimeoutMs, TArray<FJUSYNCWorkerStatus>& OutWorkerStatus)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return false;
+    }
+
+    bool bResult = Subsystem->RequestWorkerStatus(TargetRank, TimeoutMs, OutWorkerStatus);
+    if (bResult)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("✅ Retrieved worker status for rank %d: %d workers"), TargetRank, OutWorkerStatus.Num());
+    }
+    else
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to retrieve worker status for rank %d"), TargetRank);
+    }
+
+    return bResult;
+}
+
+bool UJUSYNCBlueprintLibrary::RequestWorkerCountFromBroker(int32 TimeoutMs, int32& OutWorkerCount)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return false;
+    }
+
+    bool bResult = Subsystem->RequestWorkerCount(TimeoutMs, OutWorkerCount);
+    if (bResult)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("✅ Retrieved worker count: %d workers"), OutWorkerCount);
+    }
+    else
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to retrieve worker count"));
+    }
+
+    return bResult;
+}
+
+bool UJUSYNCBlueprintLibrary::RequestTotalWorkerCountFromBroker(int32 TimeoutMs, int32& OutTotalCount)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return false;
+    }
+
+    bool bResult = Subsystem->RequestTotalWorkerCount(TimeoutMs, OutTotalCount);
+    if (bResult)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("✅ Retrieved total worker count (including rank 0): %d"), OutTotalCount);
+    }
+    else
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to retrieve total worker count"));
+    }
+
+    return bResult;
+}
+
+bool UJUSYNCBlueprintLibrary::RequestWorkerCountExcludingRank0(int32 TimeoutMs, int32& OutWorkerCount)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return false;
+    }
+
+    bool bResult = Subsystem->RequestWorkerCountExcludingRank0(TimeoutMs, OutWorkerCount);
+    if (bResult)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("✅ Retrieved worker count (excluding rank 0): %d workers"), OutWorkerCount);
+    }
+    else
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to retrieve worker count"));
+    }
+
+    return bResult;
+}
+
+// ========== ASYNC WORKER QUERIES (NON-BLOCKING) ==========
+
+void UJUSYNCBlueprintLibrary::RequestTotalWorkerCountAsync(int32 TimeoutMs, const FOnTotalWorkerCountReceived& OnComplete, const FOnBrokerError& OnError)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        OnError.ExecuteIfBound(TEXT("Subsystem not available"));
+        return;
+    }
+
+    // Capture subsystem pointer for validity checking
+    TWeakObjectPtr<UJUSYNCSubsystem> WeakSubsystem = Subsystem;
+    
+    // Launch async request on a background thread using Unreal's Async system
+    Async(EAsyncExecution::Thread, [WeakSubsystem, TimeoutMs, OnComplete, OnError]()
+    {
+        // Check if subsystem is still valid before making the request
+        if (!WeakSubsystem.IsValid())
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Subsystem no longer valid, cancelling async request"));
+            return; // Game stopped, exit early
+        }
+        
+        int32 TotalCount = 0;
+        bool bSuccess = false;
+        
+        // Make the broker request
+        if (WeakSubsystem.IsValid())
+        {
+            bSuccess = WeakSubsystem->RequestTotalWorkerCount(TimeoutMs, TotalCount);
+        }
+        
+        // Check again before calling back (game might have stopped during request)
+        if (!WeakSubsystem.IsValid())
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Subsystem destroyed during async request, cancelling callback"));
+            return; // Game stopped, don't call callbacks
+        }
+        
+        // Execute callback on game thread
+        if (IsInGameThread())
+        {
+            if (bSuccess) OnComplete.ExecuteIfBound(TotalCount);
+            else OnError.ExecuteIfBound(TEXT("Failed to retrieve total worker count"));
+        }
+        else
+        {
+            // Schedule on game thread
+            FFunctionGraphTask::CreateAndDispatchWhenReady(
+                [bSuccess, TotalCount, OnComplete, OnError]()
+                {
+                    if (bSuccess) OnComplete.ExecuteIfBound(TotalCount);
+                    else OnError.ExecuteIfBound(TEXT("Failed to retrieve total worker count"));
+                },
+                TStatId(), nullptr, ENamedThreads::GameThread);
+        }
+    });
+}
+
+void UJUSYNCBlueprintLibrary::RequestWorkerCountAsync(int32 TimeoutMs, const FOnWorkerCountReceived& OnComplete, const FOnBrokerError& OnError)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        OnError.ExecuteIfBound(TEXT("Subsystem not available"));
+        return;
+    }
+
+    // Capture subsystem pointer for validity checking
+    TWeakObjectPtr<UJUSYNCSubsystem> WeakSubsystem = Subsystem;
+    
+    // Launch async request on a background thread using Unreal's Async system
+    Async(EAsyncExecution::Thread, [WeakSubsystem, TimeoutMs, OnComplete, OnError]()
+    {
+        // Check if subsystem is still valid before making the request
+        if (!WeakSubsystem.IsValid())
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Subsystem no longer valid, cancelling async request"));
+            return; // Game stopped, exit early
+        }
+        
+        int32 WorkerCount = 0;
+        bool bSuccess = false;
+        
+        // Make the broker request
+        if (WeakSubsystem.IsValid())
+        {
+            bSuccess = WeakSubsystem->RequestWorkerCount(TimeoutMs, WorkerCount);
+        }
+        
+        // Check again before calling back (game might have stopped during request)
+        if (!WeakSubsystem.IsValid())
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Subsystem destroyed during async request, cancelling callback"));
+            return; // Game stopped, don't call callbacks
+        }
+        
+        // Execute callback on game thread
+        if (IsInGameThread())
+        {
+            if (bSuccess) OnComplete.ExecuteIfBound(WorkerCount);
+            else OnError.ExecuteIfBound(TEXT("Failed to retrieve worker count"));
+        }
+        else
+        {
+            FFunctionGraphTask::CreateAndDispatchWhenReady(
+                [bSuccess, WorkerCount, OnComplete, OnError]()
+                {
+                    if (bSuccess) OnComplete.ExecuteIfBound(WorkerCount);
+                    else OnError.ExecuteIfBound(TEXT("Failed to retrieve worker count"));
+                },
+                TStatId(), nullptr, ENamedThreads::GameThread);
+        }
+    });
+}
+
+void UJUSYNCBlueprintLibrary::RequestWorkerStatusAsync(int32 TargetRank, int32 TimeoutMs, const FOnWorkerStatusReceived& OnComplete, const FOnBrokerError& OnError)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        OnError.ExecuteIfBound(TEXT("Subsystem not available"));
+        return;
+    }
+
+    // Capture subsystem pointer for validity checking
+    TWeakObjectPtr<UJUSYNCSubsystem> WeakSubsystem = Subsystem;
+    
+    // Launch async request on a background thread using Unreal's Async system
+    Async(EAsyncExecution::Thread, [WeakSubsystem, TargetRank, TimeoutMs, OnComplete, OnError]()
+    {
+        // Check if subsystem is still valid before making the request
+        if (!WeakSubsystem.IsValid())
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Subsystem no longer valid, cancelling async request"));
+            return; // Game stopped, exit early
+        }
+        
+        TArray<FJUSYNCWorkerStatus> WorkerStatus;
+        bool bSuccess = false;
+        
+        // Make the broker request
+        if (WeakSubsystem.IsValid())
+        {
+            bSuccess = WeakSubsystem->RequestWorkerStatus(TargetRank, TimeoutMs, WorkerStatus);
+        }
+        
+        // Check again before calling back (game might have stopped during request)
+        if (!WeakSubsystem.IsValid())
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Subsystem destroyed during async request, cancelling callback"));
+            return; // Game stopped, don't call callbacks
+        }
+        
+        // Execute callback on game thread
+        if (IsInGameThread())
+        {
+            if (bSuccess) OnComplete.ExecuteIfBound(WorkerStatus);
+            else OnError.ExecuteIfBound(FString::Printf(TEXT("Failed to retrieve worker status for rank %d"), TargetRank));
+        }
+        else
+        {
+            FFunctionGraphTask::CreateAndDispatchWhenReady(
+                [bSuccess, WorkerStatus, TargetRank, OnComplete, OnError]()
+                {
+                    if (bSuccess) OnComplete.ExecuteIfBound(WorkerStatus);
+                    else OnError.ExecuteIfBound(FString::Printf(TEXT("Failed to retrieve worker status for rank %d"), TargetRank));
+                },
+                TStatId(), nullptr, ENamedThreads::GameThread);
+        }
+    });
+}
+
+void UJUSYNCBlueprintLibrary::RequestFileListAsync(int32 TargetRank, int32 TimeoutMs, const FOnFileListReceived& OnComplete, const FOnBrokerError& OnError)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        OnError.ExecuteIfBound(TEXT("Subsystem not available"));
+        return;
+    }
+
+    // Capture subsystem pointer for validity checking
+    TWeakObjectPtr<UJUSYNCSubsystem> WeakSubsystem = Subsystem;
+    
+    // Launch async request on a background thread using Unreal's Async system
+    Async(EAsyncExecution::Thread, [WeakSubsystem, TargetRank, TimeoutMs, OnComplete, OnError]()
+    {
+        // Check if subsystem is still valid before making the request
+        if (!WeakSubsystem.IsValid())
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Subsystem no longer valid, cancelling async request"));
+            return; // Game stopped, exit early
+        }
+        
+        TArray<FString> FileList;
+        bool bSuccess = false;
+        
+        // Make the broker request
+        if (WeakSubsystem.IsValid())
+        {
+            bSuccess = WeakSubsystem->RequestFileList(TargetRank, TimeoutMs, FileList);
+        }
+        
+        // Store the retrieved file list for later retrieval (if successful)
+        if (bSuccess && FileList.Num() > 0)
+        {
+            FScopeLock Lock(&UJUSYNCBlueprintLibrary::LastFileListMutex);
+            UJUSYNCBlueprintLibrary::LastFileList = FileList;
+            UE_LOG(LogJUSYNC, Log, TEXT("Stored %d files in LastFileList"), FileList.Num());
+        }
+        
+        // Check again before calling back (game might have stopped during request)
+        if (!WeakSubsystem.IsValid())
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Subsystem destroyed during async request, cancelling callback"));
+            return; // Game stopped, don't call callbacks
+        }
+        
+        // Execute callback on game thread
+        if (IsInGameThread())
+        {
+            if (bSuccess) OnComplete.ExecuteIfBound(FileList);
+            else OnError.ExecuteIfBound(FString::Printf(TEXT("Failed to retrieve file list from rank %d"), TargetRank));
+        }
+        else
+        {
+            FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady(
+                [bSuccess, FileList, TargetRank, OnComplete, OnError]()
+                {
+                    if (bSuccess) OnComplete.ExecuteIfBound(FileList);
+                    else OnError.ExecuteIfBound(FString::Printf(TEXT("Failed to retrieve file list from rank %d"), TargetRank));
+                },
+                TStatId(), nullptr, ENamedThreads::GameThread);
+        }
+    });
+}
+
+void UJUSYNCBlueprintLibrary::RequestFileListWithSizesAsync(int32 TargetRank, int32 TimeoutMs, const FOnFileListWithSizesReceived& OnComplete, const FOnBrokerError& OnError)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        OnError.ExecuteIfBound(TEXT("Subsystem not available"));
+        return;
+    }
+
+    // Capture subsystem pointer for validity checking
+    TWeakObjectPtr<UJUSYNCSubsystem> WeakSubsystem = Subsystem;
+    
+    // Launch async request on a background thread using Unreal's Async system
+    Async(EAsyncExecution::Thread, [WeakSubsystem, TargetRank, TimeoutMs, OnComplete, OnError]()
+    {
+        // Check if subsystem is still valid before making the request
+        if (!WeakSubsystem.IsValid())
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Subsystem no longer valid, cancelling async request"));
+            return; // Game stopped, exit early
+        }
+        
+        TArray<FString> FileList;
+        TArray<int64> FileSizes;
+        bool bSuccess = false;
+        
+        // Make the broker request
+        if (WeakSubsystem.IsValid())
+        {
+            bSuccess = WeakSubsystem->RequestFileListWithSizes(TargetRank, TimeoutMs, FileList, FileSizes);
+        }
+        
+        // Store the retrieved file list for later retrieval (if successful)
+        if (bSuccess && FileList.Num() > 0)
+        {
+            FScopeLock Lock(&UJUSYNCBlueprintLibrary::LastFileListWithSizesMutex);
+            UJUSYNCBlueprintLibrary::LastFileListWithSizes_Names = FileList;
+            UJUSYNCBlueprintLibrary::LastFileListWithSizes_Sizes = FileSizes;
+            UE_LOG(LogJUSYNC, Log, TEXT("Stored %d files with sizes in LastFileListWithSizes"), FileList.Num());
+        }
+        
+        // Check again before calling back (game might have stopped during request)
+        if (!WeakSubsystem.IsValid())
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Subsystem destroyed during async request, cancelling callback"));
+            return; // Game stopped, don't call callbacks
+        }
+        
+        // Execute callback on game thread
+        if (IsInGameThread())
+        {
+            if (bSuccess) OnComplete.ExecuteIfBound(FileList, FileSizes);
+            else OnError.ExecuteIfBound(FString::Printf(TEXT("Failed to retrieve file list with sizes from rank %d"), TargetRank));
+        }
+        else
+        {
+            FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady(
+                [bSuccess, FileList, FileSizes, TargetRank, OnComplete, OnError]()
+                {
+                    if (bSuccess) OnComplete.ExecuteIfBound(FileList, FileSizes);
+                    else OnError.ExecuteIfBound(FString::Printf(TEXT("Failed to retrieve file list with sizes from rank %d"), TargetRank));
+                },
+                TStatId(), nullptr, ENamedThreads::GameThread);
+        }
+    });
+}
+
+void UJUSYNCBlueprintLibrary::RequestFileAsync(const FString& Filename, int32 TargetRank, int32 TimeoutMs, const FOnFileReceived& OnComplete, const FOnBrokerError& OnError)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        OnError.ExecuteIfBound(TEXT("Subsystem not available"));
+        return;
+    }
+
+    // Capture subsystem pointer for validity checking
+    TWeakObjectPtr<UJUSYNCSubsystem> WeakSubsystem = Subsystem;
+    
+    // Launch async request on a background thread using Unreal's Async system
+    Async(EAsyncExecution::Thread, [WeakSubsystem, Filename, TargetRank, TimeoutMs, OnComplete, OnError]()
+    {
+        // Check if subsystem is still valid before making the request
+        if (!WeakSubsystem.IsValid())
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Subsystem no longer valid, cancelling async request"));
+            return; // Game stopped, exit early
+        }
+        
+        TArray<uint8> FileData;
+        bool bSuccess = false;
+        
+        // Make the broker request
+        if (WeakSubsystem.IsValid())
+        {
+            bSuccess = WeakSubsystem->RequestFile(Filename, TargetRank, TimeoutMs, FileData);
+        }
+        
+        // Check again before calling back (game might have stopped during request)
+        if (!WeakSubsystem.IsValid())
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Subsystem destroyed during async request, cancelling callback"));
+            return; // Game stopped, don't call callbacks
+        }
+        
+        // Execute callback on game thread
+        if (IsInGameThread())
+        {
+            if (bSuccess) OnComplete.ExecuteIfBound(Filename, FileData);
+            else OnError.ExecuteIfBound(FString::Printf(TEXT("Failed to retrieve file '%s' from rank %d"), *Filename, TargetRank));
+        }
+        else
+        {
+            FGraphEventRef Task = FFunctionGraphTask::CreateAndDispatchWhenReady(
+                [bSuccess, Filename, FileData, TargetRank, OnComplete, OnError]()
+                {
+                    if (bSuccess) OnComplete.ExecuteIfBound(Filename, FileData);
+                    else OnError.ExecuteIfBound(FString::Printf(TEXT("Failed to retrieve file '%s' from rank %d"), *Filename, TargetRank));
+                },
+                TStatId(), nullptr, ENamedThreads::GameThread);
+        }
+    });
+}
+
+// ========== USD PROCESSING WITH PREVIEW ==========
+
+bool UJUSYNCBlueprintLibrary::LoadUSDFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCMeshData>& OutMeshData, FString& OutPreview)
+{
+    if (!ValidateBufferSize(Buffer, TEXT("LoadUSDFromBuffer")))
+    {
+        return false;
+    }
+
+    // Generate preview first
+    OutPreview = GetUSDAPreview(Buffer, 15);
+
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available for USD loading"));
+        return false;
+    }
+
+    bool bResult = Subsystem->LoadUSDFromBuffer(Buffer, Filename, OutMeshData);
+
+    if (bResult)
+    {
+        FString Message = FString::Printf(TEXT("Loaded USD: %s (%d meshes)"), *Filename, OutMeshData.Num());
+        //DisplayDebugMessage(Message, 5.0f, FLinearColor::Green);
+        UE_LOG(LogJUSYNC, Log, TEXT("USD Preview:\n%s"), *OutPreview);
+    }
+    else
+    {
+        //DisplayDebugMessage(TEXT("Failed to load USD file"), 5.0f, FLinearColor::Red);
+    }
+
+    return bResult;
+}
+
+bool UJUSYNCBlueprintLibrary::LoadUSDFromDisk(const FString& FilePath, TArray<FJUSYNCMeshData>& OutMeshData, FString& OutPreview)
+{
+    if (!ValidateFilePath(FilePath, TEXT("LoadUSDFromDisk")))
+    {
+        return false;
+    }
+
+    // Load file to buffer first for preview
+    TArray<uint8> Buffer;
+    if (!LoadFileToBuffer(FilePath, Buffer))
+    {
+        return false;
+    }
+
+    // Extract filename from path
+    FString Filename = FPaths::GetCleanFilename(FilePath);
+
+    return LoadUSDFromBuffer(Buffer, Filename, OutMeshData, OutPreview);
+}
+
+FString UJUSYNCBlueprintLibrary::GetUSDAPreview(const TArray<uint8>& Buffer, int32 MaxLines)
+{
+    return ExtractUSDAPreview(Buffer, MaxLines);
+}
+
+bool UJUSYNCBlueprintLibrary::ValidateUSDFormat(const TArray<uint8>& Buffer, const FString& Filename)
+{
+    if (!ValidateBufferSize(Buffer, TEXT("ValidateUSDFormat")))
+    {
+        return false;
+    }
+
+    // Check file extension
+    FString Extension = FPaths::GetExtension(Filename).ToLower();
+    if (Extension != TEXT("usd") && Extension != TEXT("usda") &&
+        Extension != TEXT("usdc") && Extension != TEXT("usdz"))
+    {
+        return false;
+    }
+
+    // Check content for USD markers
+    FString Content = ExtractUSDAPreview(Buffer, 5);
+    return Content.Contains(TEXT("#usda")) ||
+           Content.Contains(TEXT("PXR-USDC")) ||
+           Content.Contains(TEXT("def ")) ||
+           Content.Contains(TEXT("over "));
+}
+
+// ========== TEXTURE PROCESSING ==========
+
+FJUSYNCTextureData UJUSYNCBlueprintLibrary::CreateTextureFromBuffer(const TArray<uint8>& Buffer)
+{
+    FJUSYNCTextureData EmptyTexture;
+
+    if (!ValidateBufferSize(Buffer, TEXT("CreateTextureFromBuffer")))
+    {
+        return EmptyTexture;
+    }
+
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available for texture creation"));
+        return EmptyTexture;
+    }
+
+    FJUSYNCTextureData Result = Subsystem->CreateTextureFromBuffer(Buffer);
+
+    if (Result.IsValid())
+    {
+        FString Message = FString::Printf(TEXT("Created Texture: %dx%d (%d channels)"),
+                                        Result.Width, Result.Height, Result.Channels);
+        // Use FLinearColor constructor for Cyan color
+        //DisplayDebugMessage(Message, 3.0f, FLinearColor(0.0f, 1.0f, 1.0f, 1.0f));
+    }
+    else
+    {
+        //DisplayDebugMessage(TEXT("Failed to create texture from buffer"), 3.0f, FLinearColor::Red);
+    }
+
+    return Result;
+}
+
+UTexture2D* UJUSYNCBlueprintLibrary::CreateUETextureFromJUSYNC(const FJUSYNCTextureData& TextureData)
+{
+    if (!TextureData.IsValid())
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("Invalid texture data provided"));
+        return nullptr;
+    }
+
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return nullptr;
+    }
+
+    UTexture2D* Result = Subsystem->CreateUETextureFromJUSYNC(TextureData);
+
+    if (Result)
+    {
+        // Use FLinearColor constructor for Cyan color
+        //DisplayDebugMessage(TEXT("UE Texture2D Created Successfully"), 3.0f, FLinearColor(0.0f, 1.0f, 1.0f, 1.0f));
+    }
+
+    return Result;
+}
+
+bool UJUSYNCBlueprintLibrary::WriteGradientLineAsPNG(const TArray<uint8>& Buffer, const FString& OutputPath)
+{
+    if (!ValidateBufferSize(Buffer, TEXT("WriteGradientLineAsPNG")))
+    {
+        return false;
+    }
+
+    if (!ValidateFilePath(OutputPath, TEXT("WriteGradientLineAsPNG")))
+    {
+        return false;
+    }
+
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return false;
+    }
+
+    bool bResult = Subsystem->WriteGradientLineAsPNG(Buffer, OutputPath);
+
+    if (bResult)
+    {
+        FString Message = FString::Printf(TEXT("Gradient PNG saved: %s"), *OutputPath);
+        //DisplayDebugMessage(Message, 3.0f, FLinearColor::Green);
+    }
+    else
+    {
+        //DisplayDebugMessage(TEXT("Failed to save gradient PNG"), 3.0f, FLinearColor::Red);
+    }
+
+    return bResult;
+}
+
+bool UJUSYNCBlueprintLibrary::GetGradientLineAsPNGBuffer(const TArray<uint8>& Buffer, TArray<uint8>& OutPNGBuffer)
+{
+    if (!ValidateBufferSize(Buffer, TEXT("GetGradientLineAsPNGBuffer")))
+    {
+        return false;
+    }
+
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return false;
+    }
+
+    bool bResult = Subsystem->GetGradientLineAsPNGBuffer(Buffer, OutPNGBuffer);
+
+    if (bResult)
+    {
+        FString Message = FString::Printf(TEXT("Gradient PNG buffer created: %d bytes"), OutPNGBuffer.Num());
+        //DisplayDebugMessage(Message, 3.0f, FLinearColor::Green);
+    }
+    else
+    {
+        //DisplayDebugMessage(TEXT("Failed to create gradient PNG buffer"), 3.0f, FLinearColor::Red);
+    }
+
+    return bResult;
+}
+
+// ========== REALTIMEMESH PROCESSING ==========
+
+bool UJUSYNCBlueprintLibrary::CreateRealtimeMeshFromJUSYNC(const FJUSYNCMeshData& MeshData, URealtimeMeshComponent* RealtimeMeshComponent)
+{
+    if (!MeshData.IsValid())
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("Invalid mesh data provided"));
+        return false;
+    }
+
+    if (!RealtimeMeshComponent)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("RealtimeMeshComponent is null"));
+        return false;
+    }
+
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return false;
+    }
+
+    bool bResult = Subsystem->CreateRealtimeMeshFromJUSYNC(MeshData, RealtimeMeshComponent);
+
+    if (bResult)
+    {
+        FString Message = FString::Printf(TEXT("RealtimeMesh Created: %s (%d verts, %d tris)"),
+                                        *MeshData.ElementName, MeshData.GetVertexCount(), MeshData.GetTriangleCount());
+        // Use FLinearColor constructor for Cyan color
+        //DisplayDebugMessage(Message, 5.0f, FLinearColor(0.0f, 1.0f, 1.0f, 1.0f));
+    }
+
+    return bResult;
+}
+
+bool UJUSYNCBlueprintLibrary::BatchCreateRealtimeMeshesFromJUSYNC(const TArray<FJUSYNCMeshData>& MeshDataArray, const TArray<URealtimeMeshComponent*>& MeshComponents)
+{
+    if (MeshDataArray.Num() != MeshComponents.Num())
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("Mesh data array and component array size mismatch"));
+        return false;
+    }
+
+    bool bAllSuccessful = true;
+    int32 SuccessCount = 0;
+
+    for (int32 i = 0; i < MeshDataArray.Num(); ++i)
+    {
+        if (CreateRealtimeMeshFromJUSYNC(MeshDataArray[i], MeshComponents[i]))
+        {
+            SuccessCount++;
+        }
+        else
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Failed to create RealtimeMesh %d: %s"), i, *MeshDataArray[i].ElementName);
+            bAllSuccessful = false;
+        }
+    }
+
+    FString Message = FString::Printf(TEXT("Batch RealtimeMesh Creation: %d/%d successful"), SuccessCount, MeshDataArray.Num());
+    // Use FLinearColor constructor for Cyan or Yellow color
+    FLinearColor Color = bAllSuccessful ? FLinearColor(0.0f, 1.0f, 1.0f, 1.0f) : FLinearColor::Yellow;
+    //DisplayDebugMessage(Message, 5.0f, Color);
+
+    return bAllSuccessful;
+}
+
+FJUSYNCRealtimeMeshData UJUSYNCBlueprintLibrary::ConvertToRealtimeMeshFormat(const FJUSYNCMeshData& StandardMesh)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return FJUSYNCRealtimeMeshData();
+    }
+
+    return Subsystem->ConvertToRealtimeMeshFormat(StandardMesh);
+}
+
+// ========== DATA RECEPTION ==========
+
+bool UJUSYNCBlueprintLibrary::CheckForReceivedFiles(TArray<FJUSYNCFileData>& OutReceivedFiles)
+{
+    FScopeLock Lock(&DataMutex);
+
+    if (ReceivedFiles.Num() > 0)
+    {
+        OutReceivedFiles = ReceivedFiles;
+
+        // Log received files for debugging
+        for (const FJUSYNCFileData& FileData : ReceivedFiles)
+        {
+            FString Message = FString::Printf(TEXT("Received File: %s (%d bytes, %s)"),
+                                            *FileData.Filename, FileData.Data.Num(), *FileData.FileType);
+            UE_LOG(LogJUSYNC, Log, TEXT("%s"), *Message);
+            //DisplayDebugMessage(Message, 5.0f, FLinearColor::Blue);
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+bool UJUSYNCBlueprintLibrary::CheckForReceivedMessages(TArray<FString>& OutReceivedMessages)
+{
+    FScopeLock Lock(&DataMutex);
+
+    if (ReceivedMessages.Num() > 0)
+    {
+        OutReceivedMessages = ReceivedMessages;
+
+        // Log received messages for debugging
+        for (const FString& Message : ReceivedMessages)
+        {
+            UE_LOG(LogJUSYNC, Log, TEXT("Received Message: %s"), *Message);
+            // Use FLinearColor constructor for Cyan color
+            //DisplayDebugMessage(FString::Printf(TEXT("Message: %s"), *Message), 3.0f, FLinearColor(0.0f, 1.0f, 1.0f, 1.0f));
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
+void UJUSYNCBlueprintLibrary::ClearReceivedData()
+{
+    FScopeLock Lock(&DataMutex);
+    ReceivedFiles.Empty();
+    ReceivedMessages.Empty();
+    UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC received data cleared"));
+}
+
+// ========== VALIDATION & UTILITIES ==========
+
+bool UJUSYNCBlueprintLibrary::ValidateJUSYNCMeshData(const FJUSYNCMeshData& MeshData, FString& ValidationMessage)
+{
+    if (MeshData.ElementName.IsEmpty())
+    {
+        ValidationMessage = TEXT("Element name is empty");
+        return false;
+    }
+
+    if (MeshData.Vertices.Num() == 0)
+    {
+        ValidationMessage = TEXT("No vertices found");
+        return false;
+    }
+
+    if (MeshData.Triangles.Num() == 0)
+    {
+        ValidationMessage = TEXT("No triangles found");
+        return false;
+    }
+
+    if (MeshData.Triangles.Num() % 3 != 0)
+    {
+        ValidationMessage = FString::Printf(TEXT("Triangle count (%d) is not divisible by 3"), MeshData.Triangles.Num());
+        return false;
+    }
+
+    // Check index bounds
+    for (int32 Index : MeshData.Triangles)
+    {
+        if (Index >= MeshData.Vertices.Num())
+        {
+            ValidationMessage = FString::Printf(TEXT("Triangle index %d exceeds vertex count %d"), Index, MeshData.Vertices.Num());
+            return false;
+        }
+    }
+
+    ValidationMessage = TEXT("Mesh data is valid");
+    return true;
+}
+
+bool UJUSYNCBlueprintLibrary::ValidateJUSYNCTextureData(const FJUSYNCTextureData& TextureData, FString& ValidationMessage)
+{
+    if (!TextureData.IsValid())
+    {
+        ValidationMessage = FString::Printf(TEXT("Invalid texture: %dx%d, %d channels, %d bytes"),
+                                          TextureData.Width, TextureData.Height, TextureData.Channels, TextureData.Data.Num());
+        return false;
+    }
+
+    ValidationMessage = TEXT("Texture data is valid");
+    return true;
+}
+
+int32 UJUSYNCBlueprintLibrary::GetFileSize(const TArray<uint8>& FileBuffer)
+{
+    return FileBuffer.Num();
+}
+
+bool UJUSYNCBlueprintLibrary::FilterFileBySize(const TArray<uint8>& FileBuffer, int32 MinimumSizeBytes)
+{
+    return FileBuffer.Num() >= MinimumSizeBytes;
+}
+
+void UJUSYNCBlueprintLibrary::FilterFileListBySize(const TArray<FString>& FileList, const TArray<int64>& FileSizes, int32 MinimumSizeBytes, TArray<FString>& OutFilteredFiles, TArray<int64>& OutFilteredSizes)
+{
+    OutFilteredFiles.Empty();
+    OutFilteredSizes.Empty();
+    if (FileList.Num() != FileSizes.Num())
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("FilterFileListBySize: FileList and FileSizes arrays have different lengths (%d vs %d)"), FileList.Num(), FileSizes.Num());
+        return;
+    }
+    for (int32 i = 0; i < FileList.Num(); ++i)
+    {
+        if (FileSizes[i] >= MinimumSizeBytes)
+        {
+            OutFilteredFiles.Add(FileList[i]);
+            OutFilteredSizes.Add(FileSizes[i]);
+        }
+    }
+    UE_LOG(LogJUSYNC, Log, TEXT("FilterFileListBySize: filtered %d files down to %d (threshold %d bytes)"), FileList.Num(), OutFilteredFiles.Num(), MinimumSizeBytes);
+}
+
+void UJUSYNCBlueprintLibrary::FilterFileListByExtensionEnum(const TArray<FString>& FileList, EJUSYNCExtension ExtensionFilter, TArray<FString>& OutFilteredFiles)
+{
+    OutFilteredFiles.Empty();
+    TArray<FString> Extensions;
+    switch (ExtensionFilter)
+    {
+        case EJUSYNCExtension::USD:
+            Extensions.Add(TEXT(".usda"));
+            Extensions.Add(TEXT(".usd"));
+            break;
+        case EJUSYNCExtension::PNG:
+            Extensions.Add(TEXT(".png"));
+            break;
+        case EJUSYNCExtension::JSON:
+            Extensions.Add(TEXT(".json"));
+            break;
+        case EJUSYNCExtension::TXT:
+            Extensions.Add(TEXT(".txt"));
+            break;
+        case EJUSYNCExtension::BIN:
+            Extensions.Add(TEXT(".bin"));
+            break;
+        case EJUSYNCExtension::ALL:
+            // No filtering
+            OutFilteredFiles = FileList;
+            UE_LOG(LogJUSYNC, Log, TEXT("FilterFileListByExtensionEnum: ALL selected, returning all %d files"), FileList.Num());
+            return;
+        default:
+            UE_LOG(LogJUSYNC, Warning, TEXT("FilterFileListByExtensionEnum: unknown extension enum value %d"), (int32)ExtensionFilter);
+            return;
+    }
+    
+    for (const FString& Filename : FileList)
+    {
+        for (const FString& Ext : Extensions)
+        {
+            if (Filename.EndsWith(Ext, ESearchCase::IgnoreCase))
+            {
+                OutFilteredFiles.Add(Filename);
+                break;
+            }
+        }
+    }
+    UE_LOG(LogJUSYNC, Log, TEXT("FilterFileListByExtensionEnum: filtered %d files down to %d (extension filter %s)"),
+           FileList.Num(), OutFilteredFiles.Num(), *UEnum::GetValueAsString(ExtensionFilter));
+}
+
+void UJUSYNCBlueprintLibrary::FilterFileListByExtensions(const TArray<FString>& FileList, const TArray<FString>& AllowedExtensions, TArray<FString>& OutFilteredFiles)
+{
+    OutFilteredFiles.Empty();
+    if (AllowedExtensions.Num() == 0)
+    {
+        UE_LOG(LogJUSYNC, Warning, TEXT("FilterFileListByExtensions: AllowedExtensions array is empty, returning empty result"));
+        return;
+    }
+    for (const FString& Filename : FileList)
+    {
+        for (const FString& Ext : AllowedExtensions)
+        {
+            // Ensure extension starts with dot
+            FString NormalizedExt = Ext;
+            if (!NormalizedExt.StartsWith(TEXT(".")))
+                NormalizedExt = TEXT(".") + NormalizedExt;
+            if (Filename.EndsWith(NormalizedExt, ESearchCase::IgnoreCase))
+            {
+                OutFilteredFiles.Add(Filename);
+                break;
+            }
+        }
+    }
+    UE_LOG(LogJUSYNC, Log, TEXT("FilterFileListByExtensions: filtered %d files down to %d (allowed extensions: %s)"),
+           FileList.Num(), OutFilteredFiles.Num(), *FString::Join(AllowedExtensions, TEXT(", ")));
+}
+
+
+
+void UJUSYNCBlueprintLibrary::FilterFileListByExtensionEnumWithSizes(const TArray<FString>& FileList, const TArray<int64>& FileSizes, EJUSYNCExtension ExtensionFilter, TArray<FString>& OutFilteredFiles, TArray<int64>& OutFilteredSizes)
+{
+    OutFilteredFiles.Empty();
+    OutFilteredSizes.Empty();
+    if (FileList.Num() != FileSizes.Num())
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("FilterFileListByExtensionEnumWithSizes: FileList and FileSizes arrays have different lengths (%d vs %d)"), FileList.Num(), FileSizes.Num());
+        return;
+    }
+    TArray<FString> Extensions;
+    switch (ExtensionFilter)
+    {
+        case EJUSYNCExtension::USD:
+            Extensions.Add(TEXT(".usda"));
+            Extensions.Add(TEXT(".usd"));
+            break;
+        case EJUSYNCExtension::PNG:
+            Extensions.Add(TEXT(".png"));
+            break;
+        case EJUSYNCExtension::JSON:
+            Extensions.Add(TEXT(".json"));
+            break;
+        case EJUSYNCExtension::TXT:
+            Extensions.Add(TEXT(".txt"));
+            break;
+        case EJUSYNCExtension::BIN:
+            Extensions.Add(TEXT(".bin"));
+            break;
+        case EJUSYNCExtension::ALL:
+            // No filtering
+            OutFilteredFiles = FileList;
+            OutFilteredSizes = FileSizes;
+            UE_LOG(LogJUSYNC, Log, TEXT("FilterFileListByExtensionEnumWithSizes: ALL selected, returning all %d files"), FileList.Num());
+            return;
+        default:
+            UE_LOG(LogJUSYNC, Warning, TEXT("FilterFileListByExtensionEnumWithSizes: unknown extension enum value %d"), (int32)ExtensionFilter);
+            return;
+    }
+    
+    for (int32 i = 0; i < FileList.Num(); ++i)
+    {
+        const FString& Filename = FileList[i];
+        for (const FString& Ext : Extensions)
+        {
+            if (Filename.EndsWith(Ext, ESearchCase::IgnoreCase))
+            {
+                OutFilteredFiles.Add(Filename);
+                OutFilteredSizes.Add(FileSizes[i]);
+                break;
+            }
+        }
+    }
+    UE_LOG(LogJUSYNC, Log, TEXT("FilterFileListByExtensionEnumWithSizes: filtered %d files down to %d (extension filter %s)"),
+           FileList.Num(), OutFilteredFiles.Num(), *UEnum::GetValueAsString(ExtensionFilter));
+}
+
+void UJUSYNCBlueprintLibrary::FilterFileListByExtensionsWithSizes(const TArray<FString>& FileList, const TArray<int64>& FileSizes, const TArray<FString>& AllowedExtensions, TArray<FString>& OutFilteredFiles, TArray<int64>& OutFilteredSizes)
+{
+    OutFilteredFiles.Empty();
+    OutFilteredSizes.Empty();
+    if (FileList.Num() != FileSizes.Num())
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("FilterFileListByExtensionsWithSizes: FileList and FileSizes arrays have different lengths (%d vs %d)"), FileList.Num(), FileSizes.Num());
+        return;
+    }
+    if (AllowedExtensions.Num() == 0)
+    {
+        UE_LOG(LogJUSYNC, Warning, TEXT("FilterFileListByExtensionsWithSizes: AllowedExtensions array is empty, returning empty result"));
+        return;
+    }
+    for (int32 i = 0; i < FileList.Num(); ++i)
+    {
+        const FString& Filename = FileList[i];
+        for (const FString& Ext : AllowedExtensions)
+        {
+            // Ensure extension starts with dot
+            FString NormalizedExt = Ext;
+            if (!NormalizedExt.StartsWith(TEXT(".")))
+                NormalizedExt = TEXT(".") + NormalizedExt;
+            if (Filename.EndsWith(NormalizedExt, ESearchCase::IgnoreCase))
+            {
+                OutFilteredFiles.Add(Filename);
+                OutFilteredSizes.Add(FileSizes[i]);
+                break;
+            }
+        }
+    }
+    UE_LOG(LogJUSYNC, Log, TEXT("FilterFileListByExtensionsWithSizes: filtered %d files down to %d (allowed extensions: %s)"),
+           FileList.Num(), OutFilteredFiles.Num(), *FString::Join(AllowedExtensions, TEXT(", ")));
+}
+
+int32 UJUSYNCBlueprintLibrary::CalculateTimeoutFromFileSize(int64 FileSizeBytes, int32 BaseTimeoutMs, float BandwidthBytesPerSecond)
+{
+    if (FileSizeBytes <= 0)
+        return BaseTimeoutMs;
+    
+    // Calculate transfer time in seconds: size / bandwidth
+    float TransferTimeSeconds = static_cast<float>(FileSizeBytes) / BandwidthBytesPerSecond;
+    // Convert to milliseconds and add base timeout
+    int32 AdditionalMs = FMath::CeilToInt(TransferTimeSeconds * 1000.0f);
+    // Add safety margin (e.g., 20%)
+    AdditionalMs = FMath::CeilToInt(AdditionalMs * 1.2f);
+    int32 TotalTimeout = BaseTimeoutMs + AdditionalMs;
+    
+    // Clamp to reasonable range (e.g., max 60 seconds)
+    const int32 MaxTimeout = 60000;
+    if (TotalTimeout > MaxTimeout)
+        TotalTimeout = MaxTimeout;
+    
+    UE_LOG(LogJUSYNC, Log, TEXT("CalculateTimeoutFromFileSize: size=%lld bytes, bandwidth=%.0f B/s, base=%d ms, total=%d ms"),
+           FileSizeBytes, BandwidthBytesPerSecond, BaseTimeoutMs, TotalTimeout);
+    return TotalTimeout;
+}
+
+FString UJUSYNCBlueprintLibrary::GetJUSYNCMeshStatistics(const FJUSYNCMeshData& MeshData)
+{
+    return FString::Printf(TEXT("Mesh '%s': %d vertices, %d triangles, %s normals, %s UVs"),
+                          *MeshData.ElementName,
+                          MeshData.GetVertexCount(),
+                          MeshData.GetTriangleCount(),
+                          MeshData.HasNormals() ? TEXT("has") : TEXT("no"),
+                          MeshData.HasUVs() ? TEXT("has") : TEXT("no"));
+}
+
+FString UJUSYNCBlueprintLibrary::GetJUSYNCTextureStatistics(const FJUSYNCTextureData& TextureData)
+{
+    return FString::Printf(TEXT("Texture: %dx%d, %d channels, %d bytes, %s"),
+                          TextureData.Width,
+                          TextureData.Height,
+                          TextureData.Channels,
+                          TextureData.Data.Num(),
+                          TextureData.IsValid() ? TEXT("valid") : TEXT("invalid"));
+}
+
+// ========== FILE OPERATIONS ==========
+
+bool UJUSYNCBlueprintLibrary::LoadFileToBuffer(const FString& FilePath, TArray<uint8>& OutBuffer)
+{
+    if (!ValidateFilePath(FilePath, TEXT("LoadFileToBuffer")))
+    {
+        return false;
+    }
+
+    bool bResult = FFileHelper::LoadFileToArray(OutBuffer, *FilePath);
+
+    if (bResult)
+    {
+        FString Message = FString::Printf(TEXT("File loaded: %s (%d bytes)"), *FilePath, OutBuffer.Num());
+        //DisplayDebugMessage(Message, 3.0f, FLinearColor::Green);
+    }
+
+    return bResult;
+}
+
+bool UJUSYNCBlueprintLibrary::SaveBufferToFile(const TArray<uint8>& Buffer, const FString& FilePath)
+{
+    if (!ValidateBufferSize(Buffer, TEXT("SaveBufferToFile")))
+    {
+        return false;
+    }
+
+    if (!ValidateFilePath(FilePath, TEXT("SaveBufferToFile")))
+    {
+        return false;
+    }
+
+    bool bResult = FFileHelper::SaveArrayToFile(Buffer, *FilePath);
+
+    if (bResult)
+    {
+        FString Message = FString::Printf(TEXT("File saved: %s (%d bytes)"), *FilePath, Buffer.Num());
+        //DisplayDebugMessage(Message, 3.0f, FLinearColor::Green);
+    }
+
+    return bResult;
+}
+
+// ========== DEBUG & DISPLAY ==========
+
+void UJUSYNCBlueprintLibrary::DisplayDebugMessage(const FString& Message, float Duration, FLinearColor Color)
+{
+    /*if (GEngine)
+    {
+        GEngine->AddOnScreenDebugMessage(-1, Duration, Color.ToFColor(true), FString::Printf(TEXT("JUSYNC: %s"), *Message));
+    }*/
+
+    UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC: %s"), *Message);
+}
+
+void UJUSYNCBlueprintLibrary::LogJUSYNCMessage(const FString& Message, bool bIsError)
+{
+    if (bIsError)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC: %s"), *Message);
+        //DisplayDebugMessage(Message, 5.0f, FLinearColor::Red);
+    }
+    else
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC: %s"), *Message);
+        //DisplayDebugMessage(Message, 3.0f, FLinearColor::White);
+    }
+}
+
+// ========== HELPER FUNCTIONS ==========
+
+UJUSYNCSubsystem* UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem()
+{
+    // Method 1: Try GWorld first (most reliable for PIE)
+    if (GWorld)
+    {
+        if (UGameInstance* GameInstance = GWorld->GetGameInstance())
+        {
+            if (UJUSYNCSubsystem* Subsystem = GameInstance->GetSubsystem<UJUSYNCSubsystem>())
+            {
+                return Subsystem;
+            }
+        }
+    }
+    
+    // Method 2: Try from all world contexts (comprehensive fallback)
+    if (GEngine)
+    {
+        // First try PIE worlds
+        for (const FWorldContext& WorldContext : GEngine->GetWorldContexts())
+        {
+            if (WorldContext.World() && WorldContext.WorldType == EWorldType::PIE)
+            {
+                if (UGameInstance* GameInstance = WorldContext.World()->GetGameInstance())
+                {
+                    if (UJUSYNCSubsystem* Subsystem = GameInstance->GetSubsystem<UJUSYNCSubsystem>())
+                    {
+                        return Subsystem;
+                    }
+                }
+            }
+        }
+        
+        // Then try game worlds
+        for (const FWorldContext& WorldContext : GEngine->GetWorldContexts())
+        {
+            if (WorldContext.World() && WorldContext.WorldType == EWorldType::Game)
+            {
+                if (UGameInstance* GameInstance = WorldContext.World()->GetGameInstance())
+                {
+                    if (UJUSYNCSubsystem* Subsystem = GameInstance->GetSubsystem<UJUSYNCSubsystem>())
+                    {
+                        return Subsystem;
+                    }
+                }
+            }
+        }
+    }
+    
+    UE_LOG(LogJUSYNC, Warning, TEXT("JUSYNC Subsystem not found in any world context"));
+    return nullptr;
+}
+
+// ========== PRIVATE HELPERS ==========
+
+bool UJUSYNCBlueprintLibrary::ValidateBufferSize(const TArray<uint8>& Buffer, const FString& Context)
+{
+    if (Buffer.Num() == 0)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("%s: Buffer is empty"), *Context);
+        return false;
+    }
+
+    // Use your middleware's safety constants
+    const size_t MaxSize = 1024 * 1024 * 1024; // 1GB limit from your middleware
+    if (Buffer.Num() > MaxSize)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("%s: Buffer too large (%d bytes, max: %llu)"), *Context, Buffer.Num(), MaxSize);
+        return false;
+    }
+
+    return true;
+}
+
+bool UJUSYNCBlueprintLibrary::ValidateFilePath(const FString& FilePath, const FString& Context)
+{
+    if (FilePath.IsEmpty())
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("%s: File path is empty"), *Context);
+        return false;
+    }
+
+    if (FilePath.Len() > 1000)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("%s: File path too long"), *Context);
+        return false;
+    }
+
+    // Check for dangerous path patterns
+    if (FilePath.Contains(TEXT("..")) || FilePath.Contains(TEXT("~/")))
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("%s: Unsafe file path detected: %s"), *Context, *FilePath);
+        return false;
+    }
+
+    return true;
+}
+
+FString UJUSYNCBlueprintLibrary::ExtractUSDAPreview(const TArray<uint8>& Buffer, int32 MaxLines)
+{
+    // Enhanced safety check - validate buffer before any access
+    if (Buffer.Num() == 0)
+    {
+        return TEXT("Empty buffer");
+    }
+
+    // Additional safety: check if buffer data pointer is valid (as much as we can)
+    // We can't fully validate but we can add some checks
+    const uint8* BufferData = Buffer.GetData();
+    if (!BufferData && Buffer.Num() > 0)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("ExtractUSDAPreview: Buffer has null data pointer but non-zero size"));
+        return TEXT("Invalid buffer");
+    }
+
+    // Dynamic search size based on file size
+    int32 SearchSize;
+    if (Buffer.Num() < 1024 * 1024) // < 1MB
+    {
+        SearchSize = Buffer.Num(); // Search entire file
+    }
+    else if (Buffer.Num() < 10 * 1024 * 1024) // < 10MB
+    {
+        SearchSize = 2 * 1024 * 1024; // Search first 2MB
+    }
+    else if (Buffer.Num() < 100 * 1024 * 1024) // < 100MB
+    {
+        SearchSize = 10 * 1024 * 1024; // Search first 10MB
+    }
+    else
+    {
+        SearchSize = 50 * 1024 * 1024; // Search first 50MB for huge files
+    }
+    
+    SearchSize = FMath::Min(Buffer.Num(), SearchSize);
+    
+    UE_LOG(LogJUSYNC, Log, TEXT("ExtractUSDAPreview: Searching %d bytes of %d total"), 
+           SearchSize, Buffer.Num());
+
+    // Convert buffer to string with better handling
+    FString Content;
+    Content.Reserve(SearchSize / 2);
+    
+    // Use direct pointer access for performance and safety
+    for (int32 i = 0; i < SearchSize; ++i)
+    {
+        // Access via GetData() with bounds checking in debug
+        char Char = static_cast<char>(BufferData[i]);
+        if (Char >= 32 && Char <= 126) // Printable ASCII
+        {
+            Content.AppendChar(Char);
+        }
+        else if (Char == '\n' || Char == '\r' || Char == '\t')
+        {
+            Content.AppendChar(Char);
+        }
+        else if (Char == 0) // Null terminator
+        {
+            Content.AppendChar(' '); // Replace with space to continue parsing
+        }
+        // Skip non-printable characters instead of replacing with '?'
+    }
+
+    // Extract first N lines with better line handling
+    TArray<FString> Lines;
+    Content.ParseIntoArrayLines(Lines);
+    FString Preview = TEXT("=== USD PREVIEW ===\n");
+    int32 LinesToShow = FMath::Min(MaxLines, Lines.Num());
+    
+    for (int32 i = 0; i < LinesToShow; ++i)
+    {
+        FString Line = Lines[i];
+        if (Line.Len() > 500) // Increased line length limit
+        {
+            Line = Line.Left(500) + TEXT("...");
+        }
+        Preview += FString::Printf(TEXT("Line %d: %s\n"), i + 1, *Line);
+    }
+
+    if (Lines.Num() > MaxLines)
+    {
+        Preview += FString::Printf(TEXT("... (%d more lines)\n"), Lines.Num() - MaxLines);
+    }
+
+    Preview += TEXT("=== END PREVIEW ===");
+    
+    // Debug logging
+    UE_LOG(LogJUSYNC, Log, TEXT("ExtractUSDAPreview: Converted %d characters, %d lines"), 
+           Content.Len(), Lines.Num());
+    
+    bool bHasVertexColors = Content.Contains(TEXT("primvars:color.timeSamples"));
+    UE_LOG(LogJUSYNC, Log, TEXT("ExtractUSDAPreview: Contains vertex colors: %s"), 
+           bHasVertexColors ? TEXT("YES") : TEXT("NO"));
+    
+    return Preview;
+}
+
+
+void UJUSYNCBlueprintLibrary::ApplyEnhancedDefaultMaterial(URealtimeMeshComponent* MeshComp)
+{
+    if (!MeshComp)
+    {
+        return;
+    }
+
+    UMaterial* DefaultMaterial = UMaterial::GetDefaultMaterial(MD_Surface);
+    if (DefaultMaterial)
+    {
+        UMaterialInstanceDynamic* DynamicMaterial = UMaterialInstanceDynamic::Create(DefaultMaterial, MeshComp);
+        if (DynamicMaterial)
+        {
+            DynamicMaterial->SetScalarParameterValue(TEXT("Metallic"), 0.0f);
+            DynamicMaterial->SetScalarParameterValue(TEXT("Roughness"), 0.8f);
+            DynamicMaterial->SetVectorParameterValue(TEXT("BaseColor"), FLinearColor::White);
+            MeshComp->SetMaterial(0, DynamicMaterial);
+            UE_LOG(LogJUSYNC, Log, TEXT("✅ Applied enhanced default material"));
+        }
+    }
+}
+
+// Update the async internal function
+void UJUSYNCBlueprintLibrary::AsyncBatchSpawnInternal(
+    const TArray<FJUSYNCMeshData>& MeshDataArray,
+    const TArray<FVector>& SpawnLocations,
+    const TArray<FRotator>& SpawnRotations,
+    TSharedPtr<TArray<AActor*>> SharedResults,
+    int32 CurrentBatch,
+    int32 BatchSize,
+    float BatchDelay)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("No subsystem for async spawn"));
+        return;
+    }
+
+    UWorld* World = Subsystem->GetWorld();
+    if (!World)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("No world for async spawn"));
+        return;
+    }
+
+    // Calculate batch range
+    int32 StartIndex = CurrentBatch * BatchSize;
+    int32 EndIndex = FMath::Min(StartIndex + BatchSize, MeshDataArray.Num());
+    
+    UE_LOG(LogJUSYNC, Log, TEXT("📦 Processing async batch %d: indices %d-%d with rotations"),
+           CurrentBatch, StartIndex, EndIndex - 1);
+
+    // Process current batch with rotations
+    for (int32 i = StartIndex; i < EndIndex; ++i)
+    {
+        FRotator UERotation = ConvertParaViewToUERotation(SpawnRotations[i]);
+        AActor* SpawnedActor = SpawnRealtimeMeshAtLocation(
+            MeshDataArray[i], SpawnLocations[i], UERotation);
+        
+        SharedResults->Add(SpawnedActor);
+        
+        if (SpawnedActor)
+        {
+            UE_LOG(LogJUSYNC, Log, TEXT("✅ Async spawned mesh %d at %s with rotation %s"),
+                   i, *SpawnLocations[i].ToString(), *UERotation.ToString());
+        }
+    }
+
+    // Check if we're done
+    if (EndIndex >= MeshDataArray.Num())
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("🎉 Async batch spawn complete: %d/%d successful"),
+               SharedResults->Num(), MeshDataArray.Num());
+        return;
+    }
+
+    // Schedule next batch
+    FTimerHandle TimerHandle;
+    World->GetTimerManager().SetTimer(TimerHandle,
+        FTimerDelegate::CreateLambda([=]()
+        {
+            AsyncBatchSpawnInternal(MeshDataArray, SpawnLocations, SpawnRotations, SharedResults,
+                                  CurrentBatch + 1, BatchSize, BatchDelay);
+        }),
+        BatchDelay, false);
+}
+
+// Add this function after your existing helper functions
+FString UJUSYNCBlueprintLibrary::DetectUSDContentType(const TArray<uint8>& Buffer)
+{
+    FString Content = ExtractUSDAPreview(Buffer, 200);
+    
+    UE_LOG(LogJUSYNC, Log, TEXT("=== USD CONTENT TYPE DETECTION DEBUG ==="));
+    UE_LOG(LogJUSYNC, Log, TEXT("Buffer size: %d bytes"), Buffer.Num());
+    UE_LOG(LogJUSYNC, Log, TEXT("Content length: %d characters"), Content.Len());
+    
+    // Look for primvars:color.timeSamples
+    bool bHasPrimvarsColor = Content.Contains(TEXT("primvars:color.timeSamples"));
+    UE_LOG(LogJUSYNC, Log, TEXT("Contains 'primvars:color.timeSamples': %s"), 
+           bHasPrimvarsColor ? TEXT("YES") : TEXT("NO"));
+    
+    if (bHasPrimvarsColor)
+    {
+        // Look for actual color data patterns FIRST
+        bool bHasActualColorData = Content.Contains(TEXT("0: [(0.")) ||
+                                  Content.Contains(TEXT("0: [(1.")) ||
+                                  Content.Contains(TEXT("), (0.")) ||
+                                  Content.Contains(TEXT("), (1.")) ||
+                                  (Content.Contains(TEXT("0: [(")) && Content.Contains(TEXT("), (")));
+        
+        UE_LOG(LogJUSYNC, Log, TEXT("Contains actual color data patterns: %s"), 
+               bHasActualColorData ? TEXT("YES") : TEXT("NO"));
+        
+        // CRITICAL FIX: Prioritize actual color data over "None"
+        if (bHasActualColorData)
+        {
+            UE_LOG(LogJUSYNC, Log, TEXT("🎨 DETECTED: VERTEX_COLORS (actual color data found)"));
+            return TEXT("VERTEX_COLORS");
+        }
+        else if (Content.Contains(TEXT("0: None")))
+        {
+            UE_LOG(LogJUSYNC, Log, TEXT("🎨 DETECTED: TEXTURES (None values found, no color data)"));
+            return TEXT("TEXTURES");
+        }
+    }
+    
+    // Check for explicit texture references
+    if (Content.Contains(TEXT("asset inputs:file")) ||
+        Content.Contains(TEXT("UsdUVTexture")) ||
+        Content.Contains(TEXT(".jpg")) ||
+        Content.Contains(TEXT(".png")))
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("🎨 DETECTED: TEXTURES (explicit references)"));
+        return TEXT("TEXTURES");
+    }
+    
+    UE_LOG(LogJUSYNC, Log, TEXT("🎨 DETECTED: GEOMETRY_ONLY"));
+    return TEXT("GEOMETRY_ONLY");
+}
+
+
+TArray<AActor*> UJUSYNCBlueprintLibrary::BatchSpawnRealtimeMeshesAtLocationsSync(
+    const TArray<FJUSYNCMeshData>& MeshDataArray,
+    const TArray<FVector>& SpawnLocations,
+    const TArray<FRotator>& SpawnRotations)
+{
+    TArray<AActor*> SpawnedActors;
+    
+    // Create default rotations if not provided
+    TArray<FRotator> FinalRotations = SpawnRotations;
+    if (FinalRotations.Num() == 0)
+    {
+        FinalRotations = GenerateDefaultRotations(MeshDataArray.Num());
+    }
+
+    UE_LOG(LogJUSYNC, Log, TEXT("=== SYNC BATCH SPAWN WITH ROTATIONS ==="));
+    UE_LOG(LogJUSYNC, Log, TEXT("Processing %d meshes with locations and rotations"), MeshDataArray.Num());
+
+    SpawnedActors.Reserve(MeshDataArray.Num());
+    int32 SuccessCount = 0;
+
+    for (int32 i = 0; i < MeshDataArray.Num(); ++i)
+    {
+        // Convert ParaView rotation to UE rotation if needed
+        FRotator UERotation = ConvertParaViewToUERotation(FinalRotations[i]);
+        
+        UE_LOG(LogJUSYNC, Log, TEXT("🎯 Spawning mesh %d '%s' at location %s with rotation %s"),
+               i, *MeshDataArray[i].ElementName, *SpawnLocations[i].ToString(), *UERotation.ToString());
+
+        AActor* SpawnedActor = SpawnRealtimeMeshAtLocation(MeshDataArray[i], SpawnLocations[i], UERotation);
+        SpawnedActors.Add(SpawnedActor);
+
+        if (SpawnedActor)
+        {
+            SuccessCount++;
+            UE_LOG(LogJUSYNC, Log, TEXT("✅ Successfully spawned at %s with rotation %s"),
+                   *SpawnedActor->GetActorLocation().ToString(), 
+                   *SpawnedActor->GetActorRotation().ToString());
+        }
+        else
+        {
+            UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to spawn mesh %d"), i);
+        }
+    }
+
+    UE_LOG(LogJUSYNC, Log, TEXT("=== SYNC BATCH SPAWN COMPLETE: %d/%d successful ==="),
+           SuccessCount, MeshDataArray.Num());
+    return SpawnedActors;
+}
+
+FRotator UJUSYNCBlueprintLibrary::ConvertParaViewToUERotation(const FRotator& ParaViewRotation)
+{
+    // ParaView and UE both use Z-up, but ParaView is right-handed, UE is left-handed
+    FRotator UERotation;
+    
+    // For Z-up to Z-up conversion with handedness flip:
+    UERotation.Pitch = ParaViewRotation.Pitch;  // Keep pitch
+    UERotation.Yaw = -ParaViewRotation.Yaw;     // Flip yaw for handedness
+    UERotation.Roll = ParaViewRotation.Roll;    // Keep roll
+    
+    UE_LOG(LogJUSYNC, Log, TEXT("Converted ParaView rotation %s to UE rotation %s"),
+           *ParaViewRotation.ToString(), *UERotation.ToString());
+    
+    return UERotation;
+}
+
+// Generate default rotations
+TArray<FRotator> UJUSYNCBlueprintLibrary::GenerateDefaultRotations(int32 Count, const FRotator& BaseRotation)
+{
+    TArray<FRotator> Rotations;
+    Rotations.Reserve(Count);
+    
+    for (int32 i = 0; i < Count; ++i)
+    {
+        Rotations.Add(BaseRotation);
+    }
+    
+    return Rotations;
+}
+
+TArray<AActor*> UJUSYNCBlueprintLibrary::BatchSpawnRealtimeMeshesWithMaterial(
+    const TArray<FJUSYNCMeshData>& MeshDataArray,
+    const TArray<FVector>& SpawnLocations,
+    const TArray<FRotator>& SpawnRotations,
+    UMaterialInterface* Material,
+    const TArray<uint8>& USDBuffer,
+    bool bUseUniformScaling,
+    FVector OuterBoundingBoxSize,
+    bool bPreserveAspectRatio,
+    bool bUseAsyncSpawning,
+    int32 BatchSize,
+    float BatchDelay)
+{
+    // Enhanced validation
+    if (MeshDataArray.Num() != SpawnLocations.Num())
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("❌ Array size mismatch! Meshes: %d, Locations: %d"),
+               MeshDataArray.Num(), SpawnLocations.Num());
+        return TArray<AActor*>();
+    }
+
+    if (MeshDataArray.Num() == 0)
+    {
+        UE_LOG(LogJUSYNC, Warning, TEXT("⚠️ Empty mesh data array provided"));
+        return TArray<AActor*>();
+    }
+
+    // Create default rotations if not provided
+    TArray<FRotator> FinalRotations = SpawnRotations;
+    if (FinalRotations.Num() == 0)
+    {
+        FinalRotations = GenerateDefaultRotations(MeshDataArray.Num());
+        UE_LOG(LogJUSYNC, Log, TEXT("Generated %d default rotations"), FinalRotations.Num());
+    }
+    else if (FinalRotations.Num() != MeshDataArray.Num())
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("❌ Rotation array size mismatch! Expected: %d, Got: %d"),
+               MeshDataArray.Num(), FinalRotations.Num());
+        return TArray<AActor*>();
+    }
+
+    // **ENHANCED SCALING LOGIC**
+    TArray<FVector> FinalLocations = SpawnLocations;
+    FVector ScaleFactor = FVector::OneVector;
+    
+    if (bUseUniformScaling && OuterBoundingBoxSize != FVector::ZeroVector)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("🎯 Applying uniform scaling with bounding box: %s"),
+               *OuterBoundingBoxSize.ToString());
+               
+        // **FIX: Handle single point scaling properly**
+        if (SpawnLocations.Num() == 1)
+        {
+            UE_LOG(LogJUSYNC, Log, TEXT("🔧 Single spawn point - calculating scale based on mesh bounds"));
+            
+            // Calculate mesh extent from first mesh data
+            FVector MeshSize(40.0f, 40.0f, 40.0f); // Default fallback
+            if (MeshDataArray.Num() > 0 && MeshDataArray[0].Vertices.Num() > 0)
+            {
+                FBox MeshBounds(EForceInit::ForceInit);
+                for (const FVector& Vertex : MeshDataArray[0].Vertices)
+                {
+                    MeshBounds += Vertex;
+                }
+                MeshSize = MeshBounds.GetSize();
+                UE_LOG(LogJUSYNC, Log, TEXT("📐 Calculated mesh size from vertices: %s"), *MeshSize.ToString());
+            }
+
+            // Calculate scale factor for single point
+            if (bPreserveAspectRatio)
+            {
+                float MinScale = FMath::Min3(
+                    MeshSize.X > 0 ? OuterBoundingBoxSize.X / MeshSize.X : 1.0f,
+                    MeshSize.Y > 0 ? OuterBoundingBoxSize.Y / MeshSize.Y : 1.0f,
+                    MeshSize.Z > 0 ? OuterBoundingBoxSize.Z / MeshSize.Z : 1.0f
+                );
+                ScaleFactor = FVector(MinScale, MinScale, MinScale);
+            }
+            else
+            {
+                ScaleFactor = FVector(
+                    MeshSize.X > 0 ? OuterBoundingBoxSize.X / MeshSize.X : 1.0f,
+                    MeshSize.Y > 0 ? OuterBoundingBoxSize.Y / MeshSize.Y : 1.0f,
+                    MeshSize.Z > 0 ? OuterBoundingBoxSize.Z / MeshSize.Z : 1.0f
+                );
+            }
+
+            UE_LOG(LogJUSYNC, Log, TEXT("🎯 Single point scale factor: %s (MeshSize: %s, TargetSize: %s)"),
+                   *ScaleFactor.ToString(), *MeshSize.ToString(), *OuterBoundingBoxSize.ToString());
+        }
+        else
+        {
+            // Multi-point scaling using existing logic
+            FinalLocations = CalculateScaledPositions(
+                SpawnLocations,
+                OuterBoundingBoxSize,
+                bPreserveAspectRatio,
+                ScaleFactor
+            );
+        }
+
+        UE_LOG(LogJUSYNC, Log, TEXT("📏 Final scale factor: %s"), *ScaleFactor.ToString());
+    }
+
+    // Get subsystem and world
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available"));
+        return TArray<AActor*>();
+    }
+
+    UWorld* World = Subsystem->GetWorld();
+    if (!World)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("No valid world context"));
+        return TArray<AActor*>();
+    }
+
+    // **ENHANCED SPAWNING LOGIC**
+    TArray<AActor*> SpawnedActors;
+    SpawnedActors.Reserve(MeshDataArray.Num());
+    int32 SuccessCount = 0;
+
+    UE_LOG(LogJUSYNC, Log, TEXT("=== STARTING BATCH SPAWN ==="));
+    UE_LOG(LogJUSYNC, Log, TEXT("Meshes: %d, Uniform Scaling: %s, Scale Factor: %s"),
+           MeshDataArray.Num(), bUseUniformScaling ? TEXT("YES") : TEXT("NO"), *ScaleFactor.ToString());
+
+    for (int32 i = 0; i < MeshDataArray.Num(); ++i)
+    {
+        // Process mesh data
+        FJUSYNCMeshData ProcessedMeshData = FixMeshDataForSpawning(MeshDataArray[i]);
+        FRotator UERotation = ConvertParaViewToUERotation(FinalRotations[i]);
+
+        UE_LOG(LogJUSYNC, Log, TEXT("🎯 Spawning mesh %d '%s' at location %s with rotation %s"),
+               i, *ProcessedMeshData.ElementName, *FinalLocations[i].ToString(), *UERotation.ToString());
+
+        // **FIXED ACTOR SPAWNING - Let engine auto-generate names**
+        FActorSpawnParameters SpawnParams;
+        SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+        // **CRITICAL FIX: Do NOT set SpawnParams.Name - let Unreal Engine auto-generate unique names**
+
+        AActor* SpawnedActor = World->SpawnActor<AActor>(SpawnParams);
+        if (!SpawnedActor)
+        {
+            UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to spawn actor %d"), i);
+            SpawnedActors.Add(nullptr);
+            continue;
+        }
+
+        // **ENHANCED: Use Tags for identification instead of relying on names**
+        SpawnedActor->Tags.Add(FName(*FString::Printf(TEXT("JUSYNC_%s_%d"), *ProcessedMeshData.ElementName, i)));
+        UE_LOG(LogJUSYNC, Log, TEXT("✅ Spawned actor with auto-generated name: %s"), *SpawnedActor->GetName());
+
+        // **ENHANCED COMPONENT CREATION**
+        URealtimeMeshComponent* MeshComp = NewObject<URealtimeMeshComponent>(SpawnedActor);
+        SpawnedActor->SetRootComponent(MeshComp);
+        MeshComp->RegisterComponent();
+
+        // **ENHANCED TRANSFORM APPLICATION**
+        FTransform ActorTransform(UERotation, FinalLocations[i], ScaleFactor);
+        SpawnedActor->SetActorTransform(ActorTransform);
+
+        // **ENHANCED SCALING APPLICATION** - Multiple methods for reliability
+        if (bUseUniformScaling && ScaleFactor != FVector::OneVector)
+        {
+            // Method 1: Component-level scaling
+            MeshComp->SetWorldScale3D(ScaleFactor);
+            // Method 2: Actor-level scaling (redundant but ensures it works)
+            SpawnedActor->SetActorScale3D(ScaleFactor);
+            // Method 3: Force transform update
+            SpawnedActor->SetActorTransform(FTransform(UERotation, FinalLocations[i], ScaleFactor));
+            // Method 4: Mark for render state update
+            MeshComp->MarkRenderStateDirty();
+
+            UE_LOG(LogJUSYNC, Log, TEXT("🔧 Applied scale %s to actor %d (Actor: %s, Component: %s)"),
+                   *ScaleFactor.ToString(), i,
+                   *SpawnedActor->GetActorScale3D().ToString(),
+                   *MeshComp->GetComponentScale().ToString());
+        }
+
+        // **ENHANCED MATERIAL APPLICATION**
+        if (Material)
+        {
+            // Always use the provided material (your texture material from Blueprint)
+            MeshComp->SetMaterial(0, Material);
+            UE_LOG(LogJUSYNC, Log, TEXT("✅ Applied PROVIDED material to mesh %d (prioritizing over auto-detection)"), i);
+        }
+        else
+        {
+            // Only use automatic detection if NO material is provided
+            FString ContentType = DetectUSDContentType(USDBuffer);
+            UE_LOG(LogJUSYNC, Log, TEXT("🎨 USD Content Type: %s"), *ContentType);
+            
+            if (ContentType == TEXT("VERTEX_COLORS"))
+            {
+                UMaterial* VertexColorMaterial = LoadObject<UMaterial>(nullptr, TEXT("/Game/Materials/M_VertexColor"));
+                if (VertexColorMaterial)
+                {
+                    MeshComp->SetMaterial(0, VertexColorMaterial);
+                    UE_LOG(LogJUSYNC, Log, TEXT("✅ Applied M_VertexColor material (auto-detected)"));
+                }
+            }
+            else if (ContentType == TEXT("TEXTURES"))
+            {
+                UMaterial* TextureMaterial = LoadObject<UMaterial>(nullptr, TEXT("/Game/Materials/M_BaseMaterial"));
+                if (TextureMaterial)
+                {
+                    MeshComp->SetMaterial(0, TextureMaterial);
+                    UE_LOG(LogJUSYNC, Log, TEXT("✅ Applied texture material to mesh %d (auto-detected)"), i);
+                }
+            }
+            else
+            {
+                ApplyEnhancedDefaultMaterial(MeshComp);
+            }
+        }
+
+        // **ENHANCED MESH CREATION**
+        bool bSuccess = Subsystem->CreateRealtimeMeshFromJUSYNC(ProcessedMeshData, MeshComp);
+        if (bSuccess)
+        {
+            SuccessCount++;
+            SpawnedActors.Add(SpawnedActor);
+
+            // **FINAL VERIFICATION**
+            FVector ActualLocation = SpawnedActor->GetActorLocation();
+            FVector ActualScale = SpawnedActor->GetActorScale3D();
+            FRotator ActualRotation = SpawnedActor->GetActorRotation();
+
+            UE_LOG(LogJUSYNC, Log, TEXT("✅ Successfully spawned mesh %d at %s (Scale: %s, Rotation: %s)"),
+                   i, *ActualLocation.ToString(), *ActualScale.ToString(), *ActualRotation.ToString());
+        }
+        else
+        {
+            UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to create RealtimeMesh for actor %d, destroying"), i);
+            SpawnedActor->Destroy();
+            SpawnedActors.Add(nullptr);
+        }
+    }
+
+    // **ENHANCED COMPLETION LOGGING**
+    UE_LOG(LogJUSYNC, Log, TEXT("=== BATCH SPAWN COMPLETE: %d/%d successful ==="),
+           SuccessCount, MeshDataArray.Num());
+    if (bUseUniformScaling)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("🎯 Uniform scaling applied with factor: %s"),
+               *ScaleFactor.ToString());
+    }
+
+    // Display success message
+    FString Message = FString::Printf(TEXT("Batch Spawn Complete: %d/%d meshes spawned successfully"),
+                                     SuccessCount, MeshDataArray.Num());
+    //DisplayDebugMessage(Message, 5.0f, SuccessCount == MeshDataArray.Num() ? FLinearColor::Green : FLinearColor::Yellow);
+
+    return SpawnedActors;
+}
+
+
+FJUSYNCMeshData UJUSYNCBlueprintLibrary::FixMeshDataForSpawning(const FJUSYNCMeshData& InputMeshData)
+{
+    FJUSYNCMeshData FixedData = InputMeshData;
+    
+    // Basic vertex validation
+    for (int32 i = 0; i < FixedData.Vertices.Num(); ++i)
+    {
+        FVector& Vertex = FixedData.Vertices[i];
+        if (!FMath::IsFinite(Vertex.X) || !FMath::IsFinite(Vertex.Y) || !FMath::IsFinite(Vertex.Z))
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Fixed invalid vertex at index %d"), i);
+            Vertex = FVector::ZeroVector;
+        }
+    }
+    
+    // Basic triangle validation - keep only valid triangles
+    TArray<int32> ValidTriangles;
+    ValidTriangles.Reserve(FixedData.Triangles.Num());
+    
+    for (int32 i = 0; i < FixedData.Triangles.Num(); i += 3)
+    {
+        if (i + 2 < FixedData.Triangles.Num())
+        {
+            int32 i0 = FixedData.Triangles[i];
+            int32 i1 = FixedData.Triangles[i + 1];
+            int32 i2 = FixedData.Triangles[i + 2];
+            
+            // Basic bounds checking and degenerate triangle check
+            if (i0 >= 0 && i0 < FixedData.Vertices.Num() &&
+                i1 >= 0 && i1 < FixedData.Vertices.Num() &&
+                i2 >= 0 && i2 < FixedData.Vertices.Num() &&
+                i0 != i1 && i1 != i2 && i0 != i2)
+            {
+                ValidTriangles.Add(i0);
+                ValidTriangles.Add(i1);
+                ValidTriangles.Add(i2);
+            }
+        }
+    }
+    
+    FixedData.Triangles = ValidTriangles;
+    
+    // Recalculate normals if missing or invalid
+    if (!FixedData.HasNormals() || FixedData.Normals.Num() != FixedData.Vertices.Num())
+    {
+        FixedData.Normals.SetNum(FixedData.Vertices.Num());
+        for (int32 i = 0; i < FixedData.Normals.Num(); ++i)
+        {
+            FixedData.Normals[i] = FVector::ZeroVector;
+        }
+        
+        // Calculate face normals and accumulate
+        for (int32 i = 0; i < FixedData.Triangles.Num(); i += 3)
+        {
+            int32 i0 = FixedData.Triangles[i];
+            int32 i1 = FixedData.Triangles[i + 1];
+            int32 i2 = FixedData.Triangles[i + 2];
+            
+            if (i0 < FixedData.Vertices.Num() && i1 < FixedData.Vertices.Num() && i2 < FixedData.Vertices.Num())
+            {
+                FVector v0 = FixedData.Vertices[i0];
+                FVector v1 = FixedData.Vertices[i1];
+                FVector v2 = FixedData.Vertices[i2];
+                
+                FVector FaceNormal = FVector::CrossProduct(v1 - v0, v2 - v0).GetSafeNormal();
+                
+                FixedData.Normals[i0] += FaceNormal;
+                FixedData.Normals[i1] += FaceNormal;
+                FixedData.Normals[i2] += FaceNormal;
+            }
+        }
+        
+        // Normalize accumulated normals
+        for (int32 i = 0; i < FixedData.Normals.Num(); ++i)
+        {
+            FixedData.Normals[i] = FixedData.Normals[i].GetSafeNormal();
+            if (FixedData.Normals[i].IsNearlyZero())
+            {
+                FixedData.Normals[i] = FVector::UpVector; // Fallback normal
+            }
+        }
+        
+        UE_LOG(LogJUSYNC, Log, TEXT("Recalculated normals for mesh: %s"), *InputMeshData.ElementName);
+    }
+    
+    // Validate and fix UV coordinates
+    if (FixedData.HasUVs())
+    {
+        for (int32 i = 0; i < FixedData.UVs.Num(); ++i)
+        {
+            FVector2D& UV = FixedData.UVs[i];
+            if (!FMath::IsFinite(UV.X) || !FMath::IsFinite(UV.Y))
+            {
+                UV = FVector2D::ZeroVector;
+            }
+        }
+    }
+    
+    return FixedData;
+}
+
+
+FBox UJUSYNCBlueprintLibrary::CalculateMeshBounds(const FJUSYNCMeshData& MeshData, const FVector& Location)
+{
+    FBox MeshBounds(EForceInit::ForceInit);
+    
+    // Add all vertices to the bounding box, transformed by location
+    for (const FVector& Vertex : MeshData.Vertices)
+    {
+        FVector WorldVertex = Vertex + Location;
+        MeshBounds += WorldVertex;
+    }
+    
+    return MeshBounds;
+}
+
+TArray<FVector> UJUSYNCBlueprintLibrary::CalculateScaledPositions(
+    const TArray<FVector>& OriginalLocations,
+    const FVector& BoundingBoxSize,
+    bool bPreserveAspectRatio,
+    FVector& OutScaleFactor)
+{
+    if (OriginalLocations.Num() == 0 || BoundingBoxSize == FVector::ZeroVector)
+    {
+        OutScaleFactor = FVector::OneVector;
+        return OriginalLocations;
+    }
+
+    // **FIX: Handle single point case with mesh-based scaling**
+    if (OriginalLocations.Num() == 1)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("🔧 Single spawn point - calculating scale based on mesh bounds"));
+        
+        // For single point, calculate scale based on the mesh extent from USD
+        // Your USD shows extent [(-20, -20, -20), (20, 20, 20)] = 40x40x40 size
+        FVector MeshSize(40.0f, 40.0f, 40.0f); // Based on your USD extent
+        
+        if (bPreserveAspectRatio)
+        {
+            float MinScale = FMath::Min3(
+                BoundingBoxSize.X / MeshSize.X,
+                BoundingBoxSize.Y / MeshSize.Y,
+                BoundingBoxSize.Z / MeshSize.Z
+            );
+            OutScaleFactor = FVector(MinScale, MinScale, MinScale);
+        }
+        else
+        {
+            OutScaleFactor = FVector(
+                BoundingBoxSize.X / MeshSize.X,
+                BoundingBoxSize.Y / MeshSize.Y,
+                BoundingBoxSize.Z / MeshSize.Z
+            );
+        }
+        
+        UE_LOG(LogJUSYNC, Log, TEXT("🎯 Single point scale factor: %s"), *OutScaleFactor.ToString());
+        return OriginalLocations; // Return original location, scaling will be applied to actor
+    }
+
+    // Rest of your existing multi-point logic...
+    FBox CombinedBounds(EForceInit::ForceInit);
+    for (const FVector& Location : OriginalLocations)
+    {
+        CombinedBounds += Location;
+    }
+
+    FVector CurrentSize = CombinedBounds.GetSize();
+    FVector BoundingBoxCenter = CombinedBounds.GetCenter();
+
+    if (CurrentSize.IsNearlyZero())
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("🔧 Zero-size bounding box detected - no scaling needed"));
+        OutScaleFactor = FVector::OneVector;
+        return OriginalLocations;
+    }
+
+    // Calculate scale factor with safety checks
+    if (bPreserveAspectRatio)
+    {
+        float MinScale = FMath::Min3(
+            CurrentSize.X > 0 ? BoundingBoxSize.X / CurrentSize.X : 1.0f,
+            CurrentSize.Y > 0 ? BoundingBoxSize.Y / CurrentSize.Y : 1.0f,
+            CurrentSize.Z > 0 ? BoundingBoxSize.Z / CurrentSize.Z : 1.0f
+        );
+        OutScaleFactor = FVector(MinScale, MinScale, MinScale);
+    }
+    else
+    {
+        OutScaleFactor = FVector(
+            CurrentSize.X > 0 ? BoundingBoxSize.X / CurrentSize.X : 1.0f,
+            CurrentSize.Y > 0 ? BoundingBoxSize.Y / CurrentSize.Y : 1.0f,
+            CurrentSize.Z > 0 ? BoundingBoxSize.Z / CurrentSize.Z : 1.0f
+        );
+    }
+
+    // Calculate scaled positions
+    TArray<FVector> ScaledLocations;
+    ScaledLocations.Reserve(OriginalLocations.Num());
+
+    for (const FVector& Location : OriginalLocations)
+    {
+        FVector RelativePosition = Location - BoundingBoxCenter;
+        FVector ScaledPosition = RelativePosition * OutScaleFactor;
+        FVector NewLocation = BoundingBoxCenter + ScaledPosition;
+        ScaledLocations.Add(NewLocation);
+    }
+
+    UE_LOG(LogJUSYNC, Log, TEXT("🎯 Multi-point scaling applied: %s"), *OutScaleFactor.ToString());
+    return ScaledLocations;
+}
+
+static void ApplyEnhancedDefaultMaterial(URealtimeMeshComponent* MeshComp)
+{
+    UMaterial* DefaultMaterial = UMaterial::GetDefaultMaterial(MD_Surface);
+    if (DefaultMaterial)
+    {
+        UMaterialInstanceDynamic* DynamicMaterial = UMaterialInstanceDynamic::Create(DefaultMaterial, MeshComp);
+        if (DynamicMaterial)
+        {
+            DynamicMaterial->SetScalarParameterValue(TEXT("Metallic"), 0.0f);
+            DynamicMaterial->SetScalarParameterValue(TEXT("Roughness"), 0.8f);
+            DynamicMaterial->SetVectorParameterValue(TEXT("BaseColor"), FLinearColor::White);
+            MeshComp->SetMaterial(0, DynamicMaterial);
+        }
+    }
+}
