@@ -137,6 +137,9 @@ Plugins/RealtimeMeshComponents/*
 # Builds
 Build/*
 
+# Benchmark folder
+Benchmarks/*
+
 # Whitelist PakBlacklist-<BuildConfiguration>.txt files
 !Build/*/
 Build/*/**

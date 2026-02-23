@@ -10,10 +10,16 @@
 #include "MaterialDomain.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
+#include "Containers/Map.h"
+#include "UObject/SoftObjectPtr.h"
+#include <functional>
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
 #include "AnariUsdMiddleware.h"
 #endif
+
+// Forward declaration to avoid circular dependency
+class UJUSYNCBlueprintLibrary;
 
 #include "JUSYNCSubsystem.generated.h"
 
@@ -102,6 +108,39 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Mesh|Legacy", DisplayName = "Batch Create Realtime Meshes From JUSYNC (Legacy)")
     bool BatchCreateRealtimeMeshesFromJUSYNC(const TArray<FJUSYNCMeshData>& MeshDataArray, const TArray<URealtimeMeshComponent*>& MeshComponents);
 
+    // Large mesh handling with automatic splitting
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Mesh|Advanced", DisplayName = "Create Realtime Mesh From JUSYNC With Splitting")
+    bool CreateRealtimeMeshFromJUSYNCWithSplitting(
+        const FJUSYNCMeshData& MeshData,
+        URealtimeMeshComponent* RealtimeMeshComponent,
+        int32 MaxVerticesPerChunk = 32768
+    );
+
+    // Core mesh splitting algorithm for large meshes
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Mesh|Advanced", DisplayName = "Split Large Mesh For RealtimeMesh")
+    TArray<FJUSYNCMeshData> SplitLargeMeshForRealtimeMesh(
+        const FJUSYNCMeshData& LargeMesh,
+        int32 MaxVerticesPerChunk = 32768,
+        bool bPreserveConnectivity = true
+    );
+
+    // Create multiple RMC components for very large meshes
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Mesh|Advanced", DisplayName = "Create Multiple RMC Components For Large Mesh")
+    TArray<URealtimeMeshComponent*> CreateMultipleRMCComponentsForLargeMesh(
+        AActor* ParentActor,
+        const FJUSYNCMeshData& LargeMesh,
+        int32 MaxVerticesPerComponent = 65535
+    );
+
+    // Memory limit detection
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Mesh|Advanced", DisplayName = "Check Memory Limits For Mesh")
+    bool CheckMemoryLimitsForMesh(
+        const FJUSYNCMeshData& MeshData,
+        float& OutRequiredRAM_MB,
+        float& OutRequiredVRAM_MB,
+        float SafetyMarginPercent = 20.0f
+    );
+
     // Conversion utilities for RealtimeMesh
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Mesh")
     FJUSYNCRealtimeMeshData ConvertToRealtimeMeshFormat(const FJUSYNCMeshData& StandardMesh);
@@ -109,6 +148,31 @@ public:
     // Texture Integration
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Texture")
     UTexture2D* CreateUETextureFromJUSYNC(const FJUSYNCTextureData& TextureData);
+
+    // Material Caching
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Materials")
+    void PreloadCommonMaterials();
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Materials")
+    UMaterialInterface* GetCachedMaterial(const FString& MaterialPath);
+
+    // Dynamic Material Creation
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Materials|Async")
+    void CreateMaterialFromTexture_Async(UTexture2D* Texture, URealtimeMeshComponent* TargetComponent);
+
+    // Async Material Creation with Return (for batch spawning)
+    // Internal implementation - uses standard delegate
+    void CreateMaterialFromTexture_Async_Return_Internal(
+        UTexture2D* Texture,
+        UMaterialInterface* BaseMaterial,
+        FName TextureParameterName,
+        std::function<void(UMaterialInstanceDynamic*)> OnMaterialCreated);
+
+    // Async Mesh Processing
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Mesh|Async")
+    void CreateRealtimeMeshFromJUSYNC_Async(
+        const FJUSYNCMeshData& MeshData,
+        URealtimeMeshComponent* RealtimeMeshComponent);
 
     // Callback handlers for Blueprint Library
     UFUNCTION()
@@ -140,6 +204,14 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Broker", DisplayName = "Request File (Sync)")
     bool RequestFile(const FString& Filename, int32 TargetRank, int32 TimeoutMs, TArray<uint8>& OutData);
 
+    // Parallel download functions
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Broker", DisplayName = "Request Files Parallel (Sync)")
+    bool RequestFilesParallel(
+        const TArray<FString>& Filenames,
+        const TArray<int32>& TargetRanks,
+        int32 TimeoutMs,
+        TArray<FJUSYNCFileData>& OutFiles);
+
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Broker", DisplayName = "Request Frame (Sync)")
     bool RequestFrame(int32 FrameNumber, int32 TargetRank, int32 TimeoutMs, TArray<FJUSYNCFileData>& OutFiles);
 
@@ -155,8 +227,95 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Broker", DisplayName = "Request Worker Count Excluding Rank0 (Sync)")
     bool RequestWorkerCountExcludingRank0(int32 TimeoutMs, int32& OutWorkerCount);
 
+    // ========== PERFORMANCE METRICS FUNCTIONS ==========
+
+    // Metrics configuration
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Metrics")
+    void ConfigureMetrics(const FJUSYNCMetricsConfig& NewConfig);
+
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Metrics")
+    FJUSYNCMetricsConfig GetMetricsConfig() const;
+
+    // Metrics collection control
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Metrics")
+    void StartMetricsCollection();
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Metrics")
+    void StopMetricsCollection();
+
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Metrics")
+    bool IsMetricsCollectionActive() const;
+
+    // Metrics data access
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Metrics")
+    FJUSYNCMetricsData GetCurrentMetrics() const;
+
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Metrics")
+    TArray<FJUSYNCMetricsData> GetMetricsHistory(int32 MaxSamples = 100) const;
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Metrics")
+    void ClearMetricsHistory();
+
+    // Metrics export
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Metrics")
+    bool ExportMetricsToCSV(const FString& FilePath);
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Metrics")
+    bool ExportMetricsToJSON(const FString& FilePath);
+
+    // Metrics events
+    UPROPERTY(BlueprintAssignable, Category = "JUSYNC|Metrics")
+    FJUSYNCMetricsUpdated OnMetricsUpdated;
+
+    // Manual metric updates (for custom tracking)
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Metrics")
+    void RecordMeshSplit(int32 OriginalVertices, int32 OriginalTriangles, int32 ChunksCreated, float SplitTime_ms);
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Metrics")
+    void RecordMeshCreation(int32 Vertices, int32 Triangles, float CreationTime_ms);
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Metrics")
+    void RecordError(const FString& ErrorType);
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Metrics")
+    void RecordMemoryWarning(const FString& WarningType);
+
+    // Real-time display
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Metrics")
+    void ShowMetricsDisplay(bool bShow);
+
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Metrics")
+    bool IsMetricsDisplayVisible() const;
+
+    // Hardware monitoring
+    float GetSystemRAMUsage_GB() const;
+    float GetVRAMUsage_GB() const;
+    float GetCPUUsage_Percent() const;
+    float GetGPUUsage_Percent() const;
+
+    // Metrics collection functions
+    void CollectMetrics();
+
+    // Benchmark-specific metrics (don't reset accumulator)
+    int32 GetSplitMeshCount() const;
 
 private:
+    // Helper functions for async processing
+    struct FProcessedMeshData
+    {
+        FString ElementName;
+        TArray<FVector3f> Positions;
+        TArray<FVector3f> Normals;
+        TArray<FVector2DHalf> UVs;
+        TArray<FColor> Colors;
+        TArray<int32> Triangles;
+        int32 FinalVertexCount;
+        int32 FinalTriCount;
+    };
+
+    FProcessedMeshData ProcessMeshDataCPU(const FJUSYNCMeshData& MeshData);
+    void ApplyProcessedMeshToComponent(const FProcessedMeshData& ProcessedData, URealtimeMeshComponent* RealtimeMeshComponent);
+
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     TUniquePtr<anari_usd_middleware::AnariUsdMiddleware> Middleware;
 
@@ -172,4 +331,71 @@ private:
 
     mutable FCriticalSection MiddlewareMutex;
     std::atomic<bool> bIsInitialized{ false };
+
+    // Material caching
+    TMap<FString, TSoftObjectPtr<UMaterialInterface>> MaterialCache;
+    mutable FCriticalSection MaterialCacheMutex;
+
+    // ========== PERFORMANCE METRICS PRIVATE MEMBERS ==========
+
+    // Metrics configuration and state
+    FJUSYNCMetricsConfig MetricsConfig;
+    FJUSYNCMetricsData CurrentMetrics;
+    TArray<FJUSYNCMetricsData> MetricsHistory;
+    mutable FCriticalSection MetricsMutex;
+
+    // Metrics collection state
+    std::atomic<bool> bMetricsCollectionActive{ false };
+    FTimerHandle MetricsCollectionTimerHandle;
+    float LastCollectionTime{ 0.0f };
+
+    // Accumulated statistics for averaging
+    struct FMetricsAccumulator
+    {
+        int32 MeshSplitCount{ 0 };
+        int32 MeshCreationCount{ 0 };
+        int32 ErrorCount{ 0 };
+        int32 MemoryWarningCount{ 0 };
+        float TotalSplitTime_ms{ 0.0f };
+        float TotalCreationTime_ms{ 0.0f };
+        int32 TotalSplitVertices{ 0 };
+        int32 TotalSplitTriangles{ 0 };
+        int32 TotalCreatedVertices{ 0 };
+        int32 TotalCreatedTriangles{ 0 };
+        int32 TotalChunksCreated{ 0 };
+
+        void Reset()
+        {
+            MeshSplitCount = 0;
+            MeshCreationCount = 0;
+            ErrorCount = 0;
+            MemoryWarningCount = 0;
+            TotalSplitTime_ms = 0.0f;
+            TotalCreationTime_ms = 0.0f;
+            TotalSplitVertices = 0;
+            TotalSplitTriangles = 0;
+            TotalCreatedVertices = 0;
+            TotalCreatedTriangles = 0;
+            TotalChunksCreated = 0;
+        }
+    };
+
+    FMetricsAccumulator MetricsAccumulator;
+
+    // Metrics collection functions (implementation details)
+    void UpdateMetricsData();
+    void SaveMetricsToHistory();
+
+    // Component tracking
+    int32 CountRMCComponents() const;
+    int32 CountActiveRMCComponents() const;
+    int32 CountInstancedRMCComponents() const;
+
+    // Display management
+    bool bMetricsDisplayVisible{ false };
+    TWeakObjectPtr<class UUserWidget> MetricsDisplayWidget;
+
+    void CreateMetricsDisplay();
+    void DestroyMetricsDisplay();
+    void UpdateMetricsDisplay();
 };
