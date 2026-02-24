@@ -1,0 +1,150 @@
+Unreal Benchmark Exporter - Blueprint Usage Guide
+==================================================
+
+The plugin provides several Blueprint functions for accessing benchmark metrics.
+
+1. **Enable the Plugin:**
+   - Go to Edit > Plugins
+   - Search for "Unreal Benchmark Exporter" in Utilities category
+   - Enable the plugin and restart the editor
+
+2. **Available Blueprint Functions:**
+   In Blueprint graphs, search for:
+   - "Get Benchmark Metrics" - Returns a FBenchmarkMetrics struct
+   - "Get Prometheus Metrics Text" - Returns metrics as Prometheus text
+   - "Start Prometheus Server" - Starts metrics export (port 9090)
+   - "Stop Prometheus Server" - Stops metrics export
+   - "Is Prometheus Server Running" - Checks if exporter is active
+   - "Push Metrics to Pushgateway" - Push directly to Prometheus Pushgateway
+   - "Push Metrics to Endpoint" - Push to any HTTP endpoint
+
+3. **Basic Usage Example:**
+   
+   **Event BeginPlay:**
+   ```
+   [Event BeginPlay]
+     |
+   [Start Prometheus Server] (Port: 9090)
+     |
+   [Print String] "Prometheus server started on port 9090"
+   ```
+
+   **Getting Metrics:**
+   ```
+   [Custom Event] GetMetrics
+     |
+   [Get Benchmark Metrics] -> (Return Value: FBenchmarkMetrics)
+     |
+   [Break FBenchmarkMetrics]
+     |
+   [Print String] "FPS: " + [FPS] + " Memory: " + [UsedPhysicalMemoryMB] + "MB"
+   ```
+
+   **Getting Prometheus Text:**
+   ```
+   [Custom Event] ExportMetrics
+     |
+   [Get Prometheus Metrics Text] -> (Return Value: String)
+     |
+   [Write to File] (File Path: "Saved/PrometheusMetrics/metrics.prom")
+   ```
+
+4. **FBenchmarkMetrics Struct Fields:**
+   - FPS (float) - Frames per second
+   - FrameTimeMs (float) - Frame time in milliseconds
+   - UsedPhysicalMemoryMB (int64) - Physical memory used in MB
+   - AvailablePhysicalMemoryMB (int64) - Available physical memory in MB
+   - UsedVirtualMemoryMB (int64) - Virtual memory used in MB
+   - CPUUsagePercent (float) - CPU usage percentage
+   - TotalVertices (int32) - Total vertices rendered
+   - TotalTriangles (int32) - Total triangles rendered
+   - DrawCalls (int32) - Number of draw calls
+   - RenderedPrimitives (int32) - Number of rendered primitives
+   - GPUMemoryUsedMB (float) - GPU memory used in MB
+   - GPUMemoryAvailableMB (float) - GPU memory available in MB
+
+5. **Complete Example - Export to File Every 5 Seconds:**
+   
+   **Event BeginPlay:**
+   ```
+   [Event BeginPlay]
+     |
+   [Start Prometheus Server]
+     |
+   [Set Timer by Function Name] 
+        Function Name: "ExportMetricsToFile"
+        Time: 5.0
+        Looping: True
+   ```
+
+   **ExportMetricsToFile Function:**
+   ```
+   [Custom Event] ExportMetricsToFile
+     |
+   [Get Prometheus Metrics Text] -> (MetricsText)
+     |
+   [Get Project Saved Directory] -> (SavedDir)
+     |
+   [Append Path] SavedDir + "PrometheusMetrics/metrics.prom" -> (FilePath)
+     |
+   [Write String to File]
+        File Path: FilePath
+        Text: MetricsText
+        bAppend: False
+   ```
+
+6. **Direct HTTP Push (Recommended):**
+   
+   **Push to Prometheus Pushgateway:**
+   ```
+   [Custom Event] PushMetrics
+     |
+   [Push Metrics to Pushgateway]
+        Pushgateway URL: "http://localhost:9091"
+        Job Name: "unreal_benchmark"
+        On Complete: [Custom Event] OnPushComplete
+   ```
+   
+   **Push to any HTTP endpoint:**
+   ```
+   [Push Metrics to Endpoint]
+        Endpoint URL: "http://your-server:9090/metrics"
+        On Complete: [Custom Event] OnPushComplete
+   ```
+   
+   **OnPushComplete Event:**
+   ```
+   [Custom Event] OnPushComplete (bSuccess: Boolean)
+     |
+   [Branch] (bSuccess)
+        True: [Print String] "Metrics pushed successfully"
+        False: [Print String] "Push failed: " + [Get Last Error]
+   ```
+
+7. **HTTP Server for Prometheus (Alternative):**
+   After writing metrics to file, run a simple HTTP server:
+   ```
+   cd "YourProject/Saved/PrometheusMetrics/"
+   python -m http.server 9090
+   ```
+   
+   Then configure Prometheus to scrape:
+   ```yaml
+   scrape_configs:
+     - job_name: 'unreal_benchmarks'
+       static_configs:
+         - targets: ['localhost:9090']
+   ```
+
+7. **Tips:**
+   - The plugin automatically starts collecting metrics when loaded
+   - Metrics are updated every second
+   - Use "Get Benchmark Metrics" for in-game display
+   - Use "Get Prometheus Metrics Text" for external monitoring
+   - The HTTP server can be started/stopped at runtime
+
+8. **Troubleshooting:**
+   - If Blueprint nodes don't appear, recompile the plugin
+   - Check Output Log for plugin initialization messages
+   - Port 9090 must be available for HTTP server
+   - Ensure plugin is enabled in project settings

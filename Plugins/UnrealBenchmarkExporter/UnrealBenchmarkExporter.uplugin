@@ -1,0 +1,28 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0.0",
+	"FriendlyName": "Unreal Benchmark Exporter",
+	"Description": "Exports Unreal Engine benchmarks (FPS, memory, CPU usage, vertices) to Prometheus for Grafana dashboards",
+	"Category": "Utilities",
+	"CreatedBy": "Unreal Developer",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"EngineVersion": "5.5.0",
+	"CanContainContent": false,
+	"Installed": true,
+	"Modules": [
+		{
+			"Name": "UnrealBenchmarkExporter",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"PlatformAllowList": [
+				"Win64",
+				"Linux"
+			]
+		}
+	],
+	"Plugins": []
+}
