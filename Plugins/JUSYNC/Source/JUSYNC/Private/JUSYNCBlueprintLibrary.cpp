@@ -30,6 +30,11 @@
 #include <unistd.h>
 #endif
 
+// Forward declarations for helper functions
+static int64 GetVRAMUsageBytes();
+static float GetCPUUsagePercentage();
+static int32 GetActiveThreadCount();
+
 // Static member initialization
 TArray<FJUSYNCFileData> UJUSYNCBlueprintLibrary::ReceivedFiles;
 TArray<FString> UJUSYNCBlueprintLibrary::ReceivedMessages;
@@ -47,6 +52,7 @@ TArray<FJUSYNCBenchmarkResult> UJUSYNCBlueprintLibrary::BenchmarkResults;
 FString UJUSYNCBlueprintLibrary::CurrentBenchmarkTest = TEXT("");
 FJUSYNCBenchmarkConfig UJUSYNCBlueprintLibrary::CurrentBenchmarkConfig;
 bool UJUSYNCBlueprintLibrary::bIsBenchmarking = false;
+FDateTime UJUSYNCBlueprintLibrary::BenchmarkSessionStartTime;
 
 // ========== CONNECTION MANAGEMENT ==========
 
@@ -2709,6 +2715,94 @@ AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshWithMaterial(
     return SpawnedActor;
 }
 
+AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshWithMaterial_Benchmarked(
+    const FJUSYNCMeshData& MeshData,
+    const FVector& SpawnLocation,
+    const FRotator& SpawnRotation,
+    UMaterialInterface* Material,
+    const FJUSYNCBenchmarkConfig& Config,
+    bool bUseUniformScaling,
+    FVector OuterBoundingBoxSize,
+    bool bPreserveAspectRatio,
+    bool bUseAsyncSpawning)
+{
+    // Start benchmark if enabled
+    bool bWasBenchmarking = bIsBenchmarking;
+    if (Config.bEnableBenchmarking && !bIsBenchmarking)
+    {
+        StartBenchmark(TEXT("SpawnRealtimeMeshWithMaterial"), Config);
+    }
+
+    // Measure before spawning
+    FPlatformMemoryStats StatsBefore = FPlatformMemory::GetStats();
+    int64 RAMBefore = StatsBefore.UsedPhysical;
+    int64 VRAMBefore = GetVRAMUsageBytes();
+    double StartTime = FPlatformTime::Seconds();
+
+    // Spawn the mesh using existing function
+    AActor* SpawnedActor = SpawnRealtimeMeshWithMaterial(
+        MeshData, SpawnLocation, SpawnRotation, Material,
+        bUseUniformScaling, OuterBoundingBoxSize,
+        bPreserveAspectRatio, bUseAsyncSpawning);
+
+    // Measure after spawning
+    double EndTime = FPlatformTime::Seconds();
+    float TimeMs = (EndTime - StartTime) * 1000.0f;
+    FPlatformMemoryStats StatsAfter = FPlatformMemory::GetStats();
+    int64 RAMAfter = StatsAfter.UsedPhysical;
+    int64 VRAMAfter = GetVRAMUsageBytes();
+
+    // Record benchmark result
+    if (Config.bEnableBenchmarking)
+    {
+        // Get additional metrics
+        float CPUUsage = GetCPUUsagePercentage();
+        int32 ActiveThreads = GetActiveThreadCount();
+        int64 RAMPeak = StatsAfter.PeakUsedPhysical;
+        
+        // Get GPU usage from subsystem
+        float GPUUsage = 0.0f;
+        UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+        if (Subsystem)
+        {
+            GPUUsage = Subsystem->GetGPUUsage_Percent();
+        }
+
+        FJUSYNCBenchmarkResult Result = CreateBenchmarkResultExtended(
+            CurrentBenchmarkTest,
+            TimeMs,
+            MeshData.GetTriangleCount(),
+            MeshData.GetVertexCount(),
+            RAMBefore,
+            RAMAfter,
+            RAMPeak,
+            RAMAfter, // RAMDuring - same as after for now
+            1, // Actor count
+            (SpawnedActor ? 0 : 1), // Error count
+            0, // Split mesh count
+            CPUUsage,
+            VRAMBefore,
+            VRAMAfter,
+            VRAMAfter, // VRAMPeak - same as after for now
+            ActiveThreads,
+            GPUUsage,
+            0, // HitchCount
+            0.0f, // AvgHitchDurationMs
+            0.0f // MaxHitchDurationMs
+        );
+
+        RecordBenchmarkResult(Result);
+
+        // End benchmark if we started it
+        if (!bWasBenchmarking)
+        {
+            EndBenchmark();
+        }
+    }
+
+    return SpawnedActor;
+}
+
 FJUSYNCMeshData UJUSYNCBlueprintLibrary::FixMeshDataForSpawning(const FJUSYNCMeshData& InputMeshData)
 {
     FJUSYNCMeshData FixedData = InputMeshData;
@@ -3239,9 +3333,13 @@ void UJUSYNCBlueprintLibrary::StartBenchmark(const FString& TestName, const FJUS
         return;
     }
 
+    // Clear any previous benchmark results when starting a new benchmark
+    ClearBenchmarkResults();
+
     CurrentBenchmarkTest = TestName;
     CurrentBenchmarkConfig = Config;
     bIsBenchmarking = true;
+    BenchmarkSessionStartTime = FDateTime::UtcNow();
 
     // Start metrics collection for split mesh tracking and other metrics
     UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
@@ -3251,7 +3349,7 @@ void UJUSYNCBlueprintLibrary::StartBenchmark(const FString& TestName, const FJUS
         UE_LOG(LogJUSYNC, Log, TEXT("Started metrics collection for benchmark"));
     }
 
-    UE_LOG(LogJUSYNC, Log, TEXT("Started benchmark: %s"), *TestName);
+    UE_LOG(LogJUSYNC, Log, TEXT("Started benchmark: %s at %s"), *TestName, *BenchmarkSessionStartTime.ToString());
 }
 
 void UJUSYNCBlueprintLibrary::EndBenchmark()
@@ -3399,9 +3497,26 @@ void UJUSYNCBlueprintLibrary::SaveAllBenchmarkResultsToJSON(const FString& Outpu
         SessionRAMStart = BenchmarkResults[0].RAMBeforeBytes;
         SessionRAMEnd = BenchmarkResults[BenchmarkResults.Num() - 1].RAMAfterBytes;
 
+        // Calculate actual elapsed session time from start to now
+        FDateTime SessionEndTime = FDateTime::UtcNow();
+        FDateTime SessionStartTime = BenchmarkSessionStartTime;
+        
+        // If session start time is not valid (e.g., SaveAllBenchmarkResultsToJSON called directly),
+        // use the timestamp of the first benchmark result as session start
+        if (SessionStartTime.GetTicks() == 0 && BenchmarkResults.Num() > 0)
+        {
+            SessionStartTime = BenchmarkResults[0].Timestamp;
+            UE_LOG(LogJUSYNC, Warning, TEXT("Using first benchmark result timestamp as session start time"));
+        }
+        
+        FTimespan ElapsedTime = SessionEndTime - SessionStartTime;
+        TotalSessionTimeMs = static_cast<int64>(ElapsedTime.GetTotalMilliseconds());
+
+        // Also calculate sum of individual test times for reference
+        int64 SumOfTestTimesMs = 0;
         for (const FJUSYNCBenchmarkResult& Result : BenchmarkResults)
         {
-            TotalSessionTimeMs += static_cast<int64>(Result.TotalTimeMs);
+            SumOfTestTimesMs += static_cast<int64>(Result.TotalTimeMs);
             TotalTriangles += Result.TriangleCount;
             TotalVertices += Result.VertexCount;
             TotalActors += Result.ActorCount;
@@ -3411,6 +3526,9 @@ void UJUSYNCBlueprintLibrary::SaveAllBenchmarkResultsToJSON(const FString& Outpu
             AvgFPS += Result.FPS;
             AvgFrameTimeMs += Result.FrameTimeMs;
         }
+
+        UE_LOG(LogJUSYNC, Log, TEXT("Benchmark session timing: Elapsed=%lld ms, Sum of tests=%lld ms, Difference=%lld ms"), 
+               TotalSessionTimeMs, SumOfTestTimesMs, TotalSessionTimeMs - SumOfTestTimesMs);
 
         AvgFPS /= BenchmarkResults.Num();
         AvgFrameTimeMs /= BenchmarkResults.Num();
@@ -3441,6 +3559,7 @@ void UJUSYNCBlueprintLibrary::SaveAllBenchmarkResultsToJSON(const FString& Outpu
     int64 SessionVRAMStart = 0;
     int64 SessionVRAMEnd = 0;
     int64 SessionVRAMPeak = 0;
+    int64 SessionRAMPeak = 0;
     int32 MaxActiveThreads = 0;
     int32 TotalHitchCount = 0;
     float AvgHitchDurationMs = 0.0f;
@@ -3456,6 +3575,7 @@ void UJUSYNCBlueprintLibrary::SaveAllBenchmarkResultsToJSON(const FString& Outpu
             AvgCPUUsage += Result.CPUUsagePercent;
             AvgGPUUsage += Result.GPUUsagePercent;
             SessionVRAMPeak = FMath::Max(SessionVRAMPeak, Result.VRAMPeakBytes);
+            SessionRAMPeak = FMath::Max(SessionRAMPeak, Result.RAMPeakBytes);
             MaxActiveThreads = FMath::Max(MaxActiveThreads, Result.ActiveThreadCount);
             TotalHitchCount += Result.HitchCount;
             AvgHitchDurationMs += Result.AvgHitchDurationMs;
@@ -3476,6 +3596,9 @@ void UJUSYNCBlueprintLibrary::SaveAllBenchmarkResultsToJSON(const FString& Outpu
     float SessionVRAMEndGB = SessionVRAMEnd / (1024.0f * 1024.0f * 1024.0f);
     float SessionVRAMPeakGB = SessionVRAMPeak / (1024.0f * 1024.0f * 1024.0f);
     float SessionVRAMDeltaGB = SessionVRAMDelta / (1024.0f * 1024.0f * 1024.0f);
+    
+    // Convert RAM peak to MB
+    float SessionRAMPeakMB = SessionRAMPeak / (1024.0f * 1024.0f);
 
     // Add session summary
     JSONData += TEXT("  \"session_summary\": {\n");
@@ -3494,6 +3617,7 @@ void UJUSYNCBlueprintLibrary::SaveAllBenchmarkResultsToJSON(const FString& Outpu
     JSONData += FString::Printf(TEXT("    \"session_ram_start_mb\": %.2f,\n"), SessionRAMStartMB);
     JSONData += FString::Printf(TEXT("    \"session_ram_end_mb\": %.2f,\n"), SessionRAMEndMB);
     JSONData += FString::Printf(TEXT("    \"session_ram_delta_mb\": %.2f,\n"), SessionRAMDeltaMB);
+    JSONData += FString::Printf(TEXT("    \"session_ram_peak_mb\": %.2f,\n"), SessionRAMPeakMB);
     JSONData += FString::Printf(TEXT("    \"avg_cpu_usage_percent\": %.1f,\n"), AvgCPUUsage);
     JSONData += FString::Printf(TEXT("    \"avg_gpu_usage_percent\": %.1f,\n"), AvgGPUUsage);
     JSONData += FString::Printf(TEXT("    \"max_active_threads\": %d,\n"), MaxActiveThreads);
@@ -3610,7 +3734,8 @@ void UJUSYNCBlueprintLibrary::SaveAllBenchmarkResultsToJSON(const FString& Outpu
 void UJUSYNCBlueprintLibrary::ClearBenchmarkResults()
 {
     BenchmarkResults.Empty();
-    UE_LOG(LogJUSYNC, Log, TEXT("Cleared all benchmark results"));
+    BenchmarkSessionStartTime = FDateTime();
+    UE_LOG(LogJUSYNC, Log, TEXT("Cleared all benchmark results and session start time"));
 }
 
 TArray<FJUSYNCBenchmarkResult> UJUSYNCBlueprintLibrary::GetBenchmarkResults()

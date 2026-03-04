@@ -397,6 +397,15 @@ public:
         bool bPreserveAspectRatio = true, bool bUseAsyncSpawning = false
     );
 
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|RealtimeMesh Spawning|Benchmarked", CallInEditor)
+    static AActor* SpawnRealtimeMeshWithMaterial_Benchmarked(
+        const FJUSYNCMeshData& MeshData, const FVector& SpawnLocation,
+        const FRotator& SpawnRotation, UMaterialInterface* Material,
+        const FJUSYNCBenchmarkConfig& Config,
+        bool bUseUniformScaling = false, FVector OuterBoundingBoxSize = FVector::ZeroVector,
+        bool bPreserveAspectRatio = true, bool bUseAsyncSpawning = true
+    );
+
 
     static FBox CalculateMeshBounds(const FJUSYNCMeshData& MeshData, const FVector& Location);
 
@@ -583,6 +592,7 @@ private:
     static FString CurrentBenchmarkTest;
     static FJUSYNCBenchmarkConfig CurrentBenchmarkConfig;
     static bool bIsBenchmarking;
+    static FDateTime BenchmarkSessionStartTime;
 
     // Benchmark helper functions
     static void RecordBenchmarkResult(const FJUSYNCBenchmarkResult& Result);
