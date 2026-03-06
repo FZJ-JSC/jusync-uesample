@@ -778,5 +778,445 @@ struct JUSYNC_API FJUSYNCMetricsConfig
 	}
 };
 
+// ========== OPTIMIZATION STRUCTURES ==========
+
+/**
+ * Thread pool statistics for parallel USD processing
+ */
+USTRUCT(BlueprintType)
+struct JUSYNC_API FJUSYNCThreadPoolStats
+{
+	GENERATED_BODY()
+
+	// Thread pool configuration
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|ThreadPool")
+	int32 MaxThreads;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|ThreadPool")
+	int32 ActiveThreads;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|ThreadPool")
+	int32 IdleThreads;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|ThreadPool")
+	int32 QueuedTasks;
+
+	// Performance metrics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|ThreadPool")
+	float AvgTaskTimeMs;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|ThreadPool")
+	float MaxTaskTimeMs;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|ThreadPool")
+	float MinTaskTimeMs;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|ThreadPool")
+	int64 TotalTasksProcessed;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|ThreadPool")
+	int64 FailedTasks;
+
+	// Throughput metrics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|ThreadPool")
+	float TasksPerSecond;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|ThreadPool")
+	float CPUUtilizationPercent;
+
+	// Memory usage
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|ThreadPool")
+	int64 ThreadStackMemoryBytes;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|ThreadPool")
+	int64 TaskQueueMemoryBytes;
+
+	FJUSYNCThreadPoolStats()
+	{
+		MaxThreads = 0;
+		ActiveThreads = 0;
+		IdleThreads = 0;
+		QueuedTasks = 0;
+		AvgTaskTimeMs = 0.0f;
+		MaxTaskTimeMs = 0.0f;
+		MinTaskTimeMs = 0.0f;
+		TotalTasksProcessed = 0;
+		FailedTasks = 0;
+		TasksPerSecond = 0.0f;
+		CPUUtilizationPercent = 0.0f;
+		ThreadStackMemoryBytes = 0;
+		TaskQueueMemoryBytes = 0;
+	}
+};
+
+/**
+ * Memory pool statistics for efficient mesh data allocation
+ */
+USTRUCT(BlueprintType)
+struct JUSYNC_API FJUSYNCMemoryPoolStats
+{
+	GENERATED_BODY()
+
+	// Pool configuration
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	int32 BlockSizeBytes;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	int32 TotalBlocks;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	int32 FreeBlocks;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	int32 UsedBlocks;
+
+	// Memory usage
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	int64 TotalMemoryBytes;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	int64 UsedMemoryBytes;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	int64 FreeMemoryBytes;
+
+	// Performance metrics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	int64 AllocationCount;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	int64 DeallocationCount;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	float AvgAllocationTimeMs;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	float AvgDeallocationTimeMs;
+
+	// Efficiency metrics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	float FragmentationPercent;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	float UtilizationPercent;
+
+	// Cache metrics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	int64 CacheHits;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	int64 CacheMisses;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|MemoryPool")
+	float CacheHitRatePercent;
+
+	FJUSYNCMemoryPoolStats()
+	{
+		BlockSizeBytes = 0;
+		TotalBlocks = 0;
+		FreeBlocks = 0;
+		UsedBlocks = 0;
+		TotalMemoryBytes = 0;
+		UsedMemoryBytes = 0;
+		FreeMemoryBytes = 0;
+		AllocationCount = 0;
+		DeallocationCount = 0;
+		AvgAllocationTimeMs = 0.0f;
+		AvgDeallocationTimeMs = 0.0f;
+		FragmentationPercent = 0.0f;
+		UtilizationPercent = 0.0f;
+		CacheHits = 0;
+		CacheMisses = 0;
+		CacheHitRatePercent = 0.0f;
+	}
+};
+
+/**
+ * GPU acceleration statistics for vertex splitting/welding
+ */
+USTRUCT(BlueprintType)
+struct JUSYNC_API FJUSYNCGPUStats
+{
+	GENERATED_BODY()
+
+	// GPU configuration
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	FString GPUName;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	int32 ComputeCapabilityMajor;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	int32 ComputeCapabilityMinor;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	int64 TotalVRAMBytes;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	int64 FreeVRAMBytes;
+
+	// Kernel performance
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	float VertexSplittingKernelTimeMs;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	float VertexWeldingKernelTimeMs;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	float NormalCalculationKernelTimeMs;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	float UVProcessingKernelTimeMs;
+
+	// Throughput metrics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	int64 VerticesProcessedPerSecond;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	int64 TrianglesProcessedPerSecond;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	float GPUUtilizationPercent;
+
+	// Memory transfer metrics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	float HostToDeviceBandwidthGBps;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	float DeviceToHostBandwidthGBps;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	int64 TotalDataTransferredBytes;
+
+	// Kernel launch metrics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	int32 KernelLaunches;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	int32 ConcurrentKernels;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|GPU")
+	float AvgKernelLaunchOverheadMs;
+
+	FJUSYNCGPUStats()
+	{
+		GPUName = TEXT("Unknown");
+		ComputeCapabilityMajor = 0;
+		ComputeCapabilityMinor = 0;
+		TotalVRAMBytes = 0;
+		FreeVRAMBytes = 0;
+		VertexSplittingKernelTimeMs = 0.0f;
+		VertexWeldingKernelTimeMs = 0.0f;
+		NormalCalculationKernelTimeMs = 0.0f;
+		UVProcessingKernelTimeMs = 0.0f;
+		VerticesProcessedPerSecond = 0;
+		TrianglesProcessedPerSecond = 0;
+		GPUUtilizationPercent = 0.0f;
+		HostToDeviceBandwidthGBps = 0.0f;
+		DeviceToHostBandwidthGBps = 0.0f;
+		TotalDataTransferredBytes = 0;
+		KernelLaunches = 0;
+		ConcurrentKernels = 0;
+		AvgKernelLaunchOverheadMs = 0.0f;
+	}
+};
+
+/**
+ * Streaming USD processor statistics
+ */
+USTRUCT(BlueprintType)
+struct JUSYNC_API FJUSYNCStreamingStats
+{
+	GENERATED_BODY()
+
+	// Streaming configuration
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	int32 ChunkSizeBytes;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	int32 MaxConcurrentChunks;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	int32 PrefetchBufferSize;
+
+	// Performance metrics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	float AvgChunkLoadTimeMs;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	float MaxChunkLoadTimeMs;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	float MinChunkLoadTimeMs;
+
+	// Throughput metrics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	float DataThroughputMBps;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	int64 TotalChunksProcessed;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	int64 FailedChunks;
+
+	// Memory metrics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	int64 ChunkCacheMemoryBytes;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	int64 ActiveChunksMemoryBytes;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	float CacheHitRatePercent;
+
+	// Queue metrics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	int32 LoadQueueSize;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	int32 ProcessQueueSize;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization|Streaming")
+	int32 ReadyQueueSize;
+
+	FJUSYNCStreamingStats()
+	{
+		ChunkSizeBytes = 0;
+		MaxConcurrentChunks = 0;
+		PrefetchBufferSize = 0;
+		AvgChunkLoadTimeMs = 0.0f;
+		MaxChunkLoadTimeMs = 0.0f;
+		MinChunkLoadTimeMs = 0.0f;
+		DataThroughputMBps = 0.0f;
+		TotalChunksProcessed = 0;
+		FailedChunks = 0;
+		ChunkCacheMemoryBytes = 0;
+		ActiveChunksMemoryBytes = 0;
+		CacheHitRatePercent = 0.0f;
+		LoadQueueSize = 0;
+		ProcessQueueSize = 0;
+		ReadyQueueSize = 0;
+	}
+};
+
+/**
+ * Comprehensive optimization statistics
+ */
+USTRUCT(BlueprintType)
+struct JUSYNC_API FJUSYNCOptimizationStats
+{
+	GENERATED_BODY()
+
+	// Timestamp
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	FDateTime Timestamp;
+
+	// Component statistics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	FJUSYNCThreadPoolStats ThreadPoolStats;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	FJUSYNCMemoryPoolStats MemoryPoolStats;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	FJUSYNCGPUStats GPUStats;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	FJUSYNCStreamingStats StreamingStats;
+
+	// Overall performance metrics
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	float TotalSpeedupFactor;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	float MemoryReductionPercent;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	float ProcessingTimeReductionPercent;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	int64 TotalVerticesProcessed;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	int64 TotalTrianglesProcessed;
+
+	// Configuration
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	bool bThreadPoolEnabled;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	bool bMemoryPoolEnabled;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	bool bGPUAccelerationEnabled;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Optimization")
+	bool bStreamingEnabled;
+
+	FJUSYNCOptimizationStats()
+	{
+		Timestamp = FDateTime::Now();
+		TotalSpeedupFactor = 1.0f;
+		MemoryReductionPercent = 0.0f;
+		ProcessingTimeReductionPercent = 0.0f;
+		TotalVerticesProcessed = 0;
+		TotalTrianglesProcessed = 0;
+		bThreadPoolEnabled = false;
+		bMemoryPoolEnabled = false;
+		bGPUAccelerationEnabled = false;
+		bStreamingEnabled = false;
+	}
+};
+
+// Optimization configuration
+USTRUCT(BlueprintType)
+struct JUSYNC_API FJUSYNCOptimizationConfig
+{
+	GENERATED_BODY()
+
+	// Thread pool configuration
+	UPROPERTY(BlueprintReadWrite, Category = "JUSYNC|Optimization|ThreadPool")
+	bool bEnableThreadPool = true;
+
+	UPROPERTY(BlueprintReadWrite, Category = "JUSYNC|Optimization|ThreadPool")
+	int32 ThreadPoolSize = 4;
+
+	UPROPERTY(BlueprintReadWrite, Category = "JUSYNC|Optimization|ThreadPool")
+	int32 MaxQueueSize = 1000;
+
+	// Memory pool configuration
+	UPROPERTY(BlueprintReadWrite, Category = "JUSYNC|Optimization|MemoryPool")
+	bool bEnableMemoryPool = true;
+
+	UPROPERTY(BlueprintReadWrite, Category = "JUSYNC|Optimization|MemoryPool")
+	int32 MemoryPoolBlockSizeKB = 1024; // 1MB blocks
+
+	UPROPERTY(BlueprintReadWrite, Category = "JUSYNC|Optimization|MemoryPool")
+	int32 MemoryPoolMaxBlocks = 1000;
+
+	// GPU acceleration configuration
+	UPROPERTY(BlueprintReadWrite, Category = "JUSYNC|Optimization|GPU")
+	bool bEnableGPUAcceleration = true;
+
+	UPROPERTY(BlueprintReadWrite, Category = "JUSYNC|Optimization|GPU")
+	int32 GPUDeviceID = 0;
+
+	UPROPERTY(BlueprintReadWrite, Category = "JUSYNC|Optimization|GPU")
+	int32 GPUThreadsPerBlock = 256;
+
+	UPROPERTY(BlueprintReadWrite, Category = "JUSYNC|Optimization|GPU")
+	int32 GPUBlocksPerGrid = 64;
+
+	// Streaming configuration
+	UPROPERTY(BlueprintReadWrite, Category = "JUSYNC|Optimization|Streaming")
+	bool bEnableStreaming = true;
+
+	UPROPERTY(BlueprintReadWrite, Category = "JUSYNC|Optimization|Streaming")
+	int32 StreamingChunkSizeMB = 10;
+
+	UPROPERTY(BlueprintReadWrite, Category = "JUSYNC|Optimization|Streaming")
+	int32 MaxConcurrentChunks = 4;
+};
+
 // Metrics collection delegate
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FJUSYNCMetricsUpdated, const FJUSYNCMetricsData&, MetricsData);

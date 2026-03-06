@@ -149,6 +149,30 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Texture")
     UTexture2D* CreateUETextureFromJUSYNC(const FJUSYNCTextureData& TextureData);
 
+    // ========== GPU ACCELERATION CONTROL ==========
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|GPU Acceleration")
+    void EnableGPUAcceleration(bool bEnable);
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|GPU Acceleration")
+    void SetGPUVertexThreshold(int32 VertexThreshold);
+
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|GPU Acceleration")
+    bool IsGPUAccelerationAvailable() const;
+
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|GPU Acceleration")
+    bool IsGPUAccelerationEnabled() const;
+
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|GPU Acceleration")
+    FString GetGPUAccelerationInfo() const;
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|GPU Acceleration")
+    bool GetMeshProcessingMetrics(
+        int32& OutVerticesProcessed,
+        float& OutProcessingTimeMs,
+        float& OutThroughputVerticesPerSec,
+        int32& OutBackendUsed
+    );
+
     // Material Caching
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Materials")
     void PreloadCommonMaterials();
@@ -380,6 +404,29 @@ private:
         }
     };
 
+    // GPU Acceleration Settings
+    bool bGPUAccelerationEnabled{ true };
+    int32 GPUVertexThreshold{ 10000 };
+    
+    // GPU Performance Metrics
+    struct FGPUMetrics
+    {
+        int32 VerticesProcessed{ 0 };
+        float ProcessingTimeMs{ 0.0f };
+        float ThroughputVerticesPerSec{ 0.0f };
+        int32 BackendUsed{ 0 }; // 0=CUDA, 1=AVX512, 2=AVX2, 3=SSE4, 4=Scalar
+        
+        void Reset()
+        {
+            VerticesProcessed = 0;
+            ProcessingTimeMs = 0.0f;
+            ThroughputVerticesPerSec = 0.0f;
+            BackendUsed = 0;
+        }
+    };
+    
+    FGPUMetrics LastGPUMetrics;
+    
     FMetricsAccumulator MetricsAccumulator;
 
     // Metrics collection functions (implementation details)

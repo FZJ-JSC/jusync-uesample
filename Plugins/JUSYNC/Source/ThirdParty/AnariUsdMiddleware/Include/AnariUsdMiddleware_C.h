@@ -886,6 +886,470 @@ ANARI_USD_MIDDLEWARE_C_API int RequestFilesParallelDirect_C(
     ParallelDownloadErrorCallback_C error_callback,
     int timeout_ms);
 
+// ============================================================================
+// MESH ACCELERATOR FUNCTIONS (GPU/CPU ACCELERATION)
+// ============================================================================
+
+/**
+ * Create and initialize MeshAccelerator instance
+ * Provides GPU (CUDA) and CPU (AVX-512) accelerated mesh processing
+ *
+ * @return Opaque handle to MeshAccelerator instance (NULL on failure)
+ */
+ANARI_USD_MIDDLEWARE_C_API void* CreateMeshAccelerator_C(void);
+
+/**
+ * Configure MeshAccelerator with specific settings
+ *
+ * @param accelerator Handle returned by CreateMeshAccelerator_C
+ * @param preferred_backend 0=AUTO, 1=CUDA, 2=AVX512, 3=AVX2, 4=SSE4, 5=SCALAR
+ * @param min_vertices_for_gpu Minimum vertices to use GPU acceleration
+ * @param enable_async Enable asynchronous processing
+ * @param memory_pool_size_mb Memory pool size in MB (0 to disable)
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int ConfigureMeshAccelerator_C(void* accelerator,
+                                                         int preferred_backend,
+                                                         size_t min_vertices_for_gpu,
+                                                         int enable_async,
+                                                         size_t memory_pool_size_mb);
+
+/**
+ * Transform vertices using GPU/CPU acceleration
+ * Applies world transformation matrix to vertex positions
+ *
+ * @param accelerator Handle returned by CreateMeshAccelerator_C
+ * @param vertices Array of vertex positions [x1,y1,z1, x2,y2,z2, ...]
+ * @param vertex_count Number of vertices (not floats)
+ * @param world_transform 4x4 transformation matrix (16 floats, row-major)
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int TransformVerticesAccelerated_C(void* accelerator,
+                                                            float* vertices,
+                                                            size_t vertex_count,
+                                                            const float* world_transform);
+
+/**
+ * Calculate normals using GPU/CPU acceleration
+ * Computes vertex normals from triangle indices
+ *
+ * @param accelerator Handle returned by CreateMeshAccelerator_C
+ * @param vertices Array of vertex positions [x1,y1,z1, x2,y2,z2, ...]
+ * @param vertex_count Number of vertices (not floats)
+ * @param indices Array of triangle indices [i1,i2,i3, i4,i5,i6, ...]
+ * @param index_count Number of indices (must be multiple of 3)
+ * @param normals Output array for normals (must be pre-allocated with vertex_count * 3 floats)
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int CalculateNormalsAccelerated_C(void* accelerator,
+                                                           const float* vertices,
+                                                           size_t vertex_count,
+                                                           const unsigned int* indices,
+                                                           size_t index_count,
+                                                           float* normals);
+
+/**
+ * Transform normals using GPU/CPU acceleration
+ * Applies normal transformation matrix to normals
+ *
+ * @param accelerator Handle returned by CreateMeshAccelerator_C
+ * @param normals Array of normals [nx1,ny1,nz1, nx2,ny2,nz2, ...]
+ * @param normal_count Number of normals (not floats)
+ * @param normal_matrix 3x3 normal transformation matrix (9 floats, row-major)
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int TransformNormalsAccelerated_C(void* accelerator,
+                                                           float* normals,
+                                                           size_t normal_count,
+                                                           const float* normal_matrix);
+
+/**
+ * Get performance metrics from last operation
+ *
+ * @param accelerator Handle returned by CreateMeshAccelerator_C
+ * @param out_vertices_processed Pointer to receive vertices processed count
+ * @param out_processing_time_ms Pointer to receive processing time in milliseconds
+ * @param out_throughput_vertices_per_sec Pointer to receive throughput
+ * @param out_used_backend Pointer to receive backend used (0=CUDA, 1=AVX512, etc.)
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int GetMeshAcceleratorMetrics_C(void* accelerator,
+                                                         size_t* out_vertices_processed,
+                                                         double* out_processing_time_ms,
+                                                         double* out_throughput_vertices_per_sec,
+                                                         int* out_used_backend);
+
+/**
+ * Get system information about available acceleration backends
+ *
+ * @param out_has_cuda Pointer to receive 1 if CUDA available, 0 otherwise
+ * @param out_has_avx512 Pointer to receive 1 if AVX-512 available, 0 otherwise
+ * @param out_has_avx2 Pointer to receive 1 if AVX2 available, 0 otherwise
+ * @param out_has_sse4 Pointer to receive 1 if SSE4 available, 0 otherwise
+ * @param out_cpu_cores Pointer to receive number of CPU cores
+ * @param out_cuda_device_count Pointer to receive number of CUDA devices
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int GetAccelerationSystemInfo_C(int* out_has_cuda,
+                                                         int* out_has_avx512,
+                                                         int* out_has_avx2,
+                                                         int* out_has_sse4,
+                                                         int* out_cpu_cores,
+                                                         int* out_cuda_device_count);
+
+/**
+ * Destroy MeshAccelerator instance and free resources
+ *
+ * @param accelerator Handle returned by CreateMeshAccelerator_C
+ */
+ANARI_USD_MIDDLEWARE_C_API void DestroyMeshAccelerator_C(void* accelerator);
+
+// ============================================================================
+// PERFORMANCE OPTIMIZATION FUNCTIONS
+// ============================================================================
+
+/**
+ * Initialize thread pool for parallel USD processing
+ * Call this before using any USD loading functions for optimal performance
+ *
+ * @param thread_count Number of threads to use (0 = auto-detect based on CPU cores)
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int InitializeThreadPool_C(int thread_count);
+
+/**
+ * Get thread pool statistics
+ *
+ * @param out_thread_count Pointer to receive number of threads in pool
+ * @param out_pending_tasks Pointer to receive number of pending tasks
+ * @param out_active_tasks Pointer to receive number of active tasks
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int GetThreadPoolStats_C(int* out_thread_count, 
+                                                   int* out_pending_tasks,
+                                                   int* out_active_tasks);
+
+/**
+ * Enable/disable memory pooling for mesh data
+ * When enabled, mesh allocations use a memory pool for better performance
+ *
+ * @param enable 1 to enable, 0 to disable
+ * @param pool_size_mb Initial memory pool size in MB (default: 16MB)
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int SetMemoryPooling_C(int enable, int pool_size_mb);
+
+/**
+ * Get memory pool statistics
+ *
+ * @param out_current_usage Pointer to receive current memory usage in bytes
+ * @param out_total_allocated Pointer to receive total allocated bytes
+ * @param out_peak_usage Pointer to receive peak memory usage in bytes
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int GetMemoryPoolStats_C(size_t* out_current_usage,
+                                                   size_t* out_total_allocated,
+                                                   size_t* out_peak_usage);
+
+/**
+ * Process USD file with streaming callback (for large files)
+ * Processes the USD file in chunks and calls callback for each batch of meshes
+ *
+ * @param filepath Path to USD file
+ * @param callback Callback function for processed mesh batches
+ * @param user_data User data passed to callback
+ * @param batch_size Number of meshes to process per batch (default: 10)
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int ProcessUSDStreaming_C(const char* filepath,
+                                                    void (*callback)(CMeshData* meshes, size_t count, void* user_data),
+                                                    void* user_data,
+                                                    int batch_size);
+
+/**
+ * Split vertices on GPU (for meshes with shared vertices but different normals/UVs)
+ * Creates duplicate vertices so each triangle has unique vertices
+ *
+ * @param mesh_data Mesh data to split
+ * @param out_vertex_count Pointer to receive new vertex count after splitting
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int SplitVerticesGPU_C(CMeshData* mesh_data, size_t* out_vertex_count);
+
+/**
+ * Weld vertices on GPU (merge duplicate vertices)
+ * Reduces vertex count by merging vertices that are close together
+ *
+ * @param mesh_data Mesh data to weld
+ * @param position_epsilon Maximum distance for vertices to be considered identical
+ * @param normal_epsilon Maximum angle difference for normals to be considered identical
+ * @param uv_epsilon Maximum UV coordinate difference
+ * @param out_vertex_count Pointer to receive new vertex count after welding
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int WeldVerticesGPU_C(CMeshData* mesh_data,
+                                                float position_epsilon,
+                                                float normal_epsilon,
+                                                float uv_epsilon,
+                                                size_t* out_vertex_count);
+
+// ============================================================================
+// OPTIMIZATION STATISTICS STRUCTURES
+// ============================================================================
+
+/**
+ * Thread pool statistics structure
+ * Used by GetOptimizationStats_C to report thread pool performance
+ */
+typedef struct {
+    int enabled;                    // Whether thread pool is enabled (1) or disabled (0)
+    int max_threads;                // Maximum number of worker threads
+    int active_threads;             // Number of currently active threads
+    int idle_threads;               // Number of idle threads
+    int queued_tasks;               // Number of tasks in queue
+    float avg_task_time_ms;         // Average task execution time in milliseconds
+    float max_task_time_ms;         // Maximum task execution time in milliseconds
+    float min_task_time_ms;         // Minimum task execution time in milliseconds
+    int total_tasks_processed;      // Total tasks processed since start
+    int failed_tasks;               // Number of failed tasks
+    float tasks_per_second;         // Tasks processed per second
+    float cpu_utilization_percent;  // CPU utilization percentage (0-100)
+    size_t thread_stack_memory_bytes; // Memory used for thread stacks
+    size_t task_queue_memory_bytes; // Memory used for task queue
+} AnariUsdThreadPoolStats;
+
+/**
+ * Memory pool statistics structure
+ * Used by GetOptimizationStats_C to report memory pool performance
+ */
+typedef struct {
+    int enabled;                    // Whether memory pool is enabled (1) or disabled (0)
+    size_t block_size_bytes;        // Size of each memory block in bytes
+    int total_blocks;               // Total number of blocks
+    int free_blocks;                // Currently free blocks
+    int used_blocks;                // Currently used blocks
+    size_t total_memory_bytes;      // Total memory allocated in bytes
+    size_t used_memory_bytes;       // Currently used memory in bytes
+    size_t free_memory_bytes;       // Currently free memory in bytes
+    size_t peak_memory_bytes;       // Peak memory usage in bytes
+    int allocation_count;           // Total number of allocations
+    int deallocation_count;         // Total number of deallocations
+    float avg_allocation_time_ms;   // Average allocation time in milliseconds
+    float avg_deallocation_time_ms; // Average deallocation time in milliseconds
+    float fragmentation_percent;    // Memory fragmentation percentage (0-100)
+    float utilization_percent;      // Memory utilization percentage (0-100)
+    int cache_hits;                 // Number of cache hits
+    int cache_misses;               // Number of cache misses
+    float cache_hit_rate_percent;   // Cache hit rate percentage (0-100)
+} AnariUsdMemoryPoolStats;
+
+/**
+ * GPU acceleration statistics structure
+ * Used by GetOptimizationStats_C to report GPU performance
+ */
+typedef struct {
+    int enabled;                    // Whether GPU acceleration is enabled (1) or disabled (0)
+    char gpu_name[256];             // GPU device name
+    int compute_capability_major;   // CUDA compute capability major version
+    int compute_capability_minor;   // CUDA compute capability minor version
+    size_t total_vram_bytes;        // Total GPU memory in bytes
+    size_t free_vram_bytes;         // Free GPU memory in bytes
+    float vertex_splitting_kernel_time_ms; // Vertex splitting kernel time
+    float vertex_welding_kernel_time_ms;   // Vertex welding kernel time
+    float normal_calculation_kernel_time_ms; // Normal calculation kernel time
+    float uv_processing_kernel_time_ms;    // UV processing kernel time
+    float vertices_processed_per_second;   // Vertices processed per second
+    float triangles_processed_per_second;  // Triangles processed per second
+    float gpu_utilization_percent;  // GPU utilization percentage (0-100)
+    float host_to_device_bandwidth_gbps; // Host to device bandwidth
+    float device_to_host_bandwidth_gbps; // Device to host bandwidth
+    size_t total_data_transferred_bytes; // Total data transferred
+    int kernel_launches;            // Total kernel launches
+    int concurrent_kernels;         // Maximum concurrent kernels
+    float avg_kernel_launch_overhead_ms; // Average kernel launch overhead
+} AnariUsdGPUStats;
+
+/**
+ * Streaming processing statistics structure
+ * Used by GetOptimizationStats_C to report streaming performance
+ */
+typedef struct {
+    int enabled;                    // Whether streaming is enabled (1) or disabled (0)
+    size_t chunk_size_bytes;        // Chunk size in bytes
+    int max_concurrent_chunks;      // Maximum concurrent chunks
+    int prefetch_buffer_size;       // Prefetch buffer size
+    float avg_chunk_load_time_ms;   // Average chunk load time in milliseconds
+    float max_chunk_load_time_ms;   // Maximum chunk load time in milliseconds
+    float min_chunk_load_time_ms;   // Minimum chunk load time in milliseconds
+    float data_throughput_mbps;     // Data throughput in MB/s
+    int total_chunks_processed;     // Total chunks processed
+    int failed_chunks;              // Number of failed chunks
+    size_t chunk_cache_memory_bytes; // Memory used for chunk cache
+    size_t active_chunks_memory_bytes; // Memory used for active chunks
+    float cache_hit_rate_percent;   // Cache hit rate percentage (0-100)
+    int load_queue_size;            // Size of load queue
+    int process_queue_size;         // Size of process queue
+    int ready_queue_size;           // Size of ready queue
+} AnariUsdStreamingStats;
+
+// ============================================================================
+// OPTIMIZATION CONFIGURATION FUNCTIONS (Unreal-compatible)
+// ============================================================================
+
+/**
+ * Configure all optimization settings at once
+ * Comprehensive configuration for thread pool, memory pool, GPU acceleration, and streaming
+ *
+ * @param enable_thread_pool Enable thread pool (1) or disable (0)
+ * @param thread_pool_size Number of worker threads (0 = auto-detect)
+ * @param max_queue_size Maximum queue size for pending tasks
+ * @param enable_memory_pool Enable memory pool (1) or disable (0)
+ * @param memory_pool_block_size Size of each memory block in bytes
+ * @param memory_pool_max_blocks Maximum number of memory blocks
+ * @param enable_gpu_acceleration Enable GPU acceleration (1) or disable (0)
+ * @param gpu_device_id GPU device ID (0 = default device)
+ * @param gpu_threads_per_block CUDA threads per block
+ * @param gpu_blocks_per_grid CUDA blocks per grid
+ * @param enable_streaming Enable streaming processing (1) or disable (0)
+ * @param streaming_chunk_size Chunk size for streaming in bytes
+ * @param max_concurrent_chunks Maximum concurrent chunks to process
+ * @return 0 on success, non-zero error code on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int anari_usd_configure_optimizations(
+    int enable_thread_pool,
+    int thread_pool_size,
+    int max_queue_size,
+    int enable_memory_pool,
+    size_t memory_pool_block_size,
+    int memory_pool_max_blocks,
+    int enable_gpu_acceleration,
+    int gpu_device_id,
+    int gpu_threads_per_block,
+    int gpu_blocks_per_grid,
+    int enable_streaming,
+    size_t streaming_chunk_size,
+    int max_concurrent_chunks
+);
+
+/**
+ * Enable or disable thread pool
+ *
+ * @param enabled Enable (1) or disable (0)
+ * @param thread_count Number of threads (0 = auto-detect)
+ * @return 0 on success, non-zero error code on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int anari_usd_set_thread_pool_enabled(int enabled, int thread_count);
+
+/**
+ * Enable or disable memory pool
+ *
+ * @param enabled Enable (1) or disable (0)
+ * @param block_size Block size in bytes
+ * @param max_blocks Maximum number of blocks
+ * @return 0 on success, non-zero error code on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int anari_usd_set_memory_pool_enabled(int enabled, size_t block_size, int max_blocks);
+
+/**
+ * Enable or disable GPU acceleration
+ *
+ * @param enabled Enable (1) or disable (0)
+ * @param device_id GPU device ID (0 = default device)
+ * @return 0 on success, non-zero error code on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int anari_usd_set_gpu_acceleration_enabled(int enabled, int device_id);
+
+/**
+ * Enable or disable streaming processing
+ *
+ * @param enabled Enable (1) or disable (0)
+ * @param chunk_size Chunk size in bytes
+ * @param max_concurrent_chunks Maximum concurrent chunks
+ * @return 0 on success, non-zero error code on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int anari_usd_set_streaming_enabled(int enabled, size_t chunk_size, int max_concurrent_chunks);
+
+/**
+ * Get detailed optimization statistics
+ * Retrieves statistics for thread pool, memory pool, GPU acceleration, and streaming
+ *
+ * @param out_thread_pool_stats Pointer to receive thread pool statistics
+ * @param out_memory_pool_stats Pointer to receive memory pool statistics
+ * @param out_gpu_stats Pointer to receive GPU statistics
+ * @param out_streaming_stats Pointer to receive streaming statistics
+ * @return 0 on success, non-zero error code on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int anari_usd_get_optimization_stats(
+    AnariUsdThreadPoolStats* out_thread_pool_stats,
+    AnariUsdMemoryPoolStats* out_memory_pool_stats,
+    AnariUsdGPUStats* out_gpu_stats,
+    AnariUsdStreamingStats* out_streaming_stats
+);
+
+/**
+ * Get overall optimization statistics as a single structure
+ * Simplified version for Unreal Blueprint integration
+ *
+ * @param out_overall_stats Pointer to receive overall statistics structure
+ * @return 0 on success, non-zero error code on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int anari_usd_get_overall_optimization_stats(void* out_overall_stats);
+
+/**
+ * Reset all optimization statistics to zero
+ * Useful for benchmarking and performance testing
+ *
+ * @return 0 on success, non-zero error code on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int anari_usd_reset_optimization_stats(void);
+
+/**
+ * Load USD data with optimization settings applied
+ * Enhanced version that uses all configured optimizations
+ *
+ * @param buffer Raw USD file data
+ * @param buffer_size Size of buffer in bytes
+ * @param filename Original filename (used for format detection)
+ * @param out_meshes Pointer to receive array of extracted meshes (caller must free)
+ * @param out_count Pointer to receive number of extracted meshes
+ * @return 0 on success, non-zero error code on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int anari_usd_load_with_optimizations(
+    const unsigned char* buffer,
+    size_t buffer_size,
+    const char* filename,
+    void** out_meshes,
+    size_t* out_count
+);
+
+/**
+ * Get performance optimization settings
+ *
+ * @param out_use_thread_pool Pointer to receive thread pool enabled status
+ * @param out_use_memory_pool Pointer to receive memory pool enabled status
+ * @param out_use_gpu_accel Pointer to receive GPU acceleration enabled status
+ * @param out_max_threads Pointer to receive maximum thread count
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int GetOptimizationSettings_C(int* out_use_thread_pool,
+                                                        int* out_use_memory_pool,
+                                                        int* out_use_gpu_accel,
+                                                        int* out_max_threads);
+
+/**
+ * Set performance optimization settings
+ *
+ * @param use_thread_pool Enable thread pool (1) or disable (0)
+ * @param use_memory_pool Enable memory pool (1) or disable (0)
+ * @param use_gpu_accel Enable GPU acceleration (1) or disable (0)
+ * @param max_threads Maximum number of threads to use (0 = auto-detect)
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int SetOptimizationSettings_C(int use_thread_pool,
+                                                        int use_memory_pool,
+                                                        int use_gpu_accel,
+                                                        int max_threads);
+
 #ifdef __cplusplus
 }
 #endif

@@ -559,6 +559,125 @@ private:
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Utilities")
     static FString GetRankPerformanceStats();
 
+    // ========== OPTIMIZATION FUNCTIONS ==========
+
+    /**
+     * Configure optimization settings for USD processing
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization")
+    static bool ConfigureOptimizations(const FJUSYNCOptimizationConfig& Config);
+
+    /**
+     * Enable/disable thread pool for parallel USD processing
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization|ThreadPool")
+    static bool SetThreadPoolEnabled(bool bEnabled, int32 ThreadCount = 4);
+
+    /**
+     * Enable/disable memory pool for efficient mesh allocation
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization|MemoryPool")
+    static bool SetMemoryPoolEnabled(bool bEnabled, int32 BlockSizeKB = 1024, int32 MaxBlocks = 1000);
+
+    /**
+     * Enable/disable GPU acceleration for vertex splitting
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization|GPU")
+    static bool SetGPUAccelerationEnabled(bool bEnabled, int32 DeviceID = 0);
+
+    /**
+     * Enable/disable streaming USD processing
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization|Streaming")
+    static bool SetStreamingEnabled(bool bEnabled, int32 ChunkSizeMB = 10, int32 MaxConcurrentChunks = 4);
+
+    /**
+     * Get current optimization statistics
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization")
+    static bool GetOptimizationStats(FJUSYNCOptimizationStats& OutStats);
+
+    /**
+     * Get thread pool statistics
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization|ThreadPool")
+    static bool GetThreadPoolStats(FJUSYNCThreadPoolStats& OutStats);
+
+    /**
+     * Get memory pool statistics
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization|MemoryPool")
+    static bool GetMemoryPoolStats(FJUSYNCMemoryPoolStats& OutStats);
+
+    /**
+     * Get GPU acceleration statistics
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization|GPU")
+    static bool GetGPUStats(FJUSYNCGPUStats& OutStats);
+
+    /**
+     * Get streaming processor statistics
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization|Streaming")
+    static bool GetStreamingStats(FJUSYNCStreamingStats& OutStats);
+
+    /**
+     * Reset all optimization statistics
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization")
+    static void ResetOptimizationStats();
+
+    /**
+     * Load USD with optimizations enabled
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization|USD")
+    static bool LoadUSDWithOptimizations(const TArray<uint8>& Buffer, const FString& Filename,
+        TArray<FJUSYNCMeshData>& OutMeshData, FString& OutPreview);
+
+    /**
+     * Load USD from disk with optimizations enabled
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization|USD")
+    static bool LoadUSDFromDiskWithOptimizations(const FString& FilePath,
+        TArray<FJUSYNCMeshData>& OutMeshData, FString& OutPreview);
+
+    /**
+     * Compare performance with and without optimizations
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization|Benchmark")
+    static bool CompareOptimizationPerformance(const TArray<uint8>& USDData, const FString& Filename,
+        float& OutSpeedupFactor, float& OutMemoryReductionPercent);
+
+    /**
+     * Get optimization configuration
+     */
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Optimization")
+    static FJUSYNCOptimizationConfig GetCurrentOptimizationConfig();
+
+    /**
+     * Save optimization configuration to file
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization")
+    static bool SaveOptimizationConfigToFile(const FString& FilePath);
+
+    /**
+     * Load optimization configuration from file
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization")
+    static bool LoadOptimizationConfigFromFile(const FString& FilePath, FJUSYNCOptimizationConfig& OutConfig);
+
+    /**
+     * Export optimization statistics to CSV
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization")
+    static bool ExportOptimizationStatsToCSV(const FString& FilePath);
+
+    /**
+     * Export optimization statistics to JSON
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Optimization")
+    static bool ExportOptimizationStatsToJSON(const FString& FilePath);
+
 private:
     // Rank performance tracking
     class FRankPerformanceTracker

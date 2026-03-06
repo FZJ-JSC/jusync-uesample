@@ -28,6 +28,49 @@ extern "C" {
 #include <cstdint>  // For uint32_t
 #endif
 
+// Helper function for CPU-based normal calculation
+static void CalculateMeshNormalsCPU(const TArray<FVector>& Vertices, const TArray<int32>& Triangles, TArray<FVector>& OutNormals)
+{
+    // Clear output normals
+    OutNormals.Empty();
+    
+    // Initialize normals to zero
+    OutNormals.SetNumZeroed(Vertices.Num());
+    
+    // Calculate face normals and accumulate to vertices
+    for (int32 i = 0; i < Triangles.Num(); i += 3)
+    {
+        int32 i0 = Triangles[i];
+        int32 i1 = Triangles[i + 1];
+        int32 i2 = Triangles[i + 2];
+        
+        if (i0 >= 0 && i0 < Vertices.Num() &&
+            i1 >= 0 && i1 < Vertices.Num() &&
+            i2 >= 0 && i2 < Vertices.Num())
+        {
+            FVector v0 = Vertices[i0];
+            FVector v1 = Vertices[i1];
+            FVector v2 = Vertices[i2];
+            
+            // Calculate face normal
+            FVector edge1 = v1 - v0;
+            FVector edge2 = v2 - v0;
+            FVector faceNormal = FVector::CrossProduct(edge1, edge2);
+            
+            // Accumulate to vertex normals
+            OutNormals[i0] += faceNormal;
+            OutNormals[i1] += faceNormal;
+            OutNormals[i2] += faceNormal;
+        }
+    }
+    
+    // Normalize all vertex normals
+    for (FVector& normal : OutNormals)
+    {
+        normal.Normalize();
+    }
+}
+
 // Global callback handlers for C interface
 // Use atomic for thread-safe access from ZMQ callback threads
 static std::atomic<UJUSYNCSubsystem*> g_SubsystemInstance = nullptr;
@@ -199,7 +242,12 @@ extern "C" void MessageReceivedCallback_Static(const char* message)
 
 // Helper function to convert C mesh data to UE format
 // Enhanced ConvertCMeshDataToUE_Helper with FORCED vertex interpolation while preserving all functionality
-static FJUSYNCMeshData ConvertCMeshDataToUE_Helper(const CMeshData& CMesh, bool bForceVertexInterpolation = true)
+// Now with GPU acceleration for vertex and normal transformation
+static FJUSYNCMeshData ConvertCMeshDataToUE_Helper(
+    const CMeshData& CMesh,
+    bool bForceVertexInterpolation = true,
+    bool bUseGPUAccelerationGlobal = true,
+    int32 GPUVertexThresholdGlobal = 10000)
 {
     FJUSYNCMeshData UEMesh;
 
@@ -211,13 +259,75 @@ static FJUSYNCMeshData ConvertCMeshDataToUE_Helper(const CMeshData& CMesh, bool 
     size_t PointCount = CMesh.points_count / 3;
     UEMesh.Vertices.Reserve(PointCount);
     
-    // Optimized loop with better cache locality
-    const float* pointsPtr = CMesh.points;
-    for (size_t i = 0; i < PointCount; ++i)
+    // Check if GPU acceleration is available and mesh is large enough
+    bool bUseGPUAcceleration = false;
+    void* gpuAccelerator = nullptr;
+    
+#ifdef WITH_ANARI_USD_MIDDLEWARE
+    // Only use GPU for large meshes (based on threshold) and if globally enabled
+    if (bUseGPUAccelerationGlobal && PointCount >= GPUVertexThresholdGlobal)
     {
-        size_t idx = i * 3;
-        // Transform from right-handed Z-up (ParaView) to left-handed Z-up (UE)
-        UEMesh.Vertices.Add(FVector(pointsPtr[idx], -pointsPtr[idx + 1], pointsPtr[idx + 2]));
+        // Create GPU accelerator
+        gpuAccelerator = CreateMeshAccelerator_C();
+        if (gpuAccelerator)
+        {
+            // Configure for GPU acceleration
+            ConfigureMeshAccelerator_C(gpuAccelerator, 1, GPUVertexThresholdGlobal, 1, 256); // CUDA backend, threshold vertices, async, 256MB pool
+            bUseGPUAcceleration = true;
+            UE_LOG(LogJUSYNC, Log, TEXT("🎮 Using GPU acceleration for mesh conversion (%d vertices, threshold: %d)"), PointCount, GPUVertexThresholdGlobal);
+        }
+    }
+#endif
+    
+    if (bUseGPUAcceleration && gpuAccelerator)
+    {
+        // GPU-accelerated vertex transformation
+        // Create a copy of the points for GPU processing
+        TArray<float> PointsCopy;
+        PointsCopy.SetNum(CMesh.points_count);
+        FMemory::Memcpy(PointsCopy.GetData(), CMesh.points, CMesh.points_count * sizeof(float));
+        
+        // Transformation matrix: [1, 0, 0, 0], [0, -1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]
+        // This transforms from ParaView (right-handed Z-up) to UE (left-handed Z-up)
+        float TransformMatrix[16] = {
+            1.0f,  0.0f, 0.0f, 0.0f,
+            0.0f, -1.0f, 0.0f, 0.0f,
+            0.0f,  0.0f, 1.0f, 0.0f,
+            0.0f,  0.0f, 0.0f, 1.0f
+        };
+        
+        // Transform vertices on GPU
+        int gpuResult = TransformVerticesAccelerated_C(gpuAccelerator, PointsCopy.GetData(), PointCount, TransformMatrix);
+        if (gpuResult)
+        {
+            // Copy transformed vertices back
+            const float* pointsPtr = PointsCopy.GetData();
+            for (size_t i = 0; i < PointCount; ++i)
+            {
+                size_t idx = i * 3;
+                UEMesh.Vertices.Add(FVector(pointsPtr[idx], pointsPtr[idx + 1], pointsPtr[idx + 2]));
+            }
+            UE_LOG(LogJUSYNC, Log, TEXT("✅ GPU vertex transformation completed for %d vertices"), PointCount);
+        }
+        else
+        {
+            // Fallback to CPU
+            UE_LOG(LogJUSYNC, Warning, TEXT("⚠️ GPU vertex transformation failed, falling back to CPU"));
+            bUseGPUAcceleration = false;
+        }
+    }
+    
+    // CPU fallback or small mesh processing
+    if (!bUseGPUAcceleration)
+    {
+        // Optimized loop with better cache locality
+        const float* pointsPtr = CMesh.points;
+        for (size_t i = 0; i < PointCount; ++i)
+        {
+            size_t idx = i * 3;
+            // Transform from right-handed Z-up (ParaView) to left-handed Z-up (UE)
+            UEMesh.Vertices.Add(FVector(pointsPtr[idx], -pointsPtr[idx + 1], pointsPtr[idx + 2]));
+        }
     }
 
     // 3. Convert triangle indices (OPTIMIZED)
@@ -232,18 +342,62 @@ static FJUSYNCMeshData ConvertCMeshDataToUE_Helper(const CMeshData& CMesh, bool 
         UEMesh.Triangles[i] = static_cast<int32>(indicesPtr[i]);
     }
 
-    // 4. Convert normals if present (OPTIMIZED)
+    // 4. Convert normals if present (OPTIMIZED with GPU acceleration)
     if (CMesh.normals && CMesh.normals_count >= 3)
     {
         size_t NormalCount = CMesh.normals_count / 3;
         UEMesh.Normals.Reserve(NormalCount);
         
-        // Optimized loop with direct pointer access
-        const float* normalsPtr = CMesh.normals;
-        for (size_t i = 0; i < NormalCount; ++i)
+        if (bUseGPUAcceleration && gpuAccelerator && NormalCount >= GPUVertexThresholdGlobal)
         {
-            size_t idx = i * 3;
-            UEMesh.Normals.Add(FVector(normalsPtr[idx], -normalsPtr[idx + 1], normalsPtr[idx + 2]).GetSafeNormal());
+            // Create a copy of normals for GPU transformation
+            TArray<float> NormalsCopy;
+            NormalsCopy.SetNumUninitialized(CMesh.normals_count);
+            FMemory::Memcpy(NormalsCopy.GetData(), CMesh.normals, CMesh.normals_count * sizeof(float));
+            
+            // Normal transformation matrix for ParaView to UE conversion
+            // For normals, we need to use the inverse transpose of the vertex transformation matrix
+            // Since we're just flipping Y coordinate (right-handed to left-handed), the normal matrix is:
+            // [1, 0, 0]
+            // [0, -1, 0]  (flip Y for normals too)
+            // [0, 0, 1]
+            float NormalMatrix[9] = {
+                1.0f, 0.0f, 0.0f,
+                0.0f, -1.0f, 0.0f,
+                0.0f, 0.0f, 1.0f
+            };
+            
+            // Transform normals on GPU
+            int gpuResult = TransformNormalsAccelerated_C(gpuAccelerator, NormalsCopy.GetData(), NormalCount, NormalMatrix);
+            if (gpuResult)
+            {
+                // Copy transformed normals back
+                const float* normalsPtr = NormalsCopy.GetData();
+                for (size_t i = 0; i < NormalCount; ++i)
+                {
+                    size_t idx = i * 3;
+                    UEMesh.Normals.Add(FVector(normalsPtr[idx], normalsPtr[idx + 1], normalsPtr[idx + 2]).GetSafeNormal());
+                }
+                UE_LOG(LogJUSYNC, Log, TEXT("✅ GPU normal transformation completed for %d normals"), NormalCount);
+            }
+            else
+            {
+                // Fallback to CPU
+                UE_LOG(LogJUSYNC, Warning, TEXT("⚠️ GPU normal transformation failed, falling back to CPU"));
+                bUseGPUAcceleration = false;
+            }
+        }
+        
+        // CPU fallback or small mesh processing
+        if (!bUseGPUAcceleration)
+        {
+            // Optimized loop with direct pointer access
+            const float* normalsPtr = CMesh.normals;
+            for (size_t i = 0; i < NormalCount; ++i)
+            {
+                size_t idx = i * 3;
+                UEMesh.Normals.Add(FVector(normalsPtr[idx], -normalsPtr[idx + 1], normalsPtr[idx + 2]).GetSafeNormal());
+            }
         }
     }
 
@@ -417,6 +571,80 @@ static FJUSYNCMeshData ConvertCMeshDataToUE_Helper(const CMeshData& CMesh, bool 
             }
         }
         UE_LOG(LogJUSYNC, Log, TEXT("Total unique colours in first scan: %d"), Unique.Num());
+    }
+
+    // 7. Calculate normals if missing (OPTIMIZED with GPU acceleration)
+    if (UEMesh.Normals.Num() == 0 && UEMesh.Vertices.Num() > 0 && UEMesh.Triangles.Num() >= 3)
+    {
+        size_t VertexCount = UEMesh.Vertices.Num();
+        size_t TriangleIndexCount = UEMesh.Triangles.Num();
+        
+        if (bUseGPUAcceleration && gpuAccelerator && VertexCount >= GPUVertexThresholdGlobal)
+        {
+            // Prepare vertex and index data for GPU calculation
+            TArray<float> VertexData;
+            VertexData.SetNumUninitialized(VertexCount * 3);
+            for (size_t i = 0; i < VertexCount; ++i)
+            {
+                const FVector& V = UEMesh.Vertices[i];
+                VertexData[i * 3 + 0] = V.X;
+                VertexData[i * 3 + 1] = V.Y;
+                VertexData[i * 3 + 2] = V.Z;
+            }
+            
+            TArray<unsigned int> IndexData;
+            IndexData.SetNumUninitialized(TriangleIndexCount);
+            for (size_t i = 0; i < TriangleIndexCount; ++i)
+            {
+                IndexData[i] = static_cast<unsigned int>(UEMesh.Triangles[i]);
+            }
+            
+            // Allocate output array for normals
+            TArray<float> NormalsData;
+            NormalsData.SetNumUninitialized(VertexCount * 3);
+            
+            // Calculate normals on GPU
+            int gpuResult = CalculateNormalsAccelerated_C(gpuAccelerator,
+                                                         VertexData.GetData(),
+                                                         VertexCount,
+                                                         IndexData.GetData(),
+                                                         TriangleIndexCount,
+                                                         NormalsData.GetData());
+            
+            if (gpuResult)
+            {
+                // Copy calculated normals back
+                UEMesh.Normals.Reserve(VertexCount);
+                for (size_t i = 0; i < VertexCount; ++i)
+                {
+                    size_t idx = i * 3;
+                    UEMesh.Normals.Add(FVector(NormalsData[idx], NormalsData[idx + 1], NormalsData[idx + 2]).GetSafeNormal());
+                }
+                UE_LOG(LogJUSYNC, Log, TEXT("✅ GPU normal calculation completed for %d vertices"), VertexCount);
+            }
+            else
+            {
+                // Fallback to CPU
+                UE_LOG(LogJUSYNC, Warning, TEXT("⚠️ GPU normal calculation failed, falling back to CPU"));
+                bUseGPUAcceleration = false;
+            }
+        }
+        
+        // CPU fallback or small mesh processing
+        if (!bUseGPUAcceleration)
+        {
+            // Calculate normals using CPU implementation
+            CalculateMeshNormalsCPU(UEMesh.Vertices, UEMesh.Triangles, UEMesh.Normals);
+            UE_LOG(LogJUSYNC, Log, TEXT("✅ CPU normal calculation completed for %d vertices"), VertexCount);
+        }
+    }
+
+    // 8. Clean up GPU accelerator if created
+    if (gpuAccelerator)
+    {
+        DestroyMeshAccelerator_C(gpuAccelerator);
+        gpuAccelerator = nullptr;
+        UE_LOG(LogJUSYNC, Log, TEXT("✅ GPU accelerator cleaned up"));
     }
 
     return UEMesh;
@@ -741,7 +969,12 @@ bool UJUSYNCSubsystem::LoadUSDFromDisk(const FString& FilePath, TArray<FJUSYNCMe
         // Convert C mesh data to UE format
         for (size_t i = 0; i < MeshCount; ++i)
         {
-            FJUSYNCMeshData UEMeshData = ConvertCMeshDataToUE_Helper(CMeshes[i]);
+            FJUSYNCMeshData UEMeshData = ConvertCMeshDataToUE_Helper(
+                CMeshes[i],
+                true,  // bForceVertexInterpolation
+                bGPUAccelerationEnabled,  // bUseGPUAccelerationGlobal
+                GPUVertexThreshold  // GPUVertexThresholdGlobal
+            );
             OutMeshData.Add(UEMeshData);
         }
         
@@ -3710,6 +3943,95 @@ int32 UJUSYNCSubsystem::CountRMCComponents() const
         }
     }
     return Count;
+}
+
+// ========== GPU ACCELERATION CONTROL FUNCTIONS ==========
+
+void UJUSYNCSubsystem::EnableGPUAcceleration(bool bEnable)
+{
+    bGPUAccelerationEnabled = bEnable;
+    UE_LOG(LogJUSYNC, Log, TEXT("GPU acceleration %s"), bEnable ? TEXT("enabled") : TEXT("disabled"));
+}
+
+void UJUSYNCSubsystem::SetGPUVertexThreshold(int32 VertexThreshold)
+{
+    if (VertexThreshold >= 0)
+    {
+        GPUVertexThreshold = VertexThreshold;
+        UE_LOG(LogJUSYNC, Log, TEXT("GPU vertex threshold set to %d vertices"), VertexThreshold);
+    }
+    else
+    {
+        UE_LOG(LogJUSYNC, Warning, TEXT("Invalid GPU vertex threshold: %d (must be >= 0)"), VertexThreshold);
+    }
+}
+
+bool UJUSYNCSubsystem::IsGPUAccelerationAvailable() const
+{
+#ifdef WITH_ANARI_USD_MIDDLEWARE
+    // Check if CUDA is available by trying to create a mesh accelerator
+    void* testAccelerator = CreateMeshAccelerator_C();
+    if (testAccelerator)
+    {
+        DestroyMeshAccelerator_C(testAccelerator);
+        return true;
+    }
+#endif
+    return false;
+}
+
+bool UJUSYNCSubsystem::IsGPUAccelerationEnabled() const
+{
+    return bGPUAccelerationEnabled;
+}
+
+FString UJUSYNCSubsystem::GetGPUAccelerationInfo() const
+{
+    FString Info;
+    
+    if (IsGPUAccelerationAvailable())
+    {
+        Info = FString::Printf(TEXT("GPU Acceleration: %s\n"), bGPUAccelerationEnabled ? TEXT("ENABLED") : TEXT("DISABLED"));
+        Info += FString::Printf(TEXT("Vertex Threshold: %d\n"), GPUVertexThreshold);
+        Info += FString::Printf(TEXT("Last Processed: %d vertices in %.2f ms\n"),
+                               LastGPUMetrics.VerticesProcessed,
+                               LastGPUMetrics.ProcessingTimeMs);
+        Info += FString::Printf(TEXT("Throughput: %.0f vertices/sec\n"), LastGPUMetrics.ThroughputVerticesPerSec);
+        
+        // Backend info
+        FString BackendStr;
+        switch (LastGPUMetrics.BackendUsed)
+        {
+            case 0: BackendStr = TEXT("CUDA"); break;
+            case 1: BackendStr = TEXT("AVX-512"); break;
+            case 2: BackendStr = TEXT("AVX2"); break;
+            case 3: BackendStr = TEXT("SSE4"); break;
+            case 4: BackendStr = TEXT("Scalar"); break;
+            default: BackendStr = TEXT("Unknown"); break;
+        }
+        Info += FString::Printf(TEXT("Backend: %s"), *BackendStr);
+    }
+    else
+    {
+        Info = TEXT("GPU Acceleration: NOT AVAILABLE\n");
+        Info += TEXT("CUDA not detected or WITH_ANARI_USD_MIDDLEWARE not defined");
+    }
+    
+    return Info;
+}
+
+bool UJUSYNCSubsystem::GetMeshProcessingMetrics(
+    int32& OutVerticesProcessed,
+    float& OutProcessingTimeMs,
+    float& OutThroughputVerticesPerSec,
+    int32& OutBackendUsed)
+{
+    OutVerticesProcessed = LastGPUMetrics.VerticesProcessed;
+    OutProcessingTimeMs = LastGPUMetrics.ProcessingTimeMs;
+    OutThroughputVerticesPerSec = LastGPUMetrics.ThroughputVerticesPerSec;
+    OutBackendUsed = LastGPUMetrics.BackendUsed;
+    
+    return (OutVerticesProcessed > 0);
 }
 
 int32 UJUSYNCSubsystem::CountActiveRMCComponents() const
