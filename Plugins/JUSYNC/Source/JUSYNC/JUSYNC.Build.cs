@@ -16,9 +16,7 @@ public class JUSYNC : ModuleRules
             "Core",
             "CoreUObject",
             "Engine",
-            "RealtimeMeshComponent",
-            "Json",
-            "JsonUtilities"
+            "RealtimeMeshComponent"
         });
 
         PrivateDependencyModuleNames.AddRange(new string[]

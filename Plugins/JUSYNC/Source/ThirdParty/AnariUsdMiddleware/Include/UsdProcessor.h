@@ -11,7 +11,6 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include "MiddlewareLogging.h"
-#include "MeshAccelerator.h"
 
 #ifndef ANARI_USD_MIDDLEWARE_API
 #ifdef _WIN32
@@ -26,6 +25,7 @@ namespace tinyusdz {
     class Prim;
     class Stage;
     class GeomMesh;
+    class GeomPoints;
 }
 
 namespace anari_usd_middleware {
@@ -367,6 +367,17 @@ private:
     bool ExtractMeshData(void* mesh,
                         MeshData& outMeshData,
                         const glm::mat4& worldTransform);
+
+    /**
+     * Extract points data from USD points primitive (point cloud) with validation
+     * @param points Pointer to the USD points primitive (validated)
+     * @param outMeshData Output mesh data structure (points stored in points array)
+     * @param worldTransform World transformation matrix (validated)
+     * @return True if extraction succeeded, false otherwise
+     */
+    bool ExtractPointsData(void* points,
+                          MeshData& outMeshData,
+                          const glm::mat4& worldTransform);
 
     /**
      * Get local transformation matrix with validation

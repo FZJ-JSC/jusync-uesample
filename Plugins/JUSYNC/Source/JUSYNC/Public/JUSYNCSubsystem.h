@@ -12,6 +12,8 @@
 #include "Materials/MaterialInterface.h"
 #include "Containers/Map.h"
 #include "UObject/SoftObjectPtr.h"
+#include "Components/HierarchicalInstancedStaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
 #include <functional>
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
@@ -25,6 +27,8 @@ class UJUSYNCBlueprintLibrary;
 
 // Forward declarations
 class URealtimeMeshComponent;
+class UHierarchicalInstancedStaticMeshComponent;
+class UStaticMesh;
 
 UCLASS()
 class JUSYNC_API UJUSYNCSubsystem : public UGameInstanceSubsystem
@@ -141,6 +145,103 @@ public:
         float SafetyMarginPercent = 20.0f
     );
 
+    // Point Cloud Visualization with HISM (Hierarchical Instanced Static Mesh)
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Point Cloud HISM")
+    UHierarchicalInstancedStaticMeshComponent* CreatePointCloudHISM(
+        AActor* ParentActor,
+        const FJUSYNCMeshData& PointCloudData,
+        UStaticMesh* SphereMesh = nullptr,
+        float DefaultSphereRadius = 10.0f,
+        bool bUseVertexColors = true,
+        UMaterialInterface* Material = nullptr
+    );
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Point Cloud HISM Chunked", 
+              meta = (AdvancedDisplay = "6"))
+    UHierarchicalInstancedStaticMeshComponent* CreatePointCloudHISM_Chunked(
+        AActor* ParentActor,
+        const FJUSYNCMeshData& PointCloudData,
+        UStaticMesh* SphereMesh = nullptr,
+        float DefaultSphereRadius = 10.0f,
+        bool bUseVertexColors = true,
+        UMaterialInterface* Material = nullptr,
+        int32 MaxPointsPerChunk = 50000
+    );
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Point Cloud HISM Parallel", 
+              meta = (AdvancedDisplay = "7"))
+    TArray<UHierarchicalInstancedStaticMeshComponent*> CreatePointCloudHISM_Parallel(
+        AActor* ParentActor,
+        const FJUSYNCMeshData& PointCloudData,
+        UStaticMesh* SphereMesh = nullptr,
+        float DefaultSphereRadius = 10.0f,
+        bool bUseVertexColors = true,
+        UMaterialInterface* Material = nullptr,
+        int32 MaxPointsPerChunk = 50000,
+        bool bSpawnProgressively = true
+    );
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Point Cloud HISM With Custom Size")
+    UHierarchicalInstancedStaticMeshComponent* CreatePointCloudHISMWithCustomSize(
+        AActor* ParentActor,
+        const FJUSYNCMeshData& PointCloudData,
+        UStaticMesh* SphereMesh,
+        const TArray<float>& PointSizes,
+        bool bUseVertexColors = true,
+        UMaterialInterface* Material = nullptr
+    );
+
+    // Point cloud helper functions
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud")
+    bool IsPointCloudData(const FJUSYNCMeshData& MeshData);
+    
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud")
+    int32 GetPointCloudCount(const FJUSYNCMeshData& MeshData);
+    
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud")
+    bool HasPointWidthsData(const FJUSYNCMeshData& MeshData);
+    
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud")
+    bool HasPointIDsData(const FJUSYNCMeshData& MeshData);
+
+    // Billboard-based point cloud (much faster than 3D spheres)
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Point Cloud Billboards")
+    UHierarchicalInstancedStaticMeshComponent* CreatePointCloudBillboards(
+        AActor* ParentActor,
+        const FJUSYNCMeshData& PointCloudData,
+        UStaticMesh* BillboardMesh = nullptr,
+        float BillboardSize = 10.0f,
+        bool bUseVertexColors = true,
+        UMaterialInterface* Material = nullptr,
+        bool bCameraFacing = true
+    );
+
+    // LOD-based point cloud with multiple detail levels
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Point Cloud With LOD")
+    TArray<UHierarchicalInstancedStaticMeshComponent*> CreatePointCloudWithLOD(
+        AActor* ParentActor,
+        const FJUSYNCMeshData& PointCloudData,
+        UStaticMesh* PointMesh = nullptr,
+        float BaseSize = 10.0f,
+        bool bUseVertexColors = true,
+        UMaterialInterface* Material = nullptr,
+        int32 LODLevels = 3,
+        float LODDistanceFactor = 1000.0f
+    );
+
+    // Optimized point cloud with spatial partitioning for better culling
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Optimized Point Cloud")
+    TArray<UHierarchicalInstancedStaticMeshComponent*> CreateOptimizedPointCloud(
+        AActor* ParentActor,
+        const FJUSYNCMeshData& PointCloudData,
+        UStaticMesh* PointMesh = nullptr,
+        float PointSize = 10.0f,
+        bool bUseVertexColors = true,
+        UMaterialInterface* Material = nullptr,
+        int32 GridSize = 10,
+        bool bUseBillboards = true
+    );
+
     // Conversion utilities for RealtimeMesh
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Mesh")
     FJUSYNCRealtimeMeshData ConvertToRealtimeMeshFormat(const FJUSYNCMeshData& StandardMesh);
@@ -148,30 +249,6 @@ public:
     // Texture Integration
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Texture")
     UTexture2D* CreateUETextureFromJUSYNC(const FJUSYNCTextureData& TextureData);
-
-    // ========== GPU ACCELERATION CONTROL ==========
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC|GPU Acceleration")
-    void EnableGPUAcceleration(bool bEnable);
-
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC|GPU Acceleration")
-    void SetGPUVertexThreshold(int32 VertexThreshold);
-
-    UFUNCTION(BlueprintPure, Category = "JUSYNC|GPU Acceleration")
-    bool IsGPUAccelerationAvailable() const;
-
-    UFUNCTION(BlueprintPure, Category = "JUSYNC|GPU Acceleration")
-    bool IsGPUAccelerationEnabled() const;
-
-    UFUNCTION(BlueprintPure, Category = "JUSYNC|GPU Acceleration")
-    FString GetGPUAccelerationInfo() const;
-
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC|GPU Acceleration")
-    bool GetMeshProcessingMetrics(
-        int32& OutVerticesProcessed,
-        float& OutProcessingTimeMs,
-        float& OutThroughputVerticesPerSec,
-        int32& OutBackendUsed
-    );
 
     // Material Caching
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Materials")
@@ -404,29 +481,6 @@ private:
         }
     };
 
-    // GPU Acceleration Settings
-    bool bGPUAccelerationEnabled{ true };
-    int32 GPUVertexThreshold{ 10000 };
-    
-    // GPU Performance Metrics
-    struct FGPUMetrics
-    {
-        int32 VerticesProcessed{ 0 };
-        float ProcessingTimeMs{ 0.0f };
-        float ThroughputVerticesPerSec{ 0.0f };
-        int32 BackendUsed{ 0 }; // 0=CUDA, 1=AVX512, 2=AVX2, 3=SSE4, 4=Scalar
-        
-        void Reset()
-        {
-            VerticesProcessed = 0;
-            ProcessingTimeMs = 0.0f;
-            ThroughputVerticesPerSec = 0.0f;
-            BackendUsed = 0;
-        }
-    };
-    
-    FGPUMetrics LastGPUMetrics;
-    
     FMetricsAccumulator MetricsAccumulator;
 
     // Metrics collection functions (implementation details)

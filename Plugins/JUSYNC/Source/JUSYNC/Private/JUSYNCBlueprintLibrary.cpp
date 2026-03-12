@@ -12,13 +12,6 @@
 #include "Misc/Paths.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/PlatformProcess.h"
-#include "AnariUsdMiddleware_C.h"
-
-// JSON serialization headers
-#include "Dom/JsonObject.h"
-#include "Serialization/JsonReader.h"
-#include "Serialization/JsonSerializer.h"
-#include "Serialization/JsonWriter.h"
 
 // Platform-specific headers for CPU/thread measurement
 #if PLATFORM_WINDOWS
@@ -2636,6 +2629,27 @@ AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshWithMaterial(
     // **ENHANCED MESH CREATION - WITH ASYNC SUPPORT AND AUTOMATIC SPLITTING**
     bool bSuccess;
 
+    // Check if this is a point cloud (no triangles)
+    bool bIsPointCloud = ProcessedMeshData.IsPointCloud();
+    if (bIsPointCloud)
+    {
+        UE_LOG(LogJUSYNC, Log, TEXT("🎯 Point cloud detected: %d points, using HISM visualization"), 
+               ProcessedMeshData.Vertices.Num());
+        
+        // For point clouds, we need to use HISM instead of RealtimeMesh
+        // Note: This requires the user to handle point clouds separately in Blueprint
+        // For now, we'll log an error and return false
+        UE_LOG(LogJUSYNC, Error, TEXT("❌ Point clouds require HISM visualization. Use CreatePointCloudHISM or CreatePointCloudHISM_Chunked instead of standard mesh creation."));
+        UE_LOG(LogJUSYNC, Error, TEXT("   For large point clouds (>50k points), use CreatePointCloudHISM_Chunked to avoid freezing."));
+        UE_LOG(LogJUSYNC, Error, TEXT("   For maximum performance (>500k points), use CreatePointCloudHISM_Parallel with bSpawnProgressively=true."));
+        UE_LOG(LogJUSYNC, Error, TEXT("   For 6M+ point clouds, use CreatePointCloudBillboards for 480x performance improvement."));
+        UE_LOG(LogJUSYNC, Error, TEXT("   For optimal rendering, use CreatePointCloudWithLOD or CreateOptimizedPointCloud."));
+        
+        // Destroy the actor since we can't visualize the point cloud
+        SpawnedActor->Destroy();
+        return nullptr;
+    }
+
     // Check if mesh needs splitting (exceeds RMC vertex/triangle limits)
     const int32 TotalVertices = ProcessedMeshData.Vertices.Num();
     const int32 TotalTriangles = ProcessedMeshData.Triangles.Num() / 3;
@@ -2766,7 +2780,7 @@ AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshWithMaterial_Benchmarked(
         float CPUUsage = GetCPUUsagePercentage();
         int32 ActiveThreads = GetActiveThreadCount();
         int64 RAMPeak = StatsAfter.PeakUsedPhysical;
-
+        
         // Get GPU usage from subsystem
         float GPUUsage = 0.0f;
         UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
@@ -3507,7 +3521,7 @@ void UJUSYNCBlueprintLibrary::SaveAllBenchmarkResultsToJSON(const FString& Outpu
         // Calculate actual elapsed session time from start to now
         FDateTime SessionEndTime = FDateTime::UtcNow();
         FDateTime SessionStartTime = BenchmarkSessionStartTime;
-
+        
         // If session start time is not valid (e.g., SaveAllBenchmarkResultsToJSON called directly),
         // use the timestamp of the first benchmark result as session start
         if (SessionStartTime.GetTicks() == 0 && BenchmarkResults.Num() > 0)
@@ -3515,7 +3529,7 @@ void UJUSYNCBlueprintLibrary::SaveAllBenchmarkResultsToJSON(const FString& Outpu
             SessionStartTime = BenchmarkResults[0].Timestamp;
             UE_LOG(LogJUSYNC, Warning, TEXT("Using first benchmark result timestamp as session start time"));
         }
-
+        
         FTimespan ElapsedTime = SessionEndTime - SessionStartTime;
         TotalSessionTimeMs = static_cast<int64>(ElapsedTime.GetTotalMilliseconds());
 
@@ -3534,8 +3548,8 @@ void UJUSYNCBlueprintLibrary::SaveAllBenchmarkResultsToJSON(const FString& Outpu
             AvgFrameTimeMs += Result.FrameTimeMs;
         }
 
-        UE_LOG(LogJUSYNC, Log, TEXT("Benchmark session timing: Elapsed=%lld ms, Sum of tests=%lld ms, Difference=%lld ms"),
-            TotalSessionTimeMs, SumOfTestTimesMs, TotalSessionTimeMs - SumOfTestTimesMs);
+        UE_LOG(LogJUSYNC, Log, TEXT("Benchmark session timing: Elapsed=%lld ms, Sum of tests=%lld ms, Difference=%lld ms"), 
+               TotalSessionTimeMs, SumOfTestTimesMs, TotalSessionTimeMs - SumOfTestTimesMs);
 
         AvgFPS /= BenchmarkResults.Num();
         AvgFrameTimeMs /= BenchmarkResults.Num();
@@ -3603,7 +3617,7 @@ void UJUSYNCBlueprintLibrary::SaveAllBenchmarkResultsToJSON(const FString& Outpu
     float SessionVRAMEndGB = SessionVRAMEnd / (1024.0f * 1024.0f * 1024.0f);
     float SessionVRAMPeakGB = SessionVRAMPeak / (1024.0f * 1024.0f * 1024.0f);
     float SessionVRAMDeltaGB = SessionVRAMDelta / (1024.0f * 1024.0f * 1024.0f);
-
+    
     // Convert RAM peak to MB
     float SessionRAMPeakMB = SessionRAMPeak / (1024.0f * 1024.0f);
 
@@ -4754,365 +4768,4 @@ void UJUSYNCBlueprintLibrary::RequestFileAsyncDynamic(
                     }
                 });
         });
-}
-
-// ========== OPTIMIZATION FUNCTIONS IMPLEMENTATION ==========
-
-bool UJUSYNCBlueprintLibrary::ConfigureOptimizations(const FJUSYNCOptimizationConfig& Config)
-{
-    // Call C interface function to configure optimizations
-    return anari_usd_configure_optimizations(
-        Config.bEnableThreadPool,
-        Config.ThreadPoolSize,
-        Config.MaxQueueSize,
-        Config.bEnableMemoryPool,
-        Config.MemoryPoolBlockSizeKB * 1024, // Convert KB to bytes
-        Config.MemoryPoolMaxBlocks,
-        Config.bEnableGPUAcceleration,
-        Config.GPUDeviceID,
-        Config.GPUThreadsPerBlock,
-        Config.GPUBlocksPerGrid,
-        Config.bEnableStreaming,
-        Config.StreamingChunkSizeMB * 1024 * 1024, // Convert MB to bytes
-        Config.MaxConcurrentChunks
-    ) == 0;
-}
-
-bool UJUSYNCBlueprintLibrary::SetThreadPoolEnabled(bool bEnabled, int32 ThreadCount)
-{
-    return anari_usd_set_thread_pool_enabled(bEnabled, ThreadCount) == 0;
-}
-
-bool UJUSYNCBlueprintLibrary::SetMemoryPoolEnabled(bool bEnabled, int32 BlockSizeKB, int32 MaxBlocks)
-{
-    return anari_usd_set_memory_pool_enabled(bEnabled, BlockSizeKB * 1024, MaxBlocks) == 0;
-}
-
-bool UJUSYNCBlueprintLibrary::SetGPUAccelerationEnabled(bool bEnabled, int32 DeviceID)
-{
-    return anari_usd_set_gpu_acceleration_enabled(bEnabled, DeviceID) == 0;
-}
-
-bool UJUSYNCBlueprintLibrary::SetStreamingEnabled(bool bEnabled, int32 ChunkSizeMB, int32 MaxConcurrentChunks)
-{
-    return anari_usd_set_streaming_enabled(bEnabled, ChunkSizeMB * 1024 * 1024, MaxConcurrentChunks) == 0;
-}
-
-bool UJUSYNCBlueprintLibrary::GetOptimizationStats(FJUSYNCOptimizationStats& OutStats)
-{
-    // Initialize C structs
-    AnariUsdThreadPoolStats cThreadPoolStats;
-    AnariUsdMemoryPoolStats cMemoryPoolStats;
-    AnariUsdGPUStats cGPUStats;
-    AnariUsdStreamingStats cStreamingStats;
-
-    // Get stats from C interface
-    int32 result = anari_usd_get_optimization_stats(
-        &cThreadPoolStats,
-        &cMemoryPoolStats,
-        &cGPUStats,
-        &cStreamingStats
-    );
-
-    if (result != 0) return false;
-
-    // Convert C structs to Unreal structs
-    OutStats.ThreadPoolStats.MaxThreads = cThreadPoolStats.max_threads;
-    OutStats.ThreadPoolStats.ActiveThreads = cThreadPoolStats.active_threads;
-    OutStats.ThreadPoolStats.IdleThreads = cThreadPoolStats.idle_threads;
-    OutStats.ThreadPoolStats.QueuedTasks = cThreadPoolStats.queued_tasks;
-    OutStats.ThreadPoolStats.AvgTaskTimeMs = cThreadPoolStats.avg_task_time_ms;
-    OutStats.ThreadPoolStats.MaxTaskTimeMs = cThreadPoolStats.max_task_time_ms;
-    OutStats.ThreadPoolStats.MinTaskTimeMs = cThreadPoolStats.min_task_time_ms;
-    OutStats.ThreadPoolStats.TotalTasksProcessed = cThreadPoolStats.total_tasks_processed;
-    OutStats.ThreadPoolStats.FailedTasks = cThreadPoolStats.failed_tasks;
-    OutStats.ThreadPoolStats.TasksPerSecond = cThreadPoolStats.tasks_per_second;
-    OutStats.ThreadPoolStats.CPUUtilizationPercent = cThreadPoolStats.cpu_utilization_percent;
-    OutStats.ThreadPoolStats.ThreadStackMemoryBytes = cThreadPoolStats.thread_stack_memory_bytes;
-    OutStats.ThreadPoolStats.TaskQueueMemoryBytes = cThreadPoolStats.task_queue_memory_bytes;
-
-    OutStats.MemoryPoolStats.BlockSizeBytes = cMemoryPoolStats.block_size_bytes;
-    OutStats.MemoryPoolStats.TotalBlocks = cMemoryPoolStats.total_blocks;
-    OutStats.MemoryPoolStats.FreeBlocks = cMemoryPoolStats.free_blocks;
-    OutStats.MemoryPoolStats.UsedBlocks = cMemoryPoolStats.used_blocks;
-    OutStats.MemoryPoolStats.TotalMemoryBytes = cMemoryPoolStats.total_memory_bytes;
-    OutStats.MemoryPoolStats.UsedMemoryBytes = cMemoryPoolStats.used_memory_bytes;
-    OutStats.MemoryPoolStats.FreeMemoryBytes = cMemoryPoolStats.free_memory_bytes;
-    OutStats.MemoryPoolStats.AllocationCount = cMemoryPoolStats.allocation_count;
-    OutStats.MemoryPoolStats.DeallocationCount = cMemoryPoolStats.deallocation_count;
-    OutStats.MemoryPoolStats.AvgAllocationTimeMs = cMemoryPoolStats.avg_allocation_time_ms;
-    OutStats.MemoryPoolStats.AvgDeallocationTimeMs = cMemoryPoolStats.avg_deallocation_time_ms;
-    OutStats.MemoryPoolStats.FragmentationPercent = cMemoryPoolStats.fragmentation_percent;
-    OutStats.MemoryPoolStats.UtilizationPercent = cMemoryPoolStats.utilization_percent;
-    OutStats.MemoryPoolStats.CacheHits = cMemoryPoolStats.cache_hits;
-    OutStats.MemoryPoolStats.CacheMisses = cMemoryPoolStats.cache_misses;
-    OutStats.MemoryPoolStats.CacheHitRatePercent = cMemoryPoolStats.cache_hit_rate_percent;
-
-    OutStats.GPUStats.GPUName = FString(cGPUStats.gpu_name);
-    OutStats.GPUStats.ComputeCapabilityMajor = cGPUStats.compute_capability_major;
-    OutStats.GPUStats.ComputeCapabilityMinor = cGPUStats.compute_capability_minor;
-    OutStats.GPUStats.TotalVRAMBytes = cGPUStats.total_vram_bytes;
-    OutStats.GPUStats.FreeVRAMBytes = cGPUStats.free_vram_bytes;
-    OutStats.GPUStats.VertexSplittingKernelTimeMs = cGPUStats.vertex_splitting_kernel_time_ms;
-    OutStats.GPUStats.VertexWeldingKernelTimeMs = cGPUStats.vertex_welding_kernel_time_ms;
-    OutStats.GPUStats.NormalCalculationKernelTimeMs = cGPUStats.normal_calculation_kernel_time_ms;
-    OutStats.GPUStats.UVProcessingKernelTimeMs = cGPUStats.uv_processing_kernel_time_ms;
-    OutStats.GPUStats.VerticesProcessedPerSecond = cGPUStats.vertices_processed_per_second;
-    OutStats.GPUStats.TrianglesProcessedPerSecond = cGPUStats.triangles_processed_per_second;
-    OutStats.GPUStats.GPUUtilizationPercent = cGPUStats.gpu_utilization_percent;
-    OutStats.GPUStats.HostToDeviceBandwidthGBps = cGPUStats.host_to_device_bandwidth_gbps;
-    OutStats.GPUStats.DeviceToHostBandwidthGBps = cGPUStats.device_to_host_bandwidth_gbps;
-    OutStats.GPUStats.TotalDataTransferredBytes = cGPUStats.total_data_transferred_bytes;
-    OutStats.GPUStats.KernelLaunches = cGPUStats.kernel_launches;
-    OutStats.GPUStats.ConcurrentKernels = cGPUStats.concurrent_kernels;
-    OutStats.GPUStats.AvgKernelLaunchOverheadMs = cGPUStats.avg_kernel_launch_overhead_ms;
-
-    OutStats.StreamingStats.ChunkSizeBytes = cStreamingStats.chunk_size_bytes;
-    OutStats.StreamingStats.MaxConcurrentChunks = cStreamingStats.max_concurrent_chunks;
-    OutStats.StreamingStats.PrefetchBufferSize = cStreamingStats.prefetch_buffer_size;
-    OutStats.StreamingStats.AvgChunkLoadTimeMs = cStreamingStats.avg_chunk_load_time_ms;
-    OutStats.StreamingStats.MaxChunkLoadTimeMs = cStreamingStats.max_chunk_load_time_ms;
-    OutStats.StreamingStats.MinChunkLoadTimeMs = cStreamingStats.min_chunk_load_time_ms;
-    OutStats.StreamingStats.DataThroughputMBps = cStreamingStats.data_throughput_mbps;
-    OutStats.StreamingStats.TotalChunksProcessed = cStreamingStats.total_chunks_processed;
-    OutStats.StreamingStats.FailedChunks = cStreamingStats.failed_chunks;
-    OutStats.StreamingStats.ChunkCacheMemoryBytes = cStreamingStats.chunk_cache_memory_bytes;
-    OutStats.StreamingStats.ActiveChunksMemoryBytes = cStreamingStats.active_chunks_memory_bytes;
-    OutStats.StreamingStats.CacheHitRatePercent = cStreamingStats.cache_hit_rate_percent;
-    OutStats.StreamingStats.LoadQueueSize = cStreamingStats.load_queue_size;
-    OutStats.StreamingStats.ProcessQueueSize = cStreamingStats.process_queue_size;
-    OutStats.StreamingStats.ReadyQueueSize = cStreamingStats.ready_queue_size;
-
-    // Get overall stats
-    float speedup_factor = 0.0f;
-    float memory_reduction_percent = 0.0f;
-    float processing_time_reduction_percent = 0.0f;
-    int64 total_vertices_processed = 0;
-    int64 total_triangles_processed = 0;
-    bool thread_pool_enabled = false;
-    bool memory_pool_enabled = false;
-    bool gpu_acceleration_enabled = false;
-    bool streaming_enabled = false;
-
-    // anari_usd_get_overall_optimization_stats is not implemented in current version
-    // Using placeholder values for compatibility
-    speedup_factor = 1.0f;
-    memory_reduction_percent = 0.0f;
-    processing_time_reduction_percent = 0.0f;
-    total_vertices_processed = 0;
-    total_triangles_processed = 0;
-    thread_pool_enabled = false;
-    memory_pool_enabled = false;
-    gpu_acceleration_enabled = false;
-    streaming_enabled = false;
-
-    OutStats.TotalSpeedupFactor = speedup_factor;
-    OutStats.MemoryReductionPercent = memory_reduction_percent;
-    OutStats.ProcessingTimeReductionPercent = processing_time_reduction_percent;
-    OutStats.TotalVerticesProcessed = total_vertices_processed;
-    OutStats.TotalTrianglesProcessed = total_triangles_processed;
-    OutStats.bThreadPoolEnabled = thread_pool_enabled;
-    OutStats.bMemoryPoolEnabled = memory_pool_enabled;
-    OutStats.bGPUAccelerationEnabled = gpu_acceleration_enabled;
-    OutStats.bStreamingEnabled = streaming_enabled;
-
-    return true;
-}
-
-bool UJUSYNCBlueprintLibrary::GetThreadPoolStats(FJUSYNCThreadPoolStats& OutStats)
-{
-    FJUSYNCOptimizationStats fullStats;
-    if (!GetOptimizationStats(fullStats)) return false;
-
-    OutStats = fullStats.ThreadPoolStats;
-    return true;
-}
-
-bool UJUSYNCBlueprintLibrary::GetMemoryPoolStats(FJUSYNCMemoryPoolStats& OutStats)
-{
-    FJUSYNCOptimizationStats fullStats;
-    if (!GetOptimizationStats(fullStats)) return false;
-
-    OutStats = fullStats.MemoryPoolStats;
-    return true;
-}
-
-bool UJUSYNCBlueprintLibrary::GetGPUStats(FJUSYNCGPUStats& OutStats)
-{
-    FJUSYNCOptimizationStats fullStats;
-    if (!GetOptimizationStats(fullStats)) return false;
-
-    OutStats = fullStats.GPUStats;
-    return true;
-}
-
-bool UJUSYNCBlueprintLibrary::GetStreamingStats(FJUSYNCStreamingStats& OutStats)
-{
-    FJUSYNCOptimizationStats fullStats;
-    if (!GetOptimizationStats(fullStats)) return false;
-
-    OutStats = fullStats.StreamingStats;
-    return true;
-}
-
-void UJUSYNCBlueprintLibrary::ResetOptimizationStats()
-{
-    anari_usd_reset_optimization_stats();
-}
-
-bool UJUSYNCBlueprintLibrary::LoadUSDWithOptimizations(const TArray<uint8>& Buffer, const FString& Filename,
-    TArray<FJUSYNCMeshData>& OutMeshData, FString& OutPreview)
-{
-    // Note: anari_usd_load_with_optimizations is not fully implemented in current version
-    // Using standard USD loading as fallback
-    OutPreview = TEXT("Optimized USD loading not available in current version");
-    return false;
-}
-
-bool UJUSYNCBlueprintLibrary::LoadUSDFromDiskWithOptimizations(const FString& FilePath,
-    TArray<FJUSYNCMeshData>& OutMeshData, FString& OutPreview)
-{
-    // Optimized disk loading not available in current version
-    OutPreview = TEXT("Optimized disk loading not available in current version");
-    return false;
-}
-
-bool UJUSYNCBlueprintLibrary::CompareOptimizationPerformance(const TArray<uint8>& USDData, const FString& Filename,
-    float& OutSpeedupFactor, float& OutMemoryReductionPercent)
-{
-    // Performance comparison not available in current version
-    OutSpeedupFactor = 1.0f;
-    OutMemoryReductionPercent = 0.0f;
-    return false;
-}
-
-FJUSYNCOptimizationConfig UJUSYNCBlueprintLibrary::GetCurrentOptimizationConfig()
-{
-    FJUSYNCOptimizationConfig config;
-
-    // Default configuration (optimization config not available in current version)
-    config.bEnableThreadPool = true;
-    config.ThreadPoolSize = 4;
-    config.MaxQueueSize = 100;
-    config.bEnableMemoryPool = true;
-    config.MemoryPoolBlockSizeKB = 16384; // 16MB
-    config.MemoryPoolMaxBlocks = 100;
-    config.bEnableGPUAcceleration = false;
-    config.GPUDeviceID = 0;
-    config.GPUThreadsPerBlock = 256;
-    config.GPUBlocksPerGrid = 64;
-    config.bEnableStreaming = false;
-    config.StreamingChunkSizeMB = 10;
-    config.MaxConcurrentChunks = 4;
-
-    return config;
-}
-
-bool UJUSYNCBlueprintLibrary::SaveOptimizationConfigToFile(const FString& FilePath)
-{
-    FJUSYNCOptimizationConfig config = GetCurrentOptimizationConfig();
-
-    // Create JSON object
-    TSharedPtr<FJsonObject> JsonObject = MakeShareable(new FJsonObject);
-    JsonObject->SetBoolField(TEXT("bEnableThreadPool"), config.bEnableThreadPool);
-    JsonObject->SetNumberField(TEXT("ThreadPoolSize"), config.ThreadPoolSize);
-    JsonObject->SetNumberField(TEXT("MaxQueueSize"), config.MaxQueueSize);
-    JsonObject->SetBoolField(TEXT("bEnableMemoryPool"), config.bEnableMemoryPool);
-    JsonObject->SetNumberField(TEXT("MemoryPoolBlockSizeKB"), config.MemoryPoolBlockSizeKB);
-    JsonObject->SetNumberField(TEXT("MemoryPoolMaxBlocks"), config.MemoryPoolMaxBlocks);
-    JsonObject->SetBoolField(TEXT("bEnableGPUAcceleration"), config.bEnableGPUAcceleration);
-    JsonObject->SetNumberField(TEXT("GPUDeviceID"), config.GPUDeviceID);
-    JsonObject->SetNumberField(TEXT("GPUThreadsPerBlock"), config.GPUThreadsPerBlock);
-    JsonObject->SetNumberField(TEXT("GPUBlocksPerGrid"), config.GPUBlocksPerGrid);
-    JsonObject->SetBoolField(TEXT("bEnableStreaming"), config.bEnableStreaming);
-    JsonObject->SetNumberField(TEXT("StreamingChunkSizeMB"), config.StreamingChunkSizeMB);
-    JsonObject->SetNumberField(TEXT("MaxConcurrentChunks"), config.MaxConcurrentChunks);
-
-    // Write to file
-    FString OutputString;
-    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
-    FJsonSerializer::Serialize(JsonObject.ToSharedRef(), Writer);
-
-    return FFileHelper::SaveStringToFile(OutputString, *FilePath);
-}
-
-bool UJUSYNCBlueprintLibrary::LoadOptimizationConfigFromFile(const FString& FilePath, FJUSYNCOptimizationConfig& OutConfig)
-{
-    FString FileContent;
-    if (!FFileHelper::LoadFileToString(FileContent, *FilePath)) {
-        return false;
-    }
-
-    TSharedPtr<FJsonObject> JsonObject;
-    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(FileContent);
-
-    if (!FJsonSerializer::Deserialize(Reader, JsonObject) || !JsonObject.IsValid()) {
-        return false;
-    }
-
-    // Parse JSON fields
-    OutConfig.bEnableThreadPool = JsonObject->GetBoolField(TEXT("bEnableThreadPool"));
-    OutConfig.ThreadPoolSize = static_cast<int32>(JsonObject->GetNumberField(TEXT("ThreadPoolSize")));
-    OutConfig.MaxQueueSize = static_cast<int32>(JsonObject->GetNumberField(TEXT("MaxQueueSize")));
-    OutConfig.bEnableMemoryPool = JsonObject->GetBoolField(TEXT("bEnableMemoryPool"));
-    OutConfig.MemoryPoolBlockSizeKB = static_cast<int32>(JsonObject->GetNumberField(TEXT("MemoryPoolBlockSizeKB")));
-    OutConfig.MemoryPoolMaxBlocks = static_cast<int32>(JsonObject->GetNumberField(TEXT("MemoryPoolMaxBlocks")));
-    OutConfig.bEnableGPUAcceleration = JsonObject->GetBoolField(TEXT("bEnableGPUAcceleration"));
-    OutConfig.GPUDeviceID = static_cast<int32>(JsonObject->GetNumberField(TEXT("GPUDeviceID")));
-    OutConfig.GPUThreadsPerBlock = static_cast<int32>(JsonObject->GetNumberField(TEXT("GPUThreadsPerBlock")));
-    OutConfig.GPUBlocksPerGrid = static_cast<int32>(JsonObject->GetNumberField(TEXT("GPUBlocksPerGrid")));
-    OutConfig.bEnableStreaming = JsonObject->GetBoolField(TEXT("bEnableStreaming"));
-    OutConfig.StreamingChunkSizeMB = static_cast<int32>(JsonObject->GetNumberField(TEXT("StreamingChunkSizeMB")));
-    OutConfig.MaxConcurrentChunks = static_cast<int32>(JsonObject->GetNumberField(TEXT("MaxConcurrentChunks")));
-
-    return true;
-}
-
-bool UJUSYNCBlueprintLibrary::ExportOptimizationStatsToCSV(const FString& FilePath)
-{
-    FJUSYNCOptimizationStats stats;
-    if (!GetOptimizationStats(stats)) {
-        return false;
-    }
-
-    FString CSVContent;
-    CSVContent += TEXT("Timestamp,TotalSpeedupFactor,MemoryReductionPercent,ProcessingTimeReductionPercent,TotalVerticesProcessed,TotalTrianglesProcessed\n");
-    CSVContent += FString::Printf(TEXT("%s,%f,%f,%f,%lld,%lld\n"),
-        *stats.Timestamp.ToString(),
-        stats.TotalSpeedupFactor,
-        stats.MemoryReductionPercent,
-        stats.ProcessingTimeReductionPercent,
-        stats.TotalVerticesProcessed,
-        stats.TotalTrianglesProcessed
-    );
-
-    return FFileHelper::SaveStringToFile(CSVContent, *FilePath);
-}
-
-bool UJUSYNCBlueprintLibrary::ExportOptimizationStatsToJSON(const FString& FilePath)
-{
-    FJUSYNCOptimizationStats stats;
-    if (!GetOptimizationStats(stats)) {
-        return false;
-    }
-
-    // Create JSON object
-    TSharedPtr<FJsonObject> JsonObject = MakeShareable(new FJsonObject);
-    JsonObject->SetStringField(TEXT("Timestamp"), stats.Timestamp.ToString());
-    JsonObject->SetNumberField(TEXT("TotalSpeedupFactor"), stats.TotalSpeedupFactor);
-    JsonObject->SetNumberField(TEXT("MemoryReductionPercent"), stats.MemoryReductionPercent);
-    JsonObject->SetNumberField(TEXT("ProcessingTimeReductionPercent"), stats.ProcessingTimeReductionPercent);
-    JsonObject->SetNumberField(TEXT("TotalVerticesProcessed"), static_cast<double>(stats.TotalVerticesProcessed));
-    JsonObject->SetNumberField(TEXT("TotalTrianglesProcessed"), static_cast<double>(stats.TotalTrianglesProcessed));
-    JsonObject->SetBoolField(TEXT("bThreadPoolEnabled"), stats.bThreadPoolEnabled);
-    JsonObject->SetBoolField(TEXT("bMemoryPoolEnabled"), stats.bMemoryPoolEnabled);
-    JsonObject->SetBoolField(TEXT("bGPUAccelerationEnabled"), stats.bGPUAccelerationEnabled);
-    JsonObject->SetBoolField(TEXT("bStreamingEnabled"), stats.bStreamingEnabled);
-
-    // Write to file
-    FString OutputString;
-    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&OutputString);
-    FJsonSerializer::Serialize(JsonObject.ToSharedRef(), Writer);
-
-    return FFileHelper::SaveStringToFile(OutputString, *FilePath);
 }
