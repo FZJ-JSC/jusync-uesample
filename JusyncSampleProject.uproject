@@ -1,6 +1,6 @@
 {
 	"FileVersion": 3,
-	"EngineAssociation": "5.5",
+	"EngineAssociation": "5.7",
 	"Category": "",
 	"Description": "",
 	"Modules": [
@@ -26,6 +26,10 @@
 			"Name": "NodeToCode",
 			"Enabled": true,
 			"MarketplaceURL": "com.epicgames.launcher://ue/marketplace/product/865c44cc-4ff6-4fc1-9c19-6fbc6ac430eb"
+		},
+		{
+			"Name": "LidarPointCloud",
+			"Enabled": true
 		}
 	]
 }

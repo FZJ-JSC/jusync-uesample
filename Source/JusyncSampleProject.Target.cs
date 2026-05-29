@@ -8,8 +8,9 @@ public class JusyncSampleProjectTarget : TargetRules
 	public JusyncSampleProjectTarget(TargetInfo Target) : base(Target)
 	{
 		Type = TargetType.Game;
-		DefaultBuildSettings = BuildSettingsVersion.V5;
-		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_5;
+		DefaultBuildSettings = BuildSettingsVersion.V6;
+		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_7;
+		UndefinedIdentifierWarningLevel = WarningLevel.Error;
 		ExtraModuleNames.Add("JusyncSampleProject");
 	}
 }

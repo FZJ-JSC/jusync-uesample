@@ -7,6 +7,9 @@
 #include "HAL/FileManager.h"
 #include "Kismet/GameplayStatics.h"
 #include "RealtimeMeshComponent.h"
+#include "LidarPointCloud.h"
+#include "LidarPointCloudComponent.h"
+#include "LidarPointCloudActor.h"
 #include "Engine/GameInstance.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -1862,6 +1865,28 @@ void UJUSYNCBlueprintLibrary::FilterFileListByExtensionsWithSizesAndRanks(const 
         FileList.Num(), OutFilteredFiles.Num(), *FString::Join(AllowedExtensions, TEXT(", ")));
 }
 
+void UJUSYNCBlueprintLibrary::ExtractGeometryClips(const TArray<FString>& FileList, const TArray<int64>& FileSizes, const TArray<int32>& FileRanks,
+    TArray<FString>& OutClips, TArray<int64>& OutSizes, TArray<int32>& OutRanks)
+{
+    check(FileList.Num() == FileSizes.Num() && FileSizes.Num() == FileRanks.Num());
+
+    OutClips.Empty();
+    OutSizes.Empty();
+    OutRanks.Empty();
+
+    for (int32 i = 0; i < FileList.Num(); ++i)
+    {
+        if (FileList[i].StartsWith(TEXT("clips/"), ESearchCase::CaseSensitive))
+        {
+            OutClips.Add(FileList[i]);
+            OutSizes.Add(FileSizes[i]);
+            OutRanks.Add(FileRanks[i]);
+        }
+    }
+
+    UE_LOG(LogJUSYNC, Log, TEXT("ExtractGeometryClips: extracted %d clips from %d total files"), OutClips.Num(), FileList.Num());
+}
+
 int32 UJUSYNCBlueprintLibrary::CalculateTimeoutFromFileSize(int64 FileSizeBytes, int32 BaseTimeoutMs, float BandwidthBytesPerSecond)
 {
     if (FileSizeBytes <= 0)
@@ -2195,7 +2220,7 @@ void UJUSYNCBlueprintLibrary::AsyncBatchSpawnInternal(
         return;
     }
 
-    UWorld* World = Subsystem->GetWorld();
+    UWorld* World = GWorld;
     if (!World)
     {
         UE_LOG(LogJUSYNC, Error, TEXT("No world for async spawn"));
@@ -2479,7 +2504,7 @@ AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshWithMaterial(
         return nullptr;
     }
 
-    UWorld* World = Subsystem->GetWorld();
+    UWorld* World = GWorld;
     if (!World)
     {
         UE_LOG(LogJUSYNC, Error, TEXT("No valid world context"));
@@ -4763,9 +4788,122 @@ void UJUSYNCBlueprintLibrary::RequestFileAsyncDynamic(
                             OnError.Execute(ErrorMsg);
                         }
                         else {
-                            UE_LOG(LogJUSYNC, Error, TEXT("OnError delegate not bound for failed file retrieval: %s"), *Filename);
+                            UE_LOG(LogJUSYNC, Warning, TEXT("OnError delegate not bound for failed file retrieval: %s"), *ErrorMsg);
                         }
                     }
                 });
         });
+}
+
+// ========== POINT CLOUD SPAWNING (LiDAR Plugin) ==========
+
+AActor* UJUSYNCBlueprintLibrary::SpawnPointCloudAtLocation(
+    const FJUSYNCMeshData& PointCloudData,
+    const FVector& SpawnLocation,
+    const FRotator& SpawnRotation,
+    float PointSize,
+    UMaterialInterface* Material)
+{
+    if (PointCloudData.Vertices.Num() == 0)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("SpawnPointCloudAtLocation: no vertices"));
+        return nullptr;
+    }
+
+    UWorld* World = GWorld;
+    if (!World)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("SpawnPointCloudAtLocation: no valid world"));
+        return nullptr;
+    }
+
+    // Create lidar point cloud asset
+    ULidarPointCloud* Cloud = ULidarPointCloudBlueprintLibrary::CreatePointCloudEmpty();
+    if (!Cloud)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("SpawnPointCloudAtLocation: failed to create lidar cloud"));
+        return nullptr;
+    }
+
+    // Calculate bounds
+    FBox Bounds(EForceInit::ForceInit);
+    for (const FVector& V : PointCloudData.Vertices)
+        Bounds += V;
+    FVector Center = Bounds.GetCenter();
+
+    // Initialize cloud with bounds centered at origin
+    FBox LocalBounds(EForceInit::ForceInit);
+    for (const FVector& V : PointCloudData.Vertices)
+        LocalBounds += (V - Center);
+
+    Cloud->Initialize(Bounds);
+    Cloud->SetOptimizedForDynamicData(true);
+
+    // Build LiDAR point array
+    TArray<FLidarPointCloudPoint> LidarPoints;
+    LidarPoints.Reserve(PointCloudData.Vertices.Num());
+
+    const int32 NumPoints = PointCloudData.Vertices.Num();
+    const bool HasColors = PointCloudData.VertexColors.Num() == NumPoints;
+    const bool HasNormals = PointCloudData.Normals.Num() == NumPoints;
+
+    for (int32 i = 0; i < NumPoints; ++i)
+    {
+        const FVector& Pos = PointCloudData.Vertices[i];
+        FColor Color = FColor::White;
+        if (HasColors)
+            Color = PointCloudData.VertexColors[i];
+
+        FLidarPointCloudNormal Normal;
+        if (HasNormals)
+            Normal.SetFromVector(FVector3f(PointCloudData.Normals[i].X, PointCloudData.Normals[i].Y, PointCloudData.Normals[i].Z));
+
+        FVector3f Pos3f(Pos.X, Pos.Y, Pos.Z);
+        LidarPoints.Emplace(Pos3f, Color, true, 0);
+        LidarPoints.Last().Normal = Normal;
+    }
+
+    // Insert points into cloud
+    Cloud->InsertPoints(LidarPoints, ELidarPointCloudDuplicateHandling::Ignore, true, FVector::ZeroVector);
+
+    // Spawn actor
+    FActorSpawnParameters SpawnParams;
+    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+    ALidarPointCloudActor* Actor = World->SpawnActor<ALidarPointCloudActor>(SpawnParams);
+    if (!Actor)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("SpawnPointCloudAtLocation: failed to spawn actor"));
+        return nullptr;
+    }
+    Actor->Tags.Add(FName(*FString::Printf(TEXT("JUSYNC_%s"), *PointCloudData.ElementName)));
+
+    ULidarPointCloudComponent* PCComp = Actor->GetPointCloudComponent();
+    if (!PCComp)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("SpawnPointCloudAtLocation: no point cloud component"));
+        Actor->Destroy();
+        return nullptr;
+    }
+
+    // Assign point cloud data
+    PCComp->SetPointCloud(Cloud);
+
+    // Configure appearance
+    PCComp->PointSize = FMath::Max(PointSize, 0.1f);
+    PCComp->PointOrientation = ELidarPointCloudSpriteOrientation::PreferFacingCamera;
+    PCComp->ScalingMethod = ELidarPointCloudScalingMethod::PerPoint;
+
+    if (HasColors)
+        PCComp->ColorSource = ELidarPointCloudColorationMode::Data;
+
+    if (Material)
+        PCComp->SetMaterial(0, Material);
+
+    // Position actor at spawn location
+    Actor->SetActorLocationAndRotation(SpawnLocation, SpawnRotation, false);
+
+    UE_LOG(LogJUSYNC, Log, TEXT("SpawnPointCloudAtLocation: spawned '%s' with %d LiDAR points (PointSize=%.2f)"),
+        *PointCloudData.ElementName, NumPoints, PointSize);
+    return Actor;
 }

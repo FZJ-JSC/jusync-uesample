@@ -12,6 +12,13 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include "MiddlewareLogging.h"
 
+// Forward declare GPU components (optional includes)
+namespace anari_usd_middleware {
+    class GpuContext;
+    class GpuKernels;
+    class GpuValidation;
+}
+
 #ifndef ANARI_USD_MIDDLEWARE_API
 #ifdef _WIN32
 #define ANARI_USD_MIDDLEWARE_API __declspec(dllexport)
@@ -25,7 +32,6 @@ namespace tinyusdz {
     class Prim;
     class Stage;
     class GeomMesh;
-    class GeomPoints;
 }
 
 namespace anari_usd_middleware {
@@ -367,17 +373,6 @@ private:
     bool ExtractMeshData(void* mesh,
                         MeshData& outMeshData,
                         const glm::mat4& worldTransform);
-
-    /**
-     * Extract points data from USD points primitive (point cloud) with validation
-     * @param points Pointer to the USD points primitive (validated)
-     * @param outMeshData Output mesh data structure (points stored in points array)
-     * @param worldTransform World transformation matrix (validated)
-     * @return True if extraction succeeded, false otherwise
-     */
-    bool ExtractPointsData(void* points,
-                          MeshData& outMeshData,
-                          const glm::mat4& worldTransform);
 
     /**
      * Get local transformation matrix with validation

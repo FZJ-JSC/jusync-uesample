@@ -261,6 +261,15 @@ public:
     static AActor* SpawnRealtimeMeshAtActor(const FJUSYNCMeshData& MeshData,
         AActor* TargetActor);
 
+    // ========== POINT CLOUD SPAWNING (Epic LiDAR Plugin) ==========
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|PointCloud", CallInEditor)
+    static AActor* SpawnPointCloudAtLocation(
+        const FJUSYNCMeshData& PointCloudData,
+        const FVector& SpawnLocation,
+        const FRotator& SpawnRotation = FRotator::ZeroRotator,
+        float PointSize = 1.0f,
+        UMaterialInterface* Material = nullptr);
+
 
     DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnBatchSpawnProgress,
         const TArray<AActor*>&, SpawnedActors, float, Progress);
@@ -333,6 +342,10 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Validation", DisplayName = "Filter File List By Extensions (Array) With Sizes And Ranks")
     static void FilterFileListByExtensionsWithSizesAndRanks(const TArray<FString>& FileList, const TArray<int64>& FileSizes, const TArray<int32>& FileRanks,
         const TArray<FString>& AllowedExtensions, TArray<FString>& OutFilteredFiles, TArray<int64>& OutFilteredSizes, TArray<int32>& OutFilteredRanks);
+
+    /** Extract only geometry clip files (paths starting with "clips/") from the file list */
+    static void ExtractGeometryClips(const TArray<FString>& FileList, const TArray<int64>& FileSizes, const TArray<int32>& FileRanks,
+        TArray<FString>& OutClips, TArray<int64>& OutSizes, TArray<int32>& OutRanks);
 
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Utilities", DisplayName = "Calculate Timeout From File Size")
     static int32 CalculateTimeoutFromFileSize(int64 FileSizeBytes, int32 BaseTimeoutMs = 1000, float BandwidthBytesPerSecond = 1000000.0f);
