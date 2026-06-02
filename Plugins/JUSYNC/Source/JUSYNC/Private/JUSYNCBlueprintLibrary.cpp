@@ -7,9 +7,6 @@
 #include "HAL/FileManager.h"
 #include "Kismet/GameplayStatics.h"
 #include "RealtimeMeshComponent.h"
-#include "LidarPointCloud.h"
-#include "LidarPointCloudComponent.h"
-#include "LidarPointCloudActor.h"
 #include "Engine/GameInstance.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -924,7 +921,7 @@ int32 UJUSYNCBlueprintLibrary::ExtractRankFromFilename(const FString& Filename)
         {
             FString RankStr = Filename.Mid(RankStart + 2, RankEnd - (RankStart + 2));
             Rank = FCString::Atoi(*RankStr);
-            if (Rank >= 0 && Rank < 16)
+            if (Rank >= 0)
             {
                 UE_LOG(LogJUSYNC, Log, TEXT("Extracted rank %d using pattern _rX_ from: %s"), Rank, *Filename);
                 return Rank;
@@ -948,7 +945,7 @@ int32 UJUSYNCBlueprintLibrary::ExtractRankFromFilename(const FString& Filename)
         if (RankStr.IsNumeric())
         {
             Rank = FCString::Atoi(*RankStr);
-            if (Rank >= 0 && Rank < 16)
+            if (Rank >= 0)
             {
                 UE_LOG(LogJUSYNC, Log, TEXT("Extracted rank %d using pattern _X at end from: %s"), Rank, *Filename);
                 return Rank;
@@ -965,7 +962,7 @@ int32 UJUSYNCBlueprintLibrary::ExtractRankFromFilename(const FString& Filename)
         if (Parts[i].IsNumeric())
         {
             Rank = FCString::Atoi(*Parts[i]);
-            if (Rank >= 0 && Rank < 16)
+            if (Rank >= 0)
             {
                 UE_LOG(LogJUSYNC, Log, TEXT("Extracted rank %d using numeric part from: %s"), Rank, *Filename);
                 return Rank;
@@ -1039,6 +1036,48 @@ bool UJUSYNCBlueprintLibrary::LoadUSDFromDisk(const FString& FilePath, TArray<FJ
     return LoadUSDFromBuffer(Buffer, Filename, OutMeshData, OutPreview);
 }
 
+bool UJUSYNCBlueprintLibrary::LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const FString& Filename,
+    TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData, FString& OutPreview)
+{
+    if (!ValidateBufferSize(Buffer, TEXT("LoadUSDFullFromBuffer")))
+    {
+        return false;
+    }
+
+#if JUSYNC_ENABLE_USD_PREVIEW
+    OutPreview = GetUSDAPreview(Buffer, 15);
+#else
+    OutPreview = TEXT("USD preview disabled for performance");
+#endif
+
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available for full USD loading"));
+        return false;
+    }
+
+    bool bResult = Subsystem->LoadUSDFullFromBuffer(Buffer, Filename, OutMeshData, OutPointCloudData);
+
+    if (bResult)
+    {
+        int32 TotalMeshes = 0;
+        for (const FJUSYNCMeshData& m : OutMeshData)
+        {
+            if (m.IsValid()) TotalMeshes++;
+        }
+        int32 TotalPCs = 0;
+        for (const FJUSYNCPointCloudData& pc : OutPointCloudData)
+        {
+            if (pc.IsValid()) TotalPCs++;
+        }
+        UE_LOG(LogJUSYNC, Log, TEXT("Successfully loaded %d meshes + %d point clouds from USD '%s' (single-pass)"),
+               TotalMeshes, TotalPCs, *Filename);
+    }
+
+    return bResult;
+}
+
 FString UJUSYNCBlueprintLibrary::GetUSDAPreview(const TArray<uint8>& Buffer, int32 MaxLines)
 {
     return ExtractUSDAPreview(Buffer, MaxLines);
@@ -1094,7 +1133,79 @@ bool UJUSYNCBlueprintLibrary::ValidateUSDFormat(const TArray<uint8>& Buffer, con
         FirstChunk.Contains(TEXT("over "));
 }
 
-// ========== TEXTURE PROCESSING ==========
+// ========== POINT CLOUD PROCESSING ==========
+
+bool UJUSYNCBlueprintLibrary::LoadUSDPointCloudFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCPointCloudData>& OutPointCloudData)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available for point cloud loading"));
+        return false;
+    }
+
+    return Subsystem->LoadPointCloudFromBuffer(Buffer, Filename, OutPointCloudData);
+}
+
+AActor* UJUSYNCBlueprintLibrary::SpawnPointCloudAtLocation(
+    const FJUSYNCPointCloudData& PointCloudData,
+    const FVector& SpawnLocation,
+    const FRotator& SpawnRotation,
+    const FVector& SpawnScale)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available for point cloud spawning"));
+        return nullptr;
+    }
+    return Subsystem->SpawnLidarPointCloudAtLocation(PointCloudData, SpawnLocation, SpawnRotation, SpawnScale);
+}
+
+TArray<AActor*> UJUSYNCBlueprintLibrary::BatchSpawnPointClouds(
+    const TArray<FJUSYNCPointCloudData>& PointCloudDataArray,
+    const TArray<FVector>& SpawnLocations)
+{
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available for point cloud batch spawning"));
+        return TArray<AActor*>();
+    }
+    return Subsystem->BatchSpawnPointCloudsAtLocations(PointCloudDataArray, SpawnLocations);
+}
+
+void UJUSYNCBlueprintLibrary::SpawnPointCloudAtLocation_Async(
+    const FJUSYNCPointCloudData& PointCloudData,
+    const FVector& SpawnLocation,
+    const FRotator& SpawnRotation,
+    const FVector& SpawnScale,
+    const FOnPointCloudSpawnedDyn& OnSpawned)
+{
+    bool bBound = OnSpawned.IsBound();
+    FOnPointCloudSpawnedDyn DelegateCopy = OnSpawned;
+    AsyncTask(ENamedThreads::GameThread, [PointCloudData = PointCloudData, SpawnLocation, SpawnRotation, SpawnScale, DelegateCopy]()
+    {
+        AActor* Actor = SpawnPointCloudAtLocation(PointCloudData, SpawnLocation, SpawnRotation, SpawnScale);
+        DelegateCopy.ExecuteIfBound(Actor, Actor != nullptr);
+    });
+}
+
+void UJUSYNCBlueprintLibrary::BatchSpawnPointClouds_Async(
+    const TArray<FJUSYNCPointCloudData>& PointCloudDataArray,
+    const TArray<FVector>& SpawnLocations,
+    const FOnPointCloudBatchSpawnedDyn& OnBatchSpawned)
+{
+    FOnPointCloudBatchSpawnedDyn DelegateCopy = OnBatchSpawned;
+    AsyncTask(ENamedThreads::GameThread, [PointCloudDataArray = PointCloudDataArray, SpawnLocations = SpawnLocations, DelegateCopy]()
+    {
+        TArray<AActor*> Spawned = BatchSpawnPointClouds(PointCloudDataArray, SpawnLocations);
+        DelegateCopy.ExecuteIfBound(Spawned);
+    });
+}
+
+
+// ========== REALTIME MESH PROCESSING AND SPAWNING ==========
 
 FJUSYNCTextureData UJUSYNCBlueprintLibrary::CreateTextureFromBuffer(const TArray<uint8>& Buffer)
 {
@@ -1866,25 +1977,33 @@ void UJUSYNCBlueprintLibrary::FilterFileListByExtensionsWithSizesAndRanks(const 
 }
 
 void UJUSYNCBlueprintLibrary::ExtractGeometryClips(const TArray<FString>& FileList, const TArray<int64>& FileSizes, const TArray<int32>& FileRanks,
-    TArray<FString>& OutClips, TArray<int64>& OutSizes, TArray<int32>& OutRanks)
+    TArray<FString>& OutFilteredFiles, TArray<int64>& OutFilteredSizes, TArray<int32>& OutFilteredRanks)
 {
-    check(FileList.Num() == FileSizes.Num() && FileSizes.Num() == FileRanks.Num());
+    OutFilteredFiles.Empty();
+    OutFilteredSizes.Empty();
+    OutFilteredRanks.Empty();
 
-    OutClips.Empty();
-    OutSizes.Empty();
-    OutRanks.Empty();
+    if (FileList.Num() != FileSizes.Num() || FileList.Num() != FileRanks.Num())
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("ExtractGeometryClips: Arrays have different lengths (FileList: %d, FileSizes: %d, FileRanks: %d)"),
+            FileList.Num(), FileSizes.Num(), FileRanks.Num());
+        return;
+    }
 
     for (int32 i = 0; i < FileList.Num(); ++i)
     {
-        if (FileList[i].StartsWith(TEXT("clips/"), ESearchCase::CaseSensitive))
+        const FString& Filename = FileList[i];
+        // Only pass through per-rank geometry clip files (they live under "clips/" and are unique per rank)
+        if (Filename.StartsWith(TEXT("clips/"), ESearchCase::CaseSensitive))
         {
-            OutClips.Add(FileList[i]);
-            OutSizes.Add(FileSizes[i]);
-            OutRanks.Add(FileRanks[i]);
+            OutFilteredFiles.Add(Filename);
+            OutFilteredSizes.Add(FileSizes[i]);
+            OutFilteredRanks.Add(FileRanks[i]);
         }
     }
 
-    UE_LOG(LogJUSYNC, Log, TEXT("ExtractGeometryClips: extracted %d clips from %d total files"), OutClips.Num(), FileList.Num());
+    UE_LOG(LogJUSYNC, Log, TEXT("ExtractGeometryClips: filtered %d files down to %d geometry clips"),
+        FileList.Num(), OutFilteredFiles.Num());
 }
 
 int32 UJUSYNCBlueprintLibrary::CalculateTimeoutFromFileSize(int64 FileSizeBytes, int32 BaseTimeoutMs, float BandwidthBytesPerSecond)
@@ -2220,7 +2339,7 @@ void UJUSYNCBlueprintLibrary::AsyncBatchSpawnInternal(
         return;
     }
 
-    UWorld* World = GWorld;
+    UWorld* World = Subsystem->GetWorld();
     if (!World)
     {
         UE_LOG(LogJUSYNC, Error, TEXT("No world for async spawn"));
@@ -2504,7 +2623,7 @@ AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshWithMaterial(
         return nullptr;
     }
 
-    UWorld* World = GWorld;
+    UWorld* World = Subsystem->GetWorld();
     if (!World)
     {
         UE_LOG(LogJUSYNC, Error, TEXT("No valid world context"));
@@ -2653,27 +2772,6 @@ AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshWithMaterial(
 
     // **ENHANCED MESH CREATION - WITH ASYNC SUPPORT AND AUTOMATIC SPLITTING**
     bool bSuccess;
-
-    // Check if this is a point cloud (no triangles)
-    bool bIsPointCloud = ProcessedMeshData.IsPointCloud();
-    if (bIsPointCloud)
-    {
-        UE_LOG(LogJUSYNC, Log, TEXT("🎯 Point cloud detected: %d points, using HISM visualization"), 
-               ProcessedMeshData.Vertices.Num());
-        
-        // For point clouds, we need to use HISM instead of RealtimeMesh
-        // Note: This requires the user to handle point clouds separately in Blueprint
-        // For now, we'll log an error and return false
-        UE_LOG(LogJUSYNC, Error, TEXT("❌ Point clouds require HISM visualization. Use CreatePointCloudHISM or CreatePointCloudHISM_Chunked instead of standard mesh creation."));
-        UE_LOG(LogJUSYNC, Error, TEXT("   For large point clouds (>50k points), use CreatePointCloudHISM_Chunked to avoid freezing."));
-        UE_LOG(LogJUSYNC, Error, TEXT("   For maximum performance (>500k points), use CreatePointCloudHISM_Parallel with bSpawnProgressively=true."));
-        UE_LOG(LogJUSYNC, Error, TEXT("   For 6M+ point clouds, use CreatePointCloudBillboards for 480x performance improvement."));
-        UE_LOG(LogJUSYNC, Error, TEXT("   For optimal rendering, use CreatePointCloudWithLOD or CreateOptimizedPointCloud."));
-        
-        // Destroy the actor since we can't visualize the point cloud
-        SpawnedActor->Destroy();
-        return nullptr;
-    }
 
     // Check if mesh needs splitting (exceeds RMC vertex/triangle limits)
     const int32 TotalVertices = ProcessedMeshData.Vertices.Num();
@@ -4601,31 +4699,17 @@ TArray<int32> UJUSYNCBlueprintLibrary::GetFallbackRanks(int32 TargetRank)
 {
     TArray<int32> Ranks;
 
-    // Add ranks from same "family" (e.g., r5, r15, r10 are related)
-    // Based on your log patterns, files exist on ranks 5, 10, 15
-    // Note: TargetRank is already added by the caller, so we don't add it here
+    // Try nearest ranks in increments based on the target rank
+    // This works for any number of workers, not just 16
+    const int32 FallbackOffsets[] = {1, 2, 3, 4, 5, -1, -2, -3, -4, -5, 0};
 
-    if (TargetRank == 5) {
-        Ranks.Add(10);
-        Ranks.Add(15);
-        Ranks.Add(0);  // Rank 0 might have files
-    }
-    else if (TargetRank == 10) {
-        Ranks.Add(5);
-        Ranks.Add(15);
-        Ranks.Add(0);
-    }
-    else if (TargetRank == 15) {
-        Ranks.Add(5);
-        Ranks.Add(10);
-        Ranks.Add(0);
-    }
-    else {
-        // For other ranks, try common ranks (excluding the target rank)
-        if (TargetRank != 5) Ranks.Add(5);
-        if (TargetRank != 10) Ranks.Add(10);
-        if (TargetRank != 15) Ranks.Add(15);
-        if (TargetRank != 0) Ranks.Add(0);
+    for (int32 Offset : FallbackOffsets)
+    {
+        int32 Candidate = TargetRank + Offset;
+        if (Candidate >= 0 && Candidate != TargetRank && !Ranks.Contains(Candidate))
+        {
+            Ranks.Add(Candidate);
+        }
     }
 
     return Ranks;
@@ -4788,122 +4872,9 @@ void UJUSYNCBlueprintLibrary::RequestFileAsyncDynamic(
                             OnError.Execute(ErrorMsg);
                         }
                         else {
-                            UE_LOG(LogJUSYNC, Warning, TEXT("OnError delegate not bound for failed file retrieval: %s"), *ErrorMsg);
+                            UE_LOG(LogJUSYNC, Error, TEXT("OnError delegate not bound for failed file retrieval: %s"), *Filename);
                         }
                     }
                 });
         });
-}
-
-// ========== POINT CLOUD SPAWNING (LiDAR Plugin) ==========
-
-AActor* UJUSYNCBlueprintLibrary::SpawnPointCloudAtLocation(
-    const FJUSYNCMeshData& PointCloudData,
-    const FVector& SpawnLocation,
-    const FRotator& SpawnRotation,
-    float PointSize,
-    UMaterialInterface* Material)
-{
-    if (PointCloudData.Vertices.Num() == 0)
-    {
-        UE_LOG(LogJUSYNC, Error, TEXT("SpawnPointCloudAtLocation: no vertices"));
-        return nullptr;
-    }
-
-    UWorld* World = GWorld;
-    if (!World)
-    {
-        UE_LOG(LogJUSYNC, Error, TEXT("SpawnPointCloudAtLocation: no valid world"));
-        return nullptr;
-    }
-
-    // Create lidar point cloud asset
-    ULidarPointCloud* Cloud = ULidarPointCloudBlueprintLibrary::CreatePointCloudEmpty();
-    if (!Cloud)
-    {
-        UE_LOG(LogJUSYNC, Error, TEXT("SpawnPointCloudAtLocation: failed to create lidar cloud"));
-        return nullptr;
-    }
-
-    // Calculate bounds
-    FBox Bounds(EForceInit::ForceInit);
-    for (const FVector& V : PointCloudData.Vertices)
-        Bounds += V;
-    FVector Center = Bounds.GetCenter();
-
-    // Initialize cloud with bounds centered at origin
-    FBox LocalBounds(EForceInit::ForceInit);
-    for (const FVector& V : PointCloudData.Vertices)
-        LocalBounds += (V - Center);
-
-    Cloud->Initialize(Bounds);
-    Cloud->SetOptimizedForDynamicData(true);
-
-    // Build LiDAR point array
-    TArray<FLidarPointCloudPoint> LidarPoints;
-    LidarPoints.Reserve(PointCloudData.Vertices.Num());
-
-    const int32 NumPoints = PointCloudData.Vertices.Num();
-    const bool HasColors = PointCloudData.VertexColors.Num() == NumPoints;
-    const bool HasNormals = PointCloudData.Normals.Num() == NumPoints;
-
-    for (int32 i = 0; i < NumPoints; ++i)
-    {
-        const FVector& Pos = PointCloudData.Vertices[i];
-        FColor Color = FColor::White;
-        if (HasColors)
-            Color = PointCloudData.VertexColors[i];
-
-        FLidarPointCloudNormal Normal;
-        if (HasNormals)
-            Normal.SetFromVector(FVector3f(PointCloudData.Normals[i].X, PointCloudData.Normals[i].Y, PointCloudData.Normals[i].Z));
-
-        FVector3f Pos3f(Pos.X, Pos.Y, Pos.Z);
-        LidarPoints.Emplace(Pos3f, Color, true, 0);
-        LidarPoints.Last().Normal = Normal;
-    }
-
-    // Insert points into cloud
-    Cloud->InsertPoints(LidarPoints, ELidarPointCloudDuplicateHandling::Ignore, true, FVector::ZeroVector);
-
-    // Spawn actor
-    FActorSpawnParameters SpawnParams;
-    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-
-    ALidarPointCloudActor* Actor = World->SpawnActor<ALidarPointCloudActor>(SpawnParams);
-    if (!Actor)
-    {
-        UE_LOG(LogJUSYNC, Error, TEXT("SpawnPointCloudAtLocation: failed to spawn actor"));
-        return nullptr;
-    }
-    Actor->Tags.Add(FName(*FString::Printf(TEXT("JUSYNC_%s"), *PointCloudData.ElementName)));
-
-    ULidarPointCloudComponent* PCComp = Actor->GetPointCloudComponent();
-    if (!PCComp)
-    {
-        UE_LOG(LogJUSYNC, Error, TEXT("SpawnPointCloudAtLocation: no point cloud component"));
-        Actor->Destroy();
-        return nullptr;
-    }
-
-    // Assign point cloud data
-    PCComp->SetPointCloud(Cloud);
-
-    // Configure appearance
-    PCComp->PointSize = FMath::Max(PointSize, 0.1f);
-    PCComp->PointOrientation = ELidarPointCloudSpriteOrientation::PreferFacingCamera;
-    PCComp->ScalingMethod = ELidarPointCloudScalingMethod::PerPoint;
-
-    if (HasColors)
-        PCComp->ColorSource = ELidarPointCloudColorationMode::Data;
-
-    if (Material)
-        PCComp->SetMaterial(0, Material);
-
-    // Position actor at spawn location
-    Actor->SetActorLocationAndRotation(SpawnLocation, SpawnRotation, false);
-
-    UE_LOG(LogJUSYNC, Log, TEXT("SpawnPointCloudAtLocation: spawned '%s' with %d LiDAR points (PointSize=%.2f)"),
-        *PointCloudData.ElementName, NumPoints, PointSize);
-    return Actor;
 }

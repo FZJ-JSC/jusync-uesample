@@ -5,6 +5,7 @@
 #include "Components/PrimitiveComponent.h"
 #include "JUSYNCTypes.h"
 #include "JUSYNCBlueprintLibrary.h"
+#include "JUSYNCPointCloudSpawner.h"
 #include "JUSYNCFileSpawnerActor.generated.h"
 
 UENUM(BlueprintType)
@@ -52,7 +53,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Filters")
     bool bFilterUSDOnly;
 
-    /** Also spawn shared files (texture, material, manifests) found alongside clips */
+    /** Only spawn files under "clips/" path (excludes shared manifests/materials/camera) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Filters")
     bool bClipsOnly;
 
@@ -88,9 +89,20 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Behavior")
     bool bAutoStart;
 
-    /** Also download shared texture and material files (from rank 0) for point cloud coloring */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Behavior")
-    bool bDownloadSharedMaterials;
+    // Point cloud settings
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|PointCloud")
+    float PointCloudSize;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|PointCloud")
+    bool bSpawnPointClouds;
+
+    /** Gradient PNG filename on the broker (e.g. "shared/gradient.png"). Leave blank to auto-detect first .png */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|PointCloud")
+    FString GradientPngFilename;
+
+    /** Look up point colors from gradient PNG using attribute0 as the index */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|PointCloud", meta = (InlineEditConditionToggle))
+    bool bUseGradientColors;
 
     UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Spawner|State")
     EJUSYNCSpawnerState CurrentState;
@@ -146,12 +158,15 @@ private:
     void OnFileDownloaded(const FString& Filename, const TArray<uint8>& FileData);
     void OnSingleFileDownloaded(const FString& Filename, const TArray<uint8>& FileData, bool bSuccess, int32 FileIndex);
     void OnFileDownloadError(const FString& ErrorMessage);
+    void DownloadGradientPng(UJUSYNCSubsystem* Subsystem);
 
     int32 CalculateDynamicTimeout(int64 FileSizeBytes) const;
-    void SpawnMeshFromData(const FString& Filename, const TArray<uint8>& FileData);
+    void SpawnMeshFromData(const FString& Filename, bool bParsed, TArray<FJUSYNCMeshData>&& MeshData, TArray<FJUSYNCPointCloudData>&& PointCloudData, int32 FileIndex);
     void ApplyDynamicMaterial(UPrimitiveComponent* Comp, const FString& Filename);
     void CheckAllDownloadsComplete();
     void RetryFailedDownloads();
+    void FlushBufferedPointClouds();
+    void OnPointCloudSpawnedHandler(const FString& EleName, AActor* Spawned);
 
     TArray<FString> RawFileList;
     TArray<int64> RawFileSizes;
@@ -160,23 +175,17 @@ private:
     TArray<FString> FilteredFiles;
     TArray<int64> FilteredSizes;
     TArray<int32> FilteredRanks;
+    TMap<FString, int32> GradientPngRankMap;
+    TMap<int32, TArray<FColor>> RankGradients;
+    std::atomic<bool> bGradientReady;
+    TArray<FJUSYNCPointCloudData> PendingPointClouds;
 
     int32 NextSpawnIndex;
     int32 PendingDownloads;
-    int32 CurrentRetryCount;
-    int32 MaxRetries;
+    int32 PendingAsyncSpawns;
     bool bIsCancelled;
+    int32 MaxRetries;
+    int32 CurrentRetryCount;
     TArray<int32> FailedFileIndices;
-
-    // Shared material/texture for point cloud coloring
-    UTexture2D* SharedPointCloudTexture;
-    UMaterialInstanceDynamic* SharedPointCloudMaterial;
-    bool bSharedMaterialReady;
-    TArray<FString> SharedTextureFiles;
-    TArray<FString> SharedMaterialFiles;
-
-    void DownloadSharedFilesFromRank0();
-    void CreatePointCloudMaterialFromTexture(UTexture2D* Texture);
-    void OnSharedFileDownloaded(const FString& Filename, const TArray<uint8>& FileData, bool bSuccess);
-    int32 PendingSharedDownloads;
+    TArray<int32> ParseFailedIndices;
 };

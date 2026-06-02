@@ -169,6 +169,10 @@ public:
     static bool LoadUSDFromBuffer(const TArray<uint8>& Buffer, const FString& Filename,
         TArray<FJUSYNCMeshData>& OutMeshData, FString& OutPreview);
 
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|USD", CallInEditor, DisplayName = "Load USD Full (Mesh + Point Cloud)")
+    static bool LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const FString& Filename,
+        TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData, FString& OutPreview);
+
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|USD", CallInEditor)
     static bool LoadUSDFromDisk(const FString& FilePath,
         TArray<FJUSYNCMeshData>& OutMeshData, FString& OutPreview);
@@ -178,6 +182,13 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|USD")
     static bool ValidateUSDFormat(const TArray<uint8>& Buffer, const FString& Filename);
+
+    // ========== POINT CLOUD PROCESSING ==========
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|PointCloud", CallInEditor, DisplayName = "Load USD Point Cloud From Buffer")
+    static bool LoadUSDPointCloudFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCPointCloudData>& OutPointCloudData);
+
+    // Async point cloud processing delegates
+    DECLARE_DYNAMIC_DELEGATE_ThreeParams(FOnAsyncPointCloudLoaded, const TArray<FJUSYNCPointCloudData>&, PCData, bool, bSuccess, const FString&, ErrorMsg);
 
     // ========== TEXTURE PROCESSING ==========
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Texture", CallInEditor)
@@ -255,20 +266,13 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|RealtimeMesh Spawning", CallInEditor)
     static AActor* SpawnRealtimeMeshAtLocation(const FJUSYNCMeshData& MeshData,
         const FVector& SpawnLocation,
-        const FRotator& SpawnRotation = FRotator::ZeroRotator);
+        const FRotator& SpawnRotation = FRotator::ZeroRotator,
+        UMaterialInterface* CustomMaterial = nullptr);
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|RealtimeMesh Spawning", CallInEditor)
     static AActor* SpawnRealtimeMeshAtActor(const FJUSYNCMeshData& MeshData,
-        AActor* TargetActor);
-
-    // ========== POINT CLOUD SPAWNING (Epic LiDAR Plugin) ==========
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC|PointCloud", CallInEditor)
-    static AActor* SpawnPointCloudAtLocation(
-        const FJUSYNCMeshData& PointCloudData,
-        const FVector& SpawnLocation,
-        const FRotator& SpawnRotation = FRotator::ZeroRotator,
-        float PointSize = 1.0f,
-        UMaterialInterface* Material = nullptr);
+        AActor* TargetActor,
+        UMaterialInterface* CustomMaterial = nullptr);
 
 
     DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnBatchSpawnProgress,
@@ -289,6 +293,37 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|RealtimeMesh Spawning")
     static TArray<FVector> GetSpawnPointLocations(const FString& TagFilter = TEXT("USDSpawnPoint"));
+
+    // ========== POINT CLOUD SPAWNING ==========
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|PointCloud Spawning", CallInEditor, DisplayName = "Spawn Point Cloud At Location")
+    static AActor* SpawnPointCloudAtLocation(
+        const FJUSYNCPointCloudData& PointCloudData,
+        const FVector& SpawnLocation,
+        const FRotator& SpawnRotation = FRotator::ZeroRotator,
+        const FVector& SpawnScale = FVector(1.0f));
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|PointCloud Spawning", CallInEditor, DisplayName = "Batch Spawn Point Clouds")
+    static TArray<AActor*> BatchSpawnPointClouds(
+        const TArray<FJUSYNCPointCloudData>& PointCloudDataArray,
+        const TArray<FVector>& SpawnLocations);
+
+    // Async point cloud spawn delegate
+    DECLARE_DYNAMIC_DELEGATE_TwoParams(FOnPointCloudSpawnedDyn, AActor*, SpawnedActor, bool, bSuccess);
+    DECLARE_DYNAMIC_DELEGATE_OneParam(FOnPointCloudBatchSpawnedDyn, const TArray<AActor*>&, SpawnedActors);
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|PointCloud Spawning|Async", CallInEditor, DisplayName = "Spawn Point Cloud At Location (Async)")
+    static void SpawnPointCloudAtLocation_Async(
+        const FJUSYNCPointCloudData& PointCloudData,
+        const FVector& SpawnLocation,
+        const FRotator& SpawnRotation,
+        const FVector& SpawnScale,
+        const FOnPointCloudSpawnedDyn& OnSpawned);
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|PointCloud Spawning|Async", CallInEditor, DisplayName = "Batch Spawn Point Clouds (Async)")
+    static void BatchSpawnPointClouds_Async(
+        const TArray<FJUSYNCPointCloudData>& PointCloudDataArray,
+        const TArray<FVector>& SpawnLocations,
+        const FOnPointCloudBatchSpawnedDyn& OnBatchSpawned);
 
 
     // ========== DATA RECEPTION ==========
@@ -343,9 +378,11 @@ public:
     static void FilterFileListByExtensionsWithSizesAndRanks(const TArray<FString>& FileList, const TArray<int64>& FileSizes, const TArray<int32>& FileRanks,
         const TArray<FString>& AllowedExtensions, TArray<FString>& OutFilteredFiles, TArray<int64>& OutFilteredSizes, TArray<int32>& OutFilteredRanks);
 
-    /** Extract only geometry clip files (paths starting with "clips/") from the file list */
+    // ========== GEOMETRY CLIP FILTER ==========
+    // Strips all shared files (manifests, materials, camera, textures) and only returns per-rank geometry clips under "clips/"
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Validation", DisplayName = "Extract Geometry Clips Only")
     static void ExtractGeometryClips(const TArray<FString>& FileList, const TArray<int64>& FileSizes, const TArray<int32>& FileRanks,
-        TArray<FString>& OutClips, TArray<int64>& OutSizes, TArray<int32>& OutRanks);
+        TArray<FString>& OutFilteredFiles, TArray<int64>& OutFilteredSizes, TArray<int32>& OutFilteredRanks);
 
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Utilities", DisplayName = "Calculate Timeout From File Size")
     static int32 CalculateTimeoutFromFileSize(int64 FileSizeBytes, int32 BaseTimeoutMs = 1000, float BandwidthBytesPerSecond = 1000000.0f);
