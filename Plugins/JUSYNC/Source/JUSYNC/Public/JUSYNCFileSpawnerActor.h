@@ -101,6 +101,10 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|LiveUpdate", meta = (EditCondition = "bEnableLiveUpdates", EditConditionHides))
     bool bAutoRefreshMeshes;
 
+    /** Pipeline depth: how many files to download ahead while spawning previous ones (1 = sequential, higher = more overlap) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pipeline", meta = (ClampMin = "1", ClampMax = "16"))
+    int32 PipelineDepth;
+
     // Point cloud settings
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|PointCloud")
     float PointCloudSize;
@@ -152,6 +156,10 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner")
     void ClearSpawnedActors();
 
+    /** Manually trigger a full refresh: re-fetch file list, diff changes, and update spawned actors */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|LiveUpdate", meta = (DisplayName = "Manual Refresh"))
+    void ManualRefresh();
+
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner")
     FVector GetNextSpawnLocation() const;
 
@@ -171,6 +179,7 @@ private:
     void OnSingleFileDownloaded(const FString& Filename, const TArray<uint8>& FileData, bool bSuccess, int32 FileIndex);
     void OnFileDownloadError(const FString& ErrorMessage);
     void DownloadGradientPng(UJUSYNCSubsystem* Subsystem);
+    void PipelineDownloadNext(UJUSYNCSubsystem* Subsystem);
 
     int32 CalculateDynamicTimeout(int64 FileSizeBytes) const;
     void SpawnMeshFromData(const FString& Filename, bool bParsed, TArray<FJUSYNCMeshData>&& MeshData, TArray<FJUSYNCPointCloudData>&& PointCloudData, int32 FileIndex);
@@ -205,6 +214,9 @@ private:
     int32 NextSpawnIndex;
     int32 PendingDownloads;
     int32 PendingAsyncSpawns;
+    int32 PendingAsyncPCS;
+    int32 PipelineNextIndex;
+    int32 PipelineActive;
     bool bIsCancelled;
     int32 MaxRetries;
     int32 CurrentRetryCount;
@@ -215,7 +227,12 @@ private:
     FTimerHandle LiveUpdateTimerHandle;
     TMap<FString, AActor*> FileToActorMap;
     TMap<FString, int64> FileLastSize;
+    TMap<FString, FString> ElementToFileMap;  // element name -> filename for PC tracking
     double LastCommitCompleteTime;
     double CommitCompleteCooldown;
     bool bCommitDiffInProgress;
+    double LastRefreshTime;  // per-file refresh cooldown
+    TMap<FString, double> FileLastRefreshTime;  // per-file last refresh time
+    double FileRefreshCooldown;  // seconds between refreshes of same file
+    bool bPollingStarted;  // guard: only start polling once
 };
