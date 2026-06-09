@@ -226,13 +226,9 @@ private:
     // Live update state
     FTimerHandle LiveUpdateTimerHandle;
     TMap<FString, AActor*> FileToActorMap;
-    TMap<FString, int64> FileLastSize;
-    TMap<FString, FString> ElementToFileMap;  // element name -> filename for PC tracking
+    TMap<FString, uint64> FileHashLo;
+    TMap<FString, uint64> FileHashHi;
     double LastCommitCompleteTime;
     double CommitCompleteCooldown;
     bool bCommitDiffInProgress;
-    double LastRefreshTime;  // per-file refresh cooldown
-    TMap<FString, double> FileLastRefreshTime;  // per-file last refresh time
-    double FileRefreshCooldown;  // seconds between refreshes of same file
-    bool bPollingStarted;  // guard: only start polling once
 };

@@ -258,19 +258,16 @@ bool UJUSYNCBlueprintLibrary::RequestFileListWithSizesAndRanksFromBroker(int32 T
     bool bResult = Subsystem->RequestFileListWithSizesAndRanks(TargetRank, TimeoutMs, OutFiles, OutSizes, OutRanks);
     if (bResult)
     {
-        UE_LOG(LogJUSYNC, Log, TEXT("✅ Retrieved %d files with sizes and ranks from broker"), OutFiles.Num());
-        // Store the file list with rank information for later retrieval
+        UE_LOG(LogJUSYNC, Log, TEXT("Retrieved %d files with sizes, ranks, hashes from broker"), OutFiles.Num());
         if (OutFiles.Num() > 0)
         {
             FScopeLock Lock(&LastFileListMutex);
             LastFileList = OutFiles;
-            // Also store rank information if needed
-            UE_LOG(LogJUSYNC, Log, TEXT("Stored %d files with rank information in LastFileList"), OutFiles.Num());
         }
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to retrieve file list with sizes and ranks from broker"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to retrieve file list with sizes and ranks from broker"));
     }
 
     return bResult;
