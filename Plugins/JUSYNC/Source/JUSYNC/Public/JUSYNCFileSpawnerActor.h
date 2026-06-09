@@ -206,6 +206,8 @@ private:
     TArray<FString> FilteredFiles;
     TArray<int64> FilteredSizes;
     TArray<int32> FilteredRanks;
+    TArray<uint64> FilteredHashLo;
+    TArray<uint64> FilteredHashHi;
     TMap<FString, int32> GradientPngRankMap;
     TMap<int32, TArray<FColor>> RankGradients;
     std::atomic<bool> bGradientReady;

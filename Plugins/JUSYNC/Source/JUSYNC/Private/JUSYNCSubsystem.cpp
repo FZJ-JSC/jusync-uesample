@@ -3180,19 +3180,19 @@ bool UJUSYNCSubsystem::RequestFileListWithSizes(int32 TargetRank, int32 TimeoutM
 
 bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks)
 {
-    // âœ… FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
-    
+    // Delegate to 7-param hash-aware version
+    TArray<uint64> DummyLo, DummyHi;
+    return RequestFileListWithSizesAndRanks(TargetRank, TimeoutMs, OutFiles, OutSizes, OutRanks, DummyLo, DummyHi);
+}
+
+bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks, TArray<uint64>& OutHashLo, TArray<uint64>& OutHashHi)
+{
     // For broadcast requests (target_rank = -1), dynamically determine worker count
     int32 AdjustedTimeoutMs = TimeoutMs;
     if (TargetRank == -1) {
-        // Query total worker count from broker (includes rank 0)
-        int32 TotalWorkerCount = 1; // Default to single-rank mode
+        int32 TotalWorkerCount = 1;
         if (RequestTotalWorkerCount(2000, TotalWorkerCount)) {
             UE_LOG(LogJUSYNC, Log, TEXT("Broadcast request: dynamically detected %d total workers (including rank 0)"), TotalWorkerCount);
-            
-            // Adjust timeout based on actual worker count
-            // Single-rank mode: 3 seconds is enough
-            // Multi-rank mode: 15 seconds for up to 16 workers
             if (TotalWorkerCount == 1) {
                 if (TimeoutMs < 3000) {
                     AdjustedTimeoutMs = 3000;
@@ -3200,9 +3200,7 @@ bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 
                 } else {
                     AdjustedTimeoutMs = TimeoutMs;
                 }
-                UE_LOG(LogJUSYNC, Log, TEXT("Single-rank mode: broadcast (-1) will be handled as direct request to rank 0"));
             } else {
-                // Multi-rank mode
                 if (TimeoutMs < 15000) {
                     AdjustedTimeoutMs = 15000;
                     UE_LOG(LogJUSYNC, Warning, TEXT("Multi-rank mode: increasing timeout from %d ms to %d ms for %d workers"), 
@@ -3223,13 +3221,13 @@ bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request file list - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request file list - middleware not initialized"));
         return false;
     }
     
     if (!IsBrokerConnected())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request file list - not connected to broker"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request file list - not connected to broker"));
         return false;
     }
     
@@ -3272,12 +3270,12 @@ bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 
         
         FreeFileListWithSizesAndRanks_C(FileList, FileSizes, FileRanks, FileHashLo, FileHashHi, FileCount);
         
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Retrieved %d files with sizes, ranks, hashes from broker"), OutFiles.Num());
+        UE_LOG(LogJUSYNC, Log, TEXT("Retrieved %d files with sizes, ranks, hashes from broker"), OutFiles.Num());
         return true;
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to request file list with sizes and ranks (Result: %d)"), Result);
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to request file list with sizes and ranks (Result: %d)"), Result);
         if (FileList || FileSizes || FileRanks)
         {
             FreeFileListWithSizesAndRanks_C(FileList, FileSizes, FileRanks, FileHashLo, FileHashHi, FileCount);

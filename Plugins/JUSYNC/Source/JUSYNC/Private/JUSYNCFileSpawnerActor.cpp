@@ -137,7 +137,6 @@ void AJUSYNCFileSpawnerActor::ClearSpawnedActors()
     SpawnedActors.Empty();
     ActorsSpawned = 0;
     FileToActorMap.Empty();
-    FileLastSize.Empty();
 }
 
 FVector AJUSYNCFileSpawnerActor::GetNextSpawnLocation() const
