@@ -903,8 +903,9 @@ bool UJUSYNCSubsystem::LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const 
             pc.PointCount = static_cast<int32>(cpc.points_count);
             pc.bHasColors = cpc.has_colors != 0;
             pc.bHasNormals = cpc.has_normals != 0;
-            pc.BoundingBoxMin = FVector(cpc.bounding_box_min[0], cpc.bounding_box_min[1], cpc.bounding_box_min[2]);
-            pc.BoundingBoxMax = FVector(cpc.bounding_box_max[0], cpc.bounding_box_max[1], cpc.bounding_box_max[2]);
+            // Transform bounds from USD-space → UE-space, matching position transform
+            pc.BoundingBoxMin = FVector(cpc.bounding_box_min[0], cpc.bounding_box_min[2], -cpc.bounding_box_min[1]);
+            pc.BoundingBoxMax = FVector(cpc.bounding_box_max[0], cpc.bounding_box_max[2], -cpc.bounding_box_max[1]);
 
             if (cpc.points_count > 0 && cpc.positions)
             {
@@ -2110,8 +2111,9 @@ bool UJUSYNCSubsystem::LoadPointCloudFromBuffer(const TArray<uint8>& Buffer, con
         pc.bHasColors = cpc.has_colors != 0;
         pc.bHasNormals = cpc.has_normals != 0;
 
-        pc.BoundingBoxMin = FVector(cpc.bounding_box_min[0], cpc.bounding_box_min[1], cpc.bounding_box_min[2]);
-        pc.BoundingBoxMax = FVector(cpc.bounding_box_max[0], cpc.bounding_box_max[1], cpc.bounding_box_max[2]);
+        // Transform bounds from USD-space to UE-space, matching position transform (x, z, -y)
+        pc.BoundingBoxMin = FVector(cpc.bounding_box_min[0], cpc.bounding_box_min[2], -cpc.bounding_box_min[1]);
+        pc.BoundingBoxMax = FVector(cpc.bounding_box_max[0], cpc.bounding_box_max[2], -cpc.bounding_box_max[1]);
 
         // Convert positions: right-handed Z-up (USD) â†’ left-handed Y-up (UE)
         // UE transform: X stays, Y becomes Z, Z becomes -Y
@@ -3180,19 +3182,19 @@ bool UJUSYNCSubsystem::RequestFileListWithSizes(int32 TargetRank, int32 TimeoutM
 
 bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks)
 {
-    // Delegate to 7-param hash-aware version
-    TArray<uint64> DummyLo, DummyHi;
-    return RequestFileListWithSizesAndRanks(TargetRank, TimeoutMs, OutFiles, OutSizes, OutRanks, DummyLo, DummyHi);
-}
-
-bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks, TArray<uint64>& OutHashLo, TArray<uint64>& OutHashHi)
-{
+    // âœ… FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
+    
     // For broadcast requests (target_rank = -1), dynamically determine worker count
     int32 AdjustedTimeoutMs = TimeoutMs;
     if (TargetRank == -1) {
-        int32 TotalWorkerCount = 1;
+        // Query total worker count from broker (includes rank 0)
+        int32 TotalWorkerCount = 1; // Default to single-rank mode
         if (RequestTotalWorkerCount(2000, TotalWorkerCount)) {
             UE_LOG(LogJUSYNC, Log, TEXT("Broadcast request: dynamically detected %d total workers (including rank 0)"), TotalWorkerCount);
+            
+            // Adjust timeout based on actual worker count
+            // Single-rank mode: 3 seconds is enough
+            // Multi-rank mode: 15 seconds for up to 16 workers
             if (TotalWorkerCount == 1) {
                 if (TimeoutMs < 3000) {
                     AdjustedTimeoutMs = 3000;
@@ -3200,7 +3202,9 @@ bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 
                 } else {
                     AdjustedTimeoutMs = TimeoutMs;
                 }
+                UE_LOG(LogJUSYNC, Log, TEXT("Single-rank mode: broadcast (-1) will be handled as direct request to rank 0"));
             } else {
+                // Multi-rank mode
                 if (TimeoutMs < 15000) {
                     AdjustedTimeoutMs = 15000;
                     UE_LOG(LogJUSYNC, Warning, TEXT("Multi-rank mode: increasing timeout from %d ms to %d ms for %d workers"), 
@@ -3221,13 +3225,13 @@ bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request file list - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request file list - middleware not initialized"));
         return false;
     }
     
     if (!IsBrokerConnected())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request file list - not connected to broker"));
+        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request file list - not connected to broker"));
         return false;
     }
     
@@ -3237,24 +3241,20 @@ bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 
     uint64_t* FileHashLo = nullptr;
     uint64_t* FileHashHi = nullptr;
     size_t FileCount = 0;
-    
+
     UE_LOG(LogJUSYNC, Log, TEXT("Calling RequestFileListWithSizesAndRanks_C..."));
     int Result = RequestFileListWithSizesAndRanks_C(TargetRank, &FileList, &FileSizes, &FileRanks, &FileHashLo, &FileHashHi, &FileCount, AdjustedTimeoutMs);
     
-    UE_LOG(LogJUSYNC, Log, TEXT("RequestFileListWithSizesAndRanks_C returned: %d, FileCount: %d"), Result, FileCount);
+    UE_LOG(LogJUSYNC, Log, TEXT("RequestFileListWithSizesAndRanks_C returned: %d, FileCount: %zu"), Result, FileCount);
     
     if (Result == 1 && FileList && FileSizes && FileRanks && FileCount > 0)
     {
         OutFiles.Empty();
         OutSizes.Empty();
         OutRanks.Empty();
-        OutHashLo.Empty();
-        OutHashHi.Empty();
         OutFiles.Reserve(FileCount);
         OutSizes.Reserve(FileCount);
         OutRanks.Reserve(FileCount);
-        OutHashLo.Reserve(FileCount);
-        OutHashHi.Reserve(FileCount);
         
         for (size_t i = 0; i < FileCount; ++i)
         {
@@ -3263,22 +3263,21 @@ bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 
                 OutFiles.Add(FString(UTF8_TO_TCHAR(FileList[i])));
                 OutSizes.Add(static_cast<int64>(FileSizes[i]));
                 OutRanks.Add(static_cast<int32>(FileRanks[i]));
-                OutHashLo.Add(static_cast<uint64>(FileHashLo[i]));
-                OutHashHi.Add(static_cast<uint64>(FileHashHi[i]));
             }
         }
         
-        FreeFileListWithSizesAndRanks_C(FileList, FileSizes, FileRanks, FileHashLo, FileHashHi, FileCount);
+        // Free C memory
+        FreeFileListWithSizesAndRanks_C(FileList, FileSizes, FileRanks, nullptr, nullptr, FileCount);
         
-        UE_LOG(LogJUSYNC, Log, TEXT("Retrieved %d files with sizes, ranks, hashes from broker"), OutFiles.Num());
+        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Retrieved %d files with sizes and ranks from broker"), OutFiles.Num());
         return true;
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("Failed to request file list with sizes and ranks (Result: %d)"), Result);
+        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to request file list with sizes and ranks (Result: %d)"), Result);
         if (FileList || FileSizes || FileRanks)
         {
-            FreeFileListWithSizesAndRanks_C(FileList, FileSizes, FileRanks, FileHashLo, FileHashHi, FileCount);
+            FreeFileListWithSizesAndRanks_C(FileList, FileSizes, FileRanks, nullptr, nullptr, FileCount);
         }
     }
 #endif

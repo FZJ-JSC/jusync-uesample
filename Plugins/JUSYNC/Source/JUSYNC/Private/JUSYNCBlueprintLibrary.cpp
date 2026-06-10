@@ -1681,7 +1681,6 @@ void UJUSYNCBlueprintLibrary::FilterFileListByExtensionEnum(const TArray<FString
     {
     case EJUSYNCExtension::USD:
         Extensions.Add(TEXT(".usda"));
-        Extensions.Add(TEXT(".usd"));
         break;
     case EJUSYNCExtension::PNG:
         Extensions.Add(TEXT(".png"));
@@ -1763,7 +1762,6 @@ void UJUSYNCBlueprintLibrary::FilterFileListByExtensionEnumWithSizes(const TArra
     {
     case EJUSYNCExtension::USD:
         Extensions.Add(TEXT(".usda"));
-        Extensions.Add(TEXT(".usd"));
         break;
     case EJUSYNCExtension::PNG:
         Extensions.Add(TEXT(".png"));
@@ -1889,7 +1887,6 @@ void UJUSYNCBlueprintLibrary::FilterFileListByExtensionEnumWithSizesAndRanks(con
     {
     case EJUSYNCExtension::USD:
         Extensions.Add(TEXT(".usda"));
-        Extensions.Add(TEXT(".usd"));
         break;
     case EJUSYNCExtension::PNG:
         Extensions.Add(TEXT(".png"));
