@@ -59,13 +59,6 @@ public:
     using FileListWithSizesCallback = std::function<void(const std::vector<FileInfo>& files)>;
     using ErrorCallback = std::function<void(const std::string& error)>;
     
-    // Notification callback types (for live update support)
-    using NotificationCallback = std::function<void(uint32_t messageType,
-                                                     int32_t sourceRank,
-                                                     const std::string& filename,
-                                                     uint64_t fileSize,
-                                                     uint64_t timestamp)>;
-
     // Worker status callback types
     using WorkerStatusCallback = std::function<void(int32_t rank,
                                                     uint32_t status,
@@ -175,9 +168,6 @@ public:
     bool testConnection();
     void updateHealthStatus();
 
-    // Notification callbacks (live update support)
-    void setNotificationCallback(NotificationCallback callback);
-
     // Parallel download support
     zmq::socket_t* getSocket() { return zmqSocket.get(); }
     const zmq::socket_t* getSocket() const { return zmqSocket.get(); }
@@ -270,10 +260,6 @@ private:
     std::atomic<size_t> maxMessageSize{104857600}; // 100MB default
     std::chrono::steady_clock::time_point lastHealthCheck;
 
-    // Notification callback (live update support)
-    std::mutex notificationCallbackMutex;
-    NotificationCallback notificationCallback;
-
     // Default chunk size for file requests
     static constexpr uint32_t DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
 
@@ -294,11 +280,8 @@ private:
 
     // Attempt to dequeue a matching message (non-blocking).
     bool tryDequeueMatching(uint32_t requestId,
-                             std::vector<uint8_t>& outDelimiter,
-                             std::vector<uint8_t>& outData);
-
-    // Handle notification message (called from dispatcher thread)
-    void handleNotification(const std::vector<uint8_t>& data);
+                            std::vector<uint8_t>& outDelimiter,
+                            std::vector<uint8_t>& outData);
 };
 
 } // namespace anari_usd_middleware
