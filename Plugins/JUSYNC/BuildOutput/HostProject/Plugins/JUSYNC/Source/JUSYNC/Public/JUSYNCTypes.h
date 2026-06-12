@@ -71,24 +71,9 @@ struct JUSYNC_API FJUSYNCMeshData
 	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
 	TArray<FColor> VertexColors;  // ADD THIS LINE
 
-	// Point cloud specific properties
-	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
-	TArray<float> PointWidths;  // Per-point width/size for spheres
-
-	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
-	TArray<int64> PointIDs;  // Per-point IDs from USD
-
 	// Update validation and helper functions
 	bool HasVertexColors() const {
 		return VertexColors.Num() > 0;
-	}
-
-	bool HasPointWidths() const {
-		return PointWidths.Num() > 0;
-	}
-
-	bool HasPointIDs() const {
-		return PointIDs.Num() > 0;
 	}
 
 	FJUSYNCMeshData()
@@ -99,39 +84,14 @@ struct JUSYNC_API FJUSYNCMeshData
 
 	bool IsValid() const
 	{
-		// For point clouds: allow empty triangles
-		// For meshes: require valid triangles
-		bool bHasVertices = !ElementName.IsEmpty() && Vertices.Num() > 0;
-		
-		if (IsPointCloud())
-		{
-			// Point cloud: only need vertices
-			return bHasVertices;
-		}
-		else
-		{
-			// Mesh: need vertices and valid triangles
-			return bHasVertices && 
-			       Triangles.Num() > 0 && 
-			       (Triangles.Num() % 3 == 0);
-		}
-	}
-
-	// Check if this is a point cloud (no triangles)
-	bool IsPointCloud() const
-	{
-		return Triangles.Num() == 0 && Vertices.Num() > 0;
-	}
-
-	// Check if this is a mesh (has triangles)
-	bool IsMesh() const
-	{
-		return Triangles.Num() > 0 && (Triangles.Num() % 3 == 0);
+		return !ElementName.IsEmpty() &&
+			Vertices.Num() > 0 &&
+			Triangles.Num() > 0 &&
+			(Triangles.Num() % 3 == 0);
 	}
 
 	int32 GetVertexCount() const { return Vertices.Num(); }
 	int32 GetTriangleCount() const { return Triangles.Num() / 3; }
-	int32 GetPointCount() const { return Vertices.Num(); }  // Same as vertex count for point clouds
 
 	bool HasNormals() const { return Normals.Num() > 0; }
 	bool HasUVs() const { return UVs.Num() > 0; }
@@ -195,6 +155,62 @@ struct JUSYNC_API FJUSYNCRealtimeMeshData
 	// Conversion methods
 	static FJUSYNCRealtimeMeshData FromStandardMesh(const FJUSYNCMeshData& StandardMesh);
 	FJUSYNCMeshData ToStandardMesh() const;
+};
+
+// Point cloud data for USD GeomPoints primitives
+USTRUCT(BlueprintType)
+struct JUSYNC_API FJUSYNCPointCloudData
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+	FString ElementName;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+	FString TypeName;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+	TArray<FVector> Positions;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+	TArray<FColor> Colors;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+	TArray<float> Widths;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+	FVector BoundingBoxMin;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+	FVector BoundingBoxMax;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+	int32 PointCount = 0;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+	bool bHasColors = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+	bool bHasNormals = false;
+
+	FJUSYNCPointCloudData()
+	{
+		ElementName = TEXT("");
+		TypeName = TEXT("GeomPoints");
+		BoundingBoxMin = FVector::ZeroVector;
+		BoundingBoxMax = FVector::ZeroVector;
+	}
+
+	bool IsValid() const
+	{
+		return !ElementName.IsEmpty() && PointCount > 0 && Positions.Num() > 0;
+	}
+
+	bool HasColors() const { return bHasColors && Colors.Num() > 0; }
+	bool HasNormals() const { return bHasNormals; }
+	bool HasWidths() const { return Widths.Num() > 0; }
+
+	int32 GetPointCount() const { return PointCount; }
 };
 
 USTRUCT(BlueprintType)
@@ -297,6 +313,41 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FJUSYNCProcessingProgress, float, P
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FJUSYNCError, const FString&, ErrorType, const FString&, ErrorMessage);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FJUSYNCWorkerStatusReceived, const TArray<FJUSYNCWorkerStatus>&, WorkerStatus);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FJUSYNCWorkerCountReceived, int32, WorkerCount);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FJUSYNCPointCloudReceived, const TArray<FJUSYNCPointCloudData>&, PointCloudData);
+
+// Live update notification from broker (NOTIFY_FILE_UPDATE=300, NOTIFY_COMMIT_COMPLETE=301)
+UENUM(BlueprintType)
+enum class EJUSYNCNotificationType : uint8
+{
+    FileUpdate    UMETA(DisplayName = "File Updated"),
+    CommitComplete UMETA(DisplayName = "Commit Complete")
+};
+
+USTRUCT(BlueprintType)
+struct JUSYNC_API FJUSYNCNotification
+{
+    GENERATED_BODY()
+
+    UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+    EJUSYNCNotificationType Type;
+
+    UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+    int32 SourceRank;
+
+    UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+    FString Filename;
+
+    UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+    int64 FileSize;
+
+    UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+    int64 Timestamp;
+
+    FJUSYNCNotification()
+        : Type(EJUSYNCNotificationType::FileUpdate), SourceRank(-1), FileSize(0), Timestamp(0) {}
+};
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FJUSYNCNotificationReceived, const FJUSYNCNotification&, Notification);
 
 // ========== BENCHMARKING STRUCTURES ==========
 

@@ -12,8 +12,6 @@
 #include "Materials/MaterialInterface.h"
 #include "Containers/Map.h"
 #include "UObject/SoftObjectPtr.h"
-#include "Components/HierarchicalInstancedStaticMeshComponent.h"
-#include "Engine/StaticMesh.h"
 #include <functional>
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
@@ -22,13 +20,12 @@
 
 // Forward declaration to avoid circular dependency
 class UJUSYNCBlueprintLibrary;
+class FJUSYNCPointCloudSpawner;
 
 #include "JUSYNCSubsystem.generated.h"
 
 // Forward declarations
 class URealtimeMeshComponent;
-class UHierarchicalInstancedStaticMeshComponent;
-class UStaticMesh;
 
 UCLASS()
 class JUSYNC_API UJUSYNCSubsystem : public UGameInstanceSubsystem
@@ -40,6 +37,12 @@ public:
     virtual void Initialize(FSubsystemCollectionBase& Collection) override;
     virtual void Deinitialize() override;
     virtual bool ShouldCreateSubsystem(UObject* Outer) const override;
+
+    // Async point cloud spawner with actor pooling
+    FJUSYNCPointCloudSpawner* GetPointCloudSpawner() const { return PCSpawner.Get(); }
+
+    // Extract cached gradient from middleware and apply to spawner LUT
+    void ApplyCachedGradientToSpawner();
 
     // Core Connection Management
     UFUNCTION(BlueprintCallable, Category = "JUSYNC")
@@ -74,12 +77,21 @@ public:
     UPROPERTY(BlueprintAssignable, Category = "JUSYNC Events")
     FJUSYNCError OnError;
 
+    UPROPERTY(BlueprintAssignable, Category = "JUSYNC Events")
+    FJUSYNCPointCloudReceived OnPointCloudReceived;
+
+    // Live update notification from broker
+    UPROPERTY(BlueprintAssignable, Category = "JUSYNC Events")
+    FJUSYNCNotificationReceived OnNotificationReceived;
+
     // USD Processing (Legacy - use JUSYNCBlueprintLibrary versions for preview support)
     UFUNCTION(BlueprintCallable, Category = "JUSYNC USD|Legacy", DisplayName = "Load USD From Buffer (Legacy)")
     bool LoadUSDFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCMeshData>& OutMeshData);
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC USD|Legacy", DisplayName = "Load USD From Disk (Legacy)")
     bool LoadUSDFromDisk(const FString& FilePath, TArray<FJUSYNCMeshData>& OutMeshData);
+
+    bool LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData);
 
     // Texture Processing
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Texture")
@@ -145,106 +157,51 @@ public:
         float SafetyMarginPercent = 20.0f
     );
 
-    // Point Cloud Visualization with HISM (Hierarchical Instanced Static Mesh)
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Point Cloud HISM")
-    UHierarchicalInstancedStaticMeshComponent* CreatePointCloudHISM(
-        AActor* ParentActor,
-        const FJUSYNCMeshData& PointCloudData,
-        UStaticMesh* SphereMesh = nullptr,
-        float DefaultSphereRadius = 10.0f,
-        bool bUseVertexColors = true,
-        UMaterialInterface* Material = nullptr
-    );
-
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Point Cloud HISM Chunked", 
-              meta = (AdvancedDisplay = "6"))
-    UHierarchicalInstancedStaticMeshComponent* CreatePointCloudHISM_Chunked(
-        AActor* ParentActor,
-        const FJUSYNCMeshData& PointCloudData,
-        UStaticMesh* SphereMesh = nullptr,
-        float DefaultSphereRadius = 10.0f,
-        bool bUseVertexColors = true,
-        UMaterialInterface* Material = nullptr,
-        int32 MaxPointsPerChunk = 50000
-    );
-
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Point Cloud HISM Parallel", 
-              meta = (AdvancedDisplay = "7"))
-    TArray<UHierarchicalInstancedStaticMeshComponent*> CreatePointCloudHISM_Parallel(
-        AActor* ParentActor,
-        const FJUSYNCMeshData& PointCloudData,
-        UStaticMesh* SphereMesh = nullptr,
-        float DefaultSphereRadius = 10.0f,
-        bool bUseVertexColors = true,
-        UMaterialInterface* Material = nullptr,
-        int32 MaxPointsPerChunk = 50000,
-        bool bSpawnProgressively = true
-    );
-
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Point Cloud HISM With Custom Size")
-    UHierarchicalInstancedStaticMeshComponent* CreatePointCloudHISMWithCustomSize(
-        AActor* ParentActor,
-        const FJUSYNCMeshData& PointCloudData,
-        UStaticMesh* SphereMesh,
-        const TArray<float>& PointSizes,
-        bool bUseVertexColors = true,
-        UMaterialInterface* Material = nullptr
-    );
-
-    // Point cloud helper functions
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud")
-    bool IsPointCloudData(const FJUSYNCMeshData& MeshData);
-    
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud")
-    int32 GetPointCloudCount(const FJUSYNCMeshData& MeshData);
-    
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud")
-    bool HasPointWidthsData(const FJUSYNCMeshData& MeshData);
-    
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud")
-    bool HasPointIDsData(const FJUSYNCMeshData& MeshData);
-
-    // Billboard-based point cloud (much faster than 3D spheres)
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Point Cloud Billboards")
-    UHierarchicalInstancedStaticMeshComponent* CreatePointCloudBillboards(
-        AActor* ParentActor,
-        const FJUSYNCMeshData& PointCloudData,
-        UStaticMesh* BillboardMesh = nullptr,
-        float BillboardSize = 10.0f,
-        bool bUseVertexColors = true,
-        UMaterialInterface* Material = nullptr,
-        bool bCameraFacing = true
-    );
-
-    // LOD-based point cloud with multiple detail levels
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Point Cloud With LOD")
-    TArray<UHierarchicalInstancedStaticMeshComponent*> CreatePointCloudWithLOD(
-        AActor* ParentActor,
-        const FJUSYNCMeshData& PointCloudData,
-        UStaticMesh* PointMesh = nullptr,
-        float BaseSize = 10.0f,
-        bool bUseVertexColors = true,
-        UMaterialInterface* Material = nullptr,
-        int32 LODLevels = 3,
-        float LODDistanceFactor = 1000.0f
-    );
-
-    // Optimized point cloud with spatial partitioning for better culling
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC Point Cloud", DisplayName = "Create Optimized Point Cloud")
-    TArray<UHierarchicalInstancedStaticMeshComponent*> CreateOptimizedPointCloud(
-        AActor* ParentActor,
-        const FJUSYNCMeshData& PointCloudData,
-        UStaticMesh* PointMesh = nullptr,
-        float PointSize = 10.0f,
-        bool bUseVertexColors = true,
-        UMaterialInterface* Material = nullptr,
-        int32 GridSize = 10,
-        bool bUseBillboards = true
-    );
-
     // Conversion utilities for RealtimeMesh
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Mesh")
     FJUSYNCRealtimeMeshData ConvertToRealtimeMeshFormat(const FJUSYNCMeshData& StandardMesh);
+
+    // Point Cloud Processing
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC PointCloud", DisplayName = "Load Point Cloud From USD Buffer")
+    bool LoadPointCloudFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCPointCloudData>& OutPointCloudData);
+
+    // Async point cloud loading
+    DECLARE_DELEGATE_ThreeParams(FOnPointCloudLoaded, const TArray<FJUSYNCPointCloudData>&, bool, const FString&);
+    void LoadPointCloudFromBuffer_Async(const TArray<uint8>& Buffer, const FString& Filename, FOnPointCloudLoaded OnLoaded);
+
+    // Spawn point cloud as LiDAR actor
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC PointCloud", DisplayName = "Spawn Lidar Point Cloud At Location")
+    AActor* SpawnLidarPointCloudAtLocation(
+        const FJUSYNCPointCloudData& PointCloudData,
+        FVector Location,
+        FRotator Rotation = FRotator::ZeroRotator,
+        FVector Scale3D = FVector(1.0f)
+    );
+
+    // Async point cloud spawning
+    DECLARE_DELEGATE_TwoParams(FOnPointCloudSpawned, AActor*, bool);
+    void SpawnLidarPointCloudAtLocation_Async(
+        const FJUSYNCPointCloudData& PointCloudData,
+        FVector Location,
+        FRotator Rotation,
+        FVector Scale3D,
+        FOnPointCloudSpawned OnSpawned
+    );
+
+    // Batch spawn point clouds
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC PointCloud", DisplayName = "Batch Spawn Point Clouds At Locations")
+    TArray<AActor*> BatchSpawnPointCloudsAtLocations(
+        const TArray<FJUSYNCPointCloudData>& PointCloudDataArray,
+        const TArray<FVector>& Locations
+    );
+
+    // Async batch spawn point clouds
+    DECLARE_DELEGATE_OneParam(FOnPointCloudBatchSpawned, const TArray<AActor*>&);
+    void BatchSpawnPointCloudsAtLocations_Async(
+        const TArray<FJUSYNCPointCloudData>& PointCloudDataArray,
+        const TArray<FVector>& Locations,
+        FOnPointCloudBatchSpawned OnBatchSpawned
+    );
 
     // Texture Integration
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Texture")
@@ -301,6 +258,9 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Broker", DisplayName = "Request File List With Sizes And Ranks (Sync)")
     bool RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks);
+
+    // Hash-aware version for internal C++ use (not BlueprintCallable)
+    bool RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks, TArray<uint64>& OutHashLo, TArray<uint64>& OutHashHi);
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Broker", DisplayName = "Request File (Sync)")
     bool RequestFile(const FString& Filename, int32 TargetRank, int32 TimeoutMs, TArray<uint8>& OutData);
@@ -495,6 +455,9 @@ private:
     // Display management
     bool bMetricsDisplayVisible{ false };
     TWeakObjectPtr<class UUserWidget> MetricsDisplayWidget;
+
+    // Async point cloud spawner with actor pooling
+    TUniquePtr<class FJUSYNCPointCloudSpawner> PCSpawner;
 
     void CreateMetricsDisplay();
     void DestroyMetricsDisplay();

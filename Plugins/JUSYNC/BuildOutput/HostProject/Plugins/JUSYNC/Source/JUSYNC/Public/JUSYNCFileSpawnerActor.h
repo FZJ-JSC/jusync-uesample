@@ -5,6 +5,7 @@
 #include "Components/PrimitiveComponent.h"
 #include "JUSYNCTypes.h"
 #include "JUSYNCBlueprintLibrary.h"
+#include "JUSYNCPointCloudSpawner.h"
 #include "JUSYNCFileSpawnerActor.generated.h"
 
 UENUM(BlueprintType)
@@ -40,7 +41,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Connection")
     int32 RequestTimeoutMs;
 
-    /** Estimated network bandwidth in bytes/sec for dynamic timeout calculation (1MB/s = 1000000) */
+    /** Estimated network bandwidth in bytes/sec for dynamic timeout calculation (default: 10GB/s = 10737418240) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Connection")
     float BandwidthBytesPerSecond;
 
@@ -52,7 +53,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Filters")
     bool bFilterUSDOnly;
 
-    /** Also spawn shared files (texture, material, manifests) found alongside clips */
+    /** Only spawn files under "clips/" path (excludes shared manifests/materials/camera) */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Filters")
     bool bClipsOnly;
 
@@ -88,9 +89,36 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Behavior")
     bool bAutoStart;
 
-    /** Also download shared texture and material files (from rank 0) for point cloud coloring */
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Behavior")
-    bool bDownloadSharedMaterials;
+    /** Enable live update mode: watches for broker notifications and polls for file changes */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|LiveUpdate", meta = (DisplayName = "Enable Live Updates"))
+    bool bEnableLiveUpdates;
+
+    /** Poll interval for checking file changes when in live update mode (seconds). Set to 0 to rely solely on broker notifications. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|LiveUpdate", meta = (EditCondition = "bEnableLiveUpdates", EditConditionHides))
+    float LiveUpdatePollInterval;
+
+    /** Automatically destroy and re-spawn updated meshes when a file change is detected */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|LiveUpdate", meta = (EditCondition = "bEnableLiveUpdates", EditConditionHides))
+    bool bAutoRefreshMeshes;
+
+    /** Pipeline depth: how many files to download ahead while spawning previous ones (1 = sequential, higher = more overlap) */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pipeline", meta = (ClampMin = "1", ClampMax = "16"))
+    int32 PipelineDepth;
+
+    // Point cloud settings
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|PointCloud")
+    float PointCloudSize;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|PointCloud")
+    bool bSpawnPointClouds;
+
+    /** Gradient PNG filename on the broker (e.g. "shared/gradient.png"). Leave blank to auto-detect first .png */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|PointCloud")
+    FString GradientPngFilename;
+
+    /** Look up point colors from gradient PNG using attribute0 as the index */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|PointCloud", meta = (InlineEditConditionToggle))
+    bool bUseGradientColors;
 
     UPROPERTY(BlueprintReadOnly, Category = "JUSYNC|Spawner|State")
     EJUSYNCSpawnerState CurrentState;
@@ -128,6 +156,10 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner")
     void ClearSpawnedActors();
 
+    /** Manually trigger a full refresh: re-fetch file list, diff changes, and update spawned actors */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|LiveUpdate", meta = (DisplayName = "Manual Refresh"))
+    void ManualRefresh();
+
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner")
     FVector GetNextSpawnLocation() const;
 
@@ -142,41 +174,72 @@ private:
 
     void OnFileListReceived(const TArray<FString>& FileList, const TArray<int64>& FileSizes, const TArray<int32>& FileRanks);
     void OnFileListReceived_Internal(const TArray<FString>& FileList, const TArray<int64>& FileSizes, const TArray<int32>& FileRanks, bool bSuccess);
+    void OnFileListReceived_Internal(const TArray<FString>& FileList, const TArray<int64>& FileSizes, const TArray<int32>& FileRanks, bool bSuccess, const TArray<uint64>& HashLo, const TArray<uint64>& HashHi);
+    void OnFileListReceived_Internal_Common(const TArray<FString>& FileList, const TArray<int64>& FileSizes, const TArray<int32>& FileRanks, bool bSuccess);
     void OnFileListError(const FString& ErrorMessage);
     void OnFileDownloaded(const FString& Filename, const TArray<uint8>& FileData);
-    void OnSingleFileDownloaded(const FString& Filename, const TArray<uint8>& FileData, bool bSuccess, int32 FileIndex);
+    void OnSingleFileDownloaded(const FString& Filename, const TArray<uint8>& FileData, bool bSuccess, int32 FileIndex, int32 TargetRank);
     void OnFileDownloadError(const FString& ErrorMessage);
+    void DownloadGradientPng(UJUSYNCSubsystem* Subsystem);
+    void PipelineDownloadNext(UJUSYNCSubsystem* Subsystem);
 
     int32 CalculateDynamicTimeout(int64 FileSizeBytes) const;
-    void SpawnMeshFromData(const FString& Filename, const TArray<uint8>& FileData);
+    void SpawnMeshFromData(const FString& Filename, bool bParsed, TArray<FJUSYNCMeshData>&& MeshData, TArray<FJUSYNCPointCloudData>&& PointCloudData, int32 FileIndex, int32 TargetRank);
     void ApplyDynamicMaterial(UPrimitiveComponent* Comp, const FString& Filename);
     void CheckAllDownloadsComplete();
     void RetryFailedDownloads();
+    void FlushBufferedPointClouds();
+    void OnPointCloudSpawnedHandler(const FString& EleName, AActor* Spawned);
+
+    // Live update support
+    UFUNCTION()
+    void OnBrokerNotification(const FJUSYNCNotification& Notification);
+    void HandleFileUpdateNotification(const FString& Filename, int32_t SourceRank);
+    void HandleCommitCompleteNotification();
+    void StartLiveUpdatePolling();
+    void StopLiveUpdatePolling();
+    void OnLiveUpdateTimer();
+    bool RefreshSingleFile(const FString& Filename, int32 TargetRank);
 
     TArray<FString> RawFileList;
     TArray<int64> RawFileSizes;
     TArray<int32> RawFileRanks;
+    TArray<uint64> RawHashLo;
+    TArray<uint64> RawHashHi;
 
     TArray<FString> FilteredFiles;
     TArray<int64> FilteredSizes;
     TArray<int32> FilteredRanks;
+    TArray<uint64> FilteredHashLo;
+    TArray<uint64> FilteredHashHi;
+    TMap<FString, int32> GradientPngRankMap;
+    TMap<int32, TArray<FColor>> RankGradients;
+    std::atomic<bool> bGradientReady;
+    TArray<FJUSYNCPointCloudData> PendingPointClouds;
 
     int32 NextSpawnIndex;
     int32 PendingDownloads;
-    int32 CurrentRetryCount;
-    int32 MaxRetries;
+    int32 PendingAsyncSpawns;
+    int32 PendingAsyncPCS;
+    int32 PipelineNextIndex;
+    int32 PipelineActive;
     bool bIsCancelled;
+    int32 MaxRetries;
+    int32 CurrentRetryCount;
     TArray<int32> FailedFileIndices;
+    TArray<int32> ParseFailedIndices;
 
-    // Shared material/texture for point cloud coloring
-    UTexture2D* SharedPointCloudTexture;
-    UMaterialInstanceDynamic* SharedPointCloudMaterial;
-    bool bSharedMaterialReady;
-    TArray<FString> SharedTextureFiles;
-    TArray<FString> SharedMaterialFiles;
+    // Live update state
+    FTimerHandle LiveUpdateTimerHandle;
+    TMap<FString, AActor*> FileToActorMap;
+    TMap<FString, uint64> FileHashLo;
+    TMap<FString, uint64> FileHashHi;
+    TMap<FString, int64> FileLastSize;
+    double LastCommitCompleteTime;
+    double CommitCompleteCooldown;
+    bool bCommitDiffInProgress;
 
-    void DownloadSharedFilesFromRank0();
-    void CreatePointCloudMaterialFromTexture(UTexture2D* Texture);
-    void OnSharedFileDownloaded(const FString& Filename, const TArray<uint8>& FileData, bool bSuccess);
-    int32 PendingSharedDownloads;
+    // Live update guards
+    bool bInitialSpawnDone;
+    TSet<FString> RefreshedFiles;
 };
