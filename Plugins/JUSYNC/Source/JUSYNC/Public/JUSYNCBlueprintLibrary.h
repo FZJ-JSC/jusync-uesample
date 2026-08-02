@@ -173,6 +173,15 @@ public:
     static bool LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const FString& Filename,
         TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData, FString& OutPreview);
 
+    /**
+     * Zero-copy variant: bypasses std::vector copy at C API boundary.
+     * Accepts raw TArray<uint8> data pointer directly to UsdProcessor.
+     * Use this for performance-critical paths (large payloads).
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|USD", CallInEditor, DisplayName = "Load USD Full No Copy (Mesh + Point Cloud)")
+    static bool LoadUSDFullFromBufferNoCopy(const TArray<uint8>& Buffer, const FString& Filename,
+        TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData, FString& OutPreview);
+
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|USD", CallInEditor)
     static bool LoadUSDFromDisk(const FString& FilePath,
         TArray<FJUSYNCMeshData>& OutMeshData, FString& OutPreview);
@@ -447,15 +456,6 @@ public:
         bool bPreserveAspectRatio = true, bool bUseAsyncSpawning = false
     );
 
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC|RealtimeMesh Spawning|Benchmarked", CallInEditor)
-    static AActor* SpawnRealtimeMeshWithMaterial_Benchmarked(
-        const FJUSYNCMeshData& MeshData, const FVector& SpawnLocation,
-        const FRotator& SpawnRotation, UMaterialInterface* Material,
-        const FJUSYNCBenchmarkConfig& Config,
-        bool bUseUniformScaling = false, FVector OuterBoundingBoxSize = FVector::ZeroVector,
-        bool bPreserveAspectRatio = true, bool bUseAsyncSpawning = true
-    );
-
 
     static FBox CalculateMeshBounds(const FJUSYNCMeshData& MeshData, const FVector& Location);
 
@@ -503,62 +503,6 @@ private:
         int32 CurrentBatch,
         int32 BatchSize,
         float BatchDelay
-    );
-
-    // ========== BENCHMARKING FUNCTIONS ==========
-
-    /**
-     * Start benchmarking for a specific test
-     */
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
-    static void StartBenchmark(const FString& TestName, const FJUSYNCBenchmarkConfig& Config);
-
-    /**
-     * End benchmarking and save results
-     */
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
-    static void EndBenchmark();
-
-    /**
-     * Save all benchmark results to CSV
-     */
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
-    static void SaveAllBenchmarkResultsToCSV(const FString& OutputDirectory);
-
-    /**
-     * Save all benchmark results to JSON (more readable format)
-     */
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
-    static void SaveAllBenchmarkResultsToJSON(const FString& OutputDirectory);
-
-    /**
-     * Clear all benchmark results
-     */
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
-    static void ClearBenchmarkResults();
-
-    /**
-     * Get current benchmark results
-     */
-    UFUNCTION(BlueprintPure, Category = "JUSYNC|Benchmarking")
-    static TArray<FJUSYNCBenchmarkResult> GetBenchmarkResults();
-
-    /**
-     * Batch spawn with benchmarking (wraps BatchSpawnRealtimeMeshesWithMaterial)
-     */
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC|RealtimeMesh Spawning|Benchmarked", CallInEditor)
-    static TArray<AActor*> BatchSpawnRealtimeMeshesWithMaterial_Benchmarked(
-        const TArray<FJUSYNCMeshData>& MeshDataArray,
-        const TArray<FVector>& SpawnLocations,
-        const TArray<FRotator>& SpawnRotations,
-        UMaterialInterface* Material,
-        const FJUSYNCBenchmarkConfig& Config,
-        bool bUseUniformScaling = false,
-        FVector OuterBoundingBoxSize = FVector::ZeroVector,
-        bool bPreserveAspectRatio = true,
-        bool bUseAsyncSpawning = false,
-        int32 BatchSize = 5,
-        float BatchDelay = 0.016f
     );
 
     // ========== DYNAMIC TIMEOUT & RETRY LOGIC ==========
@@ -636,36 +580,4 @@ private:
     };
 
     static FRankPerformanceTracker RankPerformanceTracker;
-
-    // Benchmark data storage
-    static TArray<FJUSYNCBenchmarkResult> BenchmarkResults;
-    static FString CurrentBenchmarkTest;
-    static FJUSYNCBenchmarkConfig CurrentBenchmarkConfig;
-    static bool bIsBenchmarking;
-    static FDateTime BenchmarkSessionStartTime;
-
-    // Benchmark helper functions
-    static void RecordBenchmarkResult(const FJUSYNCBenchmarkResult& Result);
-    static FJUSYNCBenchmarkResult CreateBenchmarkResult(const FString& TestName, float TotalTimeMs, int32 TriangleCount, int32 VertexCount, int64 RAMBefore, int64 RAMAfter, int32 ActorCount, int32 ErrorCount, int32 SplitMeshCount);
-    static FJUSYNCBenchmarkResult CreateBenchmarkResultExtended(
-        const FString& TestName,
-        float TotalTimeMs,
-        int32 TriangleCount,
-        int32 VertexCount,
-        int64 RAMBefore,
-        int64 RAMAfter,
-        int64 RAMPeak,
-        int64 RAMDuring,
-        int32 ActorCount,
-        int32 ErrorCount,
-        int32 SplitMeshCount,
-        float CPUUsagePercent,
-        int64 VRAMBefore,
-        int64 VRAMAfter,
-        int64 VRAMPeak,
-        int32 ActiveThreadCount,
-        float GPUUsagePercent,
-        int32 HitchCount = 0,
-        float AvgHitchDurationMs = 0.0f,
-        float MaxHitchDurationMs = 0.0f);
 };
