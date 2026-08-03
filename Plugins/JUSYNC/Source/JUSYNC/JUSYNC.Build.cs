@@ -10,6 +10,7 @@ public class JUSYNC : ModuleRules
         CppStandard = CppStandardVersion.Cpp20;
         bEnableExceptions = true;
         bUseRTTI = false;
+        bUseUnity = false;
 
         PublicDependencyModuleNames.AddRange(new string[]
         {
