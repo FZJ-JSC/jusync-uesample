@@ -64,7 +64,7 @@ static FCriticalSection ProcessedFilesCriticalSection;
 // Enhanced callback functions with detailed debugging
 extern "C" void FileReceivedCallback_Static(const CFileData* file_data)
 {
-    UE_LOG(LogJUSYNC, Log, TEXT("=== ZMQ CALLBACK TRIGGERED ==="));
+    UE_LOG(LogJUSYNC, Verbose, TEXT("File received callback triggered"));
     
     if (!file_data)
     {
@@ -83,13 +83,17 @@ extern "C" void FileReceivedCallback_Static(const CFileData* file_data)
             return;
         }
         ProcessedFiles.Add(Filename);
+
+        // Bound memory: this set only needs recent entries to drop multi-rank duplicates within a
+        // single broadcast. Reset the window once it grows large (long sessions with live updates).
+        if (ProcessedFiles.Num() >= 4096)
+        {
+            ProcessedFiles.Reset();
+        }
     }
     
-    UE_LOG(LogJUSYNC, Log, TEXT("ZMQ File Received:"));
-    UE_LOG(LogJUSYNC, Log, TEXT("  - Filename: %s"), *Filename);
-    UE_LOG(LogJUSYNC, Log, TEXT("  - File Type: %s"), UTF8_TO_TCHAR(file_data->file_type));
-    UE_LOG(LogJUSYNC, Log, TEXT("  - Data Size: %d bytes"), file_data->data_size);
-    UE_LOG(LogJUSYNC, Log, TEXT("  - Hash: %s"), UTF8_TO_TCHAR(file_data->hash));
+    UE_LOG(LogJUSYNC, Verbose, TEXT("ZMQ file received: %s (type=%s, %d bytes)"),
+           *Filename, UTF8_TO_TCHAR(file_data->file_type), file_data->data_size);
     
     UJUSYNCSubsystem* Subsystem = g_SubsystemInstance.load();
     if (!Subsystem)
@@ -175,12 +179,34 @@ extern "C" void MessageReceivedCallback_Static(const char* message)
     });
 }
 
+// Filter helper: determine if a file path is relevant for live updates (geometry clips only)
+static bool IsNotificationForSkippableFile(const char* filename)
+{
+    if (!filename) return false;
+    const char* p = filename;
+    while (*p)
+    {
+        if (p[0] == 'i' && p[1] == 'm' && p[2] == 'a' && p[3] == 'g' && p[4] == 'e' && p[5] == 's' && p[6] == '/') return true;
+        if (p[0] == 's' && p[1] == 'h' && p[2] == 'a' && p[3] == 'r' && p[4] == 'e' && p[5] == 'd' && p[6] == '/') return true;
+        if (p[0] == 'm' && p[1] == 'a' && p[2] == 'n' && p[3] == 'i' && p[4] == 'f' && p[5] == 'e' && p[6] == 's' && p[7] == 't') return true;
+        if (p[0] == 'S' && p[1] == 'e' && p[2] == 's' && p[3] == 's' && p[4] == 'i' && p[5] == 'o' && p[6] == 'n' && p[7] == '_') return true;
+        if (p[0] == 'p' && p[1] == 'r' && p[2] == 'i' && p[3] == 'm' && p[4] == 's' && p[5] == 't' && p[6] == 'a' && p[7] == 'g' && p[8] == 'e' && p[9] == 's') return true;
+        if ((p[0] == '.' || p[0] == '/') && (p[1] == 'p' || p[1] == 'P') && (p[2] == 'n' || p[2] == 'N') && (p[3] == 'g' || p[3] == 'G')) return true;
+        p++;
+    }
+    return false;
+}
+
 extern "C" void NotificationCallback_Static(uint32_t messageType, int32_t sourceRank,
                                               const char* filename, uint64_t fileSize, uint64_t timestamp,
                                               uint64_t hashLo, uint64_t hashHi,
                                               uint64_t hashPrevLo, uint64_t hashPrevHi,
                                               bool hasOldData)
 {
+    // CommitComplete has no filename - always pass through
+    if (messageType != 301 && IsNotificationForSkippableFile(filename))
+        return;  // Drop images/, shared/, .png, manifest, Session_, primstages/ early
+
     FString NotifType = TEXT("NOTIFY_UNKNOWN");
     if (messageType == 302)      NotifType = TEXT("NOTIFY_FILE_UPDATE_V2");
     else if (messageType == 301) NotifType = TEXT("NOTIFY_COMMIT_COMPLETE");
@@ -725,6 +751,11 @@ void UJUSYNCSubsystem::HandleMessageReceivedForLibrary(const FString& Message)
 bool UJUSYNCSubsystem::LoadUSDFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCMeshData>& OutMeshData)
 {
 #ifdef WITH_ANARI_USD_MIDDLEWARE
+    // ParseMutex is taken only around the C-call below (brace-scoped), not the whole
+    // function — this lets the single-threaded C->UE conversion overlap the next parse.
+    // (Uses ParseMutex, not the general MiddlewareMutex, so a long parse on a background
+    // thread never stalls game-thread ops.)
+
     if (!bIsInitialized.load())
     {
         UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Middleware not initialized"));
@@ -738,8 +769,14 @@ bool UJUSYNCSubsystem::LoadUSDFromBuffer(const TArray<uint8>& Buffer, const FStr
     CMeshData* CMeshes = nullptr;
     size_t MeshCount = 0;
     
-    // Call C interface
-    int Result = LoadUSDBuffer_C(Buffer.GetData(), Buffer.Num(), FilenameCStr, &CMeshes, &MeshCount);
+    // Serialize ONLY the tinyusdz C-call (not thread-safe for concurrent loads). The
+    // single-threaded conversion below runs OUTSIDE the lock so the next queued parse can
+    // overlap this file's conversion and keep all cores busy.
+    int Result = 0;
+    {
+        FScopeLock Lock(&ParseMutex);
+        Result = LoadUSDBuffer_C(Buffer.GetData(), Buffer.Num(), FilenameCStr, &CMeshes, &MeshCount);
+    }
     
     if (Result == 1 && CMeshes && MeshCount > 0)
     {
@@ -838,7 +875,7 @@ bool UJUSYNCSubsystem::LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const 
         return false;
     }
 
-    FScopeLock Lock(&MiddlewareMutex);
+    FScopeLock Lock(&ParseMutex);
 
     FTCHARToUTF8 FilenameConverter(*Filename);
     const char* FilenameCStr = FilenameConverter.Get();
@@ -934,6 +971,129 @@ bool UJUSYNCSubsystem::LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const 
     return true;
 #else
     UE_LOG(LogTemp, Warning, TEXT("JUSYNC: LoadUSDFullFromBuffer called but middleware not available"));
+    return false;
+#endif
+}
+
+bool UJUSYNCSubsystem::LoadUSDFullFromBufferNoCopy(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData)
+{
+#ifdef WITH_ANARI_USD_MIDDLEWARE
+    if (!bIsInitialized.load())
+    {
+        UE_LOG(LogTemp, Error, TEXT("JUSYNC: LoadUSDFullFromBufferNoCopy called but middleware is not initialized"));
+        return false;
+    }
+
+    OutMeshData.Empty();
+    OutPointCloudData.Empty();
+
+    if (Buffer.Num() == 0)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("JUSYNC: LoadUSDFullFromBufferNoCopy called with empty buffer"));
+        return false;
+    }
+
+    FTCHARToUTF8 FilenameConverter(*Filename);
+    const char* FilenameCStr = FilenameConverter.Get();
+
+    CMeshData* CMeshes = nullptr;
+    size_t MeshCount = 0;
+    CPointCloudData* CClouds = nullptr;
+    size_t CloudCount = 0;
+
+    // Serialize ONLY the tinyusdz C-call (not thread-safe for concurrent loads). The
+    // single-threaded C->UE conversion below deliberately runs OUTSIDE the lock so the
+    // next queued file's parse can overlap this file's conversion and keep all cores busy.
+    int Result = 0;
+    {
+        FScopeLock Lock(&ParseMutex);
+        // Zero-copy variant — bypasses the std::vector copy at the C API boundary.
+        Result = LoadUSDFullFromPointer_C(
+            Buffer.GetData(), Buffer.Num(), FilenameCStr,
+            &CMeshes, &MeshCount,
+            &CClouds, &CloudCount
+        );
+    }
+
+    bool bSuccess = Result == 1;
+
+    if (!bSuccess)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("JUSYNC: LoadUSDFullFromBufferNoCopy failed for '%s' (buffer=%d bytes, C_result=%d MeshCount=%llu CloudCount=%llu)"),
+            *Filename, Buffer.Num(), Result, (uint64)MeshCount, (uint64)CloudCount);
+        if (CMeshes) FreeMeshData_C(CMeshes, MeshCount);
+        if (CClouds) FreePointCloudData_C(CClouds, CloudCount);
+        return false;
+    }
+
+    // Convert meshes
+    if (CMeshes && MeshCount > 0)
+    {
+        OutMeshData.Reserve(MeshCount);
+        for (size_t i = 0; i < MeshCount; ++i)
+        {
+            FJUSYNCMeshData UEMeshData = ConvertCMeshDataToUE_Helper(CMeshes[i]);
+            OutMeshData.Add(UEMeshData);
+        }
+        FreeMeshData_C(CMeshes, MeshCount);
+    }
+
+    // Convert point clouds
+    if (CClouds && CloudCount > 0)
+    {
+        OutPointCloudData.SetNum(static_cast<int32>(CloudCount));
+        for (size_t i = 0; i < CloudCount; ++i)
+        {
+            FJUSYNCPointCloudData& pc = OutPointCloudData[i];
+            const CPointCloudData& cpc = CClouds[i];
+
+            pc.ElementName = ANSI_TO_TCHAR(cpc.element_name);
+            pc.TypeName = ANSI_TO_TCHAR(cpc.type_name);
+            pc.PointCount = static_cast<int32>(cpc.points_count);
+            pc.bHasColors = cpc.has_colors != 0;
+            pc.bHasNormals = cpc.has_normals != 0;
+            pc.BoundingBoxMin = FVector(cpc.bounding_box_min[0], cpc.bounding_box_min[2], -cpc.bounding_box_min[1]);
+            pc.BoundingBoxMax = FVector(cpc.bounding_box_max[0], cpc.bounding_box_max[2], -cpc.bounding_box_max[1]);
+
+            if (cpc.points_count > 0 && cpc.positions)
+            {
+                pc.Positions.SetNum(pc.PointCount);
+                for (size_t j = 0; j < cpc.points_count; ++j)
+                {
+                    float usdX = cpc.positions[j * 3 + 0];
+                    float usdY = cpc.positions[j * 3 + 1];
+                    float usdZ = cpc.positions[j * 3 + 2];
+                    pc.Positions[j] = FVector(usdX, usdZ, -usdY);
+                }
+            }
+
+            if (cpc.has_colors && cpc.colors && pc.PointCount > 0)
+            {
+                pc.Colors.SetNum(pc.PointCount);
+                for (int32 j = 0; j < pc.PointCount; ++j)
+                {
+                    float r = cpc.colors[j * 4 + 0] * 255.0f;
+                    float g = cpc.colors[j * 4 + 1] * 255.0f;
+                    float b = cpc.colors[j * 4 + 2] * 255.0f;
+                    float a = cpc.colors[j * 4 + 3] * 255.0f;
+                    pc.Colors[j] = FColor(static_cast<uint8>(r), static_cast<uint8>(g), static_cast<uint8>(b), static_cast<uint8>(a));
+                }
+            }
+
+            if (cpc.has_widths && cpc.widths)
+            {
+                pc.Widths.SetNum(pc.PointCount);
+                std::memcpy(pc.Widths.GetData(), cpc.widths, pc.PointCount * sizeof(float));
+            }
+        }
+        FreePointCloudData_C(CClouds, CloudCount);
+    }
+
+    UE_LOG(LogTemp, Log, TEXT("JUSYNC: LoadUSDFullFromBufferNoCopy: %d meshes + %d point clouds from '%s' (zero-copy)"),
+           OutMeshData.Num(), OutPointCloudData.Num(), *Filename);
+    return true;
+#else
+    UE_LOG(LogTemp, Warning, TEXT("JUSYNC: LoadUSDFullFromBufferNoCopy called but middleware not available"));
     return false;
 #endif
 }
@@ -1091,7 +1251,7 @@ void UJUSYNCSubsystem::ApplyCachedGradientToSpawner()
     int Result = GetCachedGradientTexture_C(&gradientData, &gradientSize, &width, &height);
     if (Result != 1 || !gradientData || gradientSize == 0 || width < 1 || height < 1)
     {
-        UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC: No cached gradient texture in middleware"));
+        UE_LOG(LogJUSYNC, Verbose, TEXT("JUSYNC: No cached gradient texture in middleware (expected if no PC parsed yet)"));
         return;
     }
 
@@ -3212,7 +3372,7 @@ bool UJUSYNCSubsystem::RequestFileListWithSizes(int32 TargetRank, int32 TimeoutM
     return false;
 }
 
-bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks)
+bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks, TArray<uint64>* OutHashLo, TArray<uint64>* OutHashHi)
 {
     // âœ… FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
     
@@ -3287,7 +3447,9 @@ bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 
         OutFiles.Reserve(FileCount);
         OutSizes.Reserve(FileCount);
         OutRanks.Reserve(FileCount);
-        
+        if (OutHashLo) OutHashLo->Reserve(FileCount);
+        if (OutHashHi) OutHashHi->Reserve(FileCount);
+
         for (size_t i = 0; i < FileCount; ++i)
         {
             if (FileList[i])
@@ -3295,6 +3457,8 @@ bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 
                 OutFiles.Add(FString(UTF8_TO_TCHAR(FileList[i])));
                 OutSizes.Add(static_cast<int64>(FileSizes[i]));
                 OutRanks.Add(static_cast<int32>(FileRanks[i]));
+                if (OutHashLo && FileHashLo) OutHashLo->Add(FileHashLo[i]);
+                if (OutHashHi && FileHashHi) OutHashHi->Add(FileHashHi[i]);
             }
         }
         
@@ -3309,7 +3473,7 @@ bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 
         UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to request file list with sizes and ranks (Result: %d)"), Result);
         if (FileList || FileSizes || FileRanks)
         {
-            FreeFileListWithSizesAndRanks_C(FileList, FileSizes, FileRanks, nullptr, nullptr, FileCount);
+            FreeFileListWithSizesAndRanks_C(FileList, FileSizes, FileRanks, FileHashLo, FileHashHi, FileCount);
         }
     }
 #endif

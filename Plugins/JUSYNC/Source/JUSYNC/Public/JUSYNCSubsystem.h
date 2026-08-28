@@ -93,6 +93,12 @@ public:
 
     bool LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData);
 
+    /**
+     * Zero-copy variant: bypasses std::vector copy at C API boundary.
+     * Uses LoadUSDFullFromPointer_C internally.
+     */
+    bool LoadUSDFullFromBufferNoCopy(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData);
+
     // Texture Processing
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Texture")
     FJUSYNCTextureData CreateTextureFromBuffer(const TArray<uint8>& Buffer);
@@ -256,8 +262,7 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Broker", DisplayName = "Request File List With Sizes (Sync)")
     bool RequestFileListWithSizes(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes);
 
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC Broker", DisplayName = "Request File List With Sizes And Ranks (Sync)")
-    bool RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks);
+    bool RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks, TArray<uint64>* OutHashLo = nullptr, TArray<uint64>* OutHashHi = nullptr);
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Broker", DisplayName = "Request File (Sync)")
     bool RequestFile(const FString& Filename, int32 TargetRank, int32 TimeoutMs, TArray<uint8>& OutData);
@@ -388,6 +393,12 @@ private:
 #endif
 
     mutable FCriticalSection MiddlewareMutex;
+
+    // Serializes USD parsing. tinyusdz is NOT thread-safe, so parses must run one-at-a-time.
+    // Deliberately SEPARATE from MiddlewareMutex: a single parse (up to ~500MB) runs on a
+    // background thread, and holding the general MiddlewareMutex for its whole duration would
+    // stall any game-thread state op (init/connect/worker-list) that also takes it.
+    mutable FCriticalSection ParseMutex;
     std::atomic<bool> bIsInitialized{ false };
 
     // Material caching

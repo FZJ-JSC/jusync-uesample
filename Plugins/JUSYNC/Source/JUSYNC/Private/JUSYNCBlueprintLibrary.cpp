@@ -880,6 +880,53 @@ bool UJUSYNCBlueprintLibrary::LoadUSDFullFromBuffer(const TArray<uint8>& Buffer,
     return bResult;
 }
 
+/**
+ * Zero-copy variant: bypasses std::vector copy at C API boundary.
+ * Accepts raw TArray<uint8> data pointer directly to UsdProcessor::LoadUSDBufferFromRaw.
+ * Use this for performance-critical paths with large payloads.
+ */
+bool UJUSYNCBlueprintLibrary::LoadUSDFullFromBufferNoCopy(const TArray<uint8>& Buffer, const FString& Filename,
+    TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData, FString& OutPreview)
+{
+    if (!ValidateBufferSize(Buffer, TEXT("LoadUSDFullFromBufferNoCopy")))
+    {
+        return false;
+    }
+
+#if JUSYNC_ENABLE_USD_PREVIEW
+    OutPreview = GetUSDAPreview(Buffer, 15);
+#else
+    OutPreview = TEXT("USD preview disabled for performance");
+#endif
+
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Subsystem not available for full USD loading (no-copy)"));
+        return false;
+    }
+
+    bool bResult = Subsystem->LoadUSDFullFromBufferNoCopy(Buffer, Filename, OutMeshData, OutPointCloudData);
+
+    if (bResult)
+    {
+        int32 TotalMeshes = 0;
+        for (const FJUSYNCMeshData& m : OutMeshData)
+        {
+            if (m.IsValid()) TotalMeshes++;
+        }
+        int32 TotalPCs = 0;
+        for (const FJUSYNCPointCloudData& pc : OutPointCloudData)
+        {
+            if (pc.IsValid()) TotalPCs++;
+        }
+        UE_LOG(LogJUSYNC, Log, TEXT("Successfully loaded %d meshes + %d point clouds from USD '%s' (zero-copy)"),
+               TotalMeshes, TotalPCs, *Filename);
+    }
+
+    return bResult;
+}
+
 FString UJUSYNCBlueprintLibrary::GetUSDAPreview(const TArray<uint8>& Buffer, int32 MaxLines)
 {
     return ExtractUSDAPreview(Buffer, MaxLines);
@@ -1352,10 +1399,13 @@ bool UJUSYNCBlueprintLibrary::CheckForReceivedFiles(TArray<FJUSYNCFileData>& Out
 
     if (ReceivedFiles.Num() > 0)
     {
-        OutReceivedFiles = ReceivedFiles;
+        // Move (not deep-copy) the accumulated files into the out param. This avoids a full
+        // memcpy of every file byte AND drains ReceivedFiles so it can't grow without bound
+        // across a long session (it was only reset by ClearReceivedData before).
+        OutReceivedFiles = MoveTemp(ReceivedFiles);
 
         // Log received files for debugging
-        for (const FJUSYNCFileData& FileData : ReceivedFiles)
+        for (const FJUSYNCFileData& FileData : OutReceivedFiles)
         {
             FString Message = FString::Printf(TEXT("Received File: %s (%d bytes, %s)"),
                 *FileData.Filename, FileData.Data.Num(), *FileData.FileType);
@@ -1375,10 +1425,12 @@ bool UJUSYNCBlueprintLibrary::CheckForReceivedMessages(TArray<FString>& OutRecei
 
     if (ReceivedMessages.Num() > 0)
     {
-        OutReceivedMessages = ReceivedMessages;
+        // Move (not deep-copy) the accumulated messages into the out param, and drain
+        // ReceivedMessages so it can't grow without bound (was only reset by ClearReceivedData).
+        OutReceivedMessages = MoveTemp(ReceivedMessages);
 
         // Log received messages for debugging
-        for (const FString& Message : ReceivedMessages)
+        for (const FString& Message : OutReceivedMessages)
         {
             UE_LOG(LogJUSYNC, Log, TEXT("Received Message: %s"), *Message);
             // Use FLinearColor constructor for Cyan color
