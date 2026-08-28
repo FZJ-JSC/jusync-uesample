@@ -12,7 +12,8 @@
 #include <chrono>
 #include <functional>
 #include <map>
-#include <queue>
+#include <deque>
+#include <unordered_map>
 #include <condition_variable>
 #include <thread>
 
@@ -29,9 +30,6 @@
 #endif
 
 namespace anari_usd_middleware {
-
-// Forward declaration
-class ParallelDownloadManager;
 
 /**
  * ANARI USD ZMQ DEALER Client
@@ -59,6 +57,18 @@ public:
     using FileListWithSizesCallback = std::function<void(const std::vector<FileInfo>& files)>;
     using ErrorCallback = std::function<void(const std::string& error)>;
     
+    // Notification callback types (for live update support, V2-aware)
+    using NotificationCallback = std::function<void(uint32_t messageType,
+                                                     int32_t sourceRank,
+                                                     const std::string& filename,
+                                                     uint64_t fileSize,
+                                                     uint64_t timestamp,
+                                                     uint64_t hashLo,
+                                                     uint64_t hashHi,
+                                                     uint64_t hashPrevLo,
+                                                     uint64_t hashPrevHi,
+                                                     bool hasOldData)>;
+
     // Worker status callback types
     using WorkerStatusCallback = std::function<void(int32_t rank,
                                                     uint32_t status,
@@ -168,6 +178,9 @@ public:
     bool testConnection();
     void updateHealthStatus();
 
+    // Notification callbacks (live update support)
+    void setNotificationCallback(NotificationCallback callback);
+
     // Parallel download support
     zmq::socket_t* getSocket() { return zmqSocket.get(); }
     const zmq::socket_t* getSocket() const { return zmqSocket.get(); }
@@ -181,6 +194,14 @@ public:
         std::function<void(const std::string&, const std::string&)> error_callback = nullptr,
         int timeout_ms = 30000);
 
+    // Async file request — fire-and-forget, never blocks calling thread.
+    // Callbacks are invoked from the dispatcher thread when responses arrive.
+    bool requestFileAsync(const std::string& filename, int32_t targetRank,
+                           FileChunkCallback chunkCallback,
+                           FileCompleteCallback completeCallback,
+                           ErrorCallback errorCallback = nullptr,
+                           int timeoutMs = 30000);
+
 private:
     // Connection management helpers
     bool configureSocket(int timeoutMs);
@@ -189,7 +210,6 @@ private:
 
     // Message sending helpers
     bool sendRequest(const void* data, size_t size, uint32_t requestId);
-    bool receiveResponse(void* buffer, size_t size, int timeoutMs);
 
     // Response handling
     bool handleFileChunkResponse(const ZmqFileChunk& chunk,
@@ -208,7 +228,6 @@ private:
 
     // Request ID management
     uint32_t generateRequestId();
-    bool waitForResponse(uint32_t requestId, int timeoutMs);
 
     // Platform-specific configuration
 #if PLATFORM_WINDOWS
@@ -220,7 +239,6 @@ private:
     // Member variables
     std::unique_ptr<zmq::context_t> zmqContext;
     std::unique_ptr<zmq::socket_t> zmqSocket;
-    std::unique_ptr<ParallelDownloadManager> parallelDownloadManager;
 
     // Connection state
     std::atomic<ConnectionStatus> connectionStatus{ConnectionStatus::Disconnected};
@@ -239,17 +257,43 @@ private:
     std::atomic<uint32_t> nextRequestId{1};
     std::map<uint32_t, bool> pendingRequests;
 
-    // Out-of-order response queue for multi-threaded safety.
-    // A dedicated dispatcher thread continuously pulls frames from the ZMQ
-    // socket and enqueues them here.  Request threads never call recv() —
-    // they only dequeue from this queue, making the receive path truly async.
+    // Incoming frame pair pulled by the dispatcher: <delimiterFrame, dataFrame>.
+    using FramePair = std::pair<std::vector<uint8_t>, std::vector<uint8_t>>;
+    using FramePairPtr = std::shared_ptr<FramePair>;
+
+    // Out-of-order response buffering for multi-threaded safety.
+    // A dedicated dispatcher thread continuously pulls frame pairs from the ZMQ
+    // socket and indexes them by request_id (O(1) lookup for requesters).
+    // Request threads never call recv() — they only dequeue from this index,
+    // making the receive path truly async and contention-free.
+    //
+    // request_id 0 is reserved for the raw-string GET_WORKERS response, which
+    // carries no ANARI magic/request_id, so it is routed to a separate FIFO.
     mutable std::mutex responseQueueMutex;
     std::condition_variable responseQueueCv;
-    std::queue<std::shared_ptr<std::pair<std::vector<uint8_t>, /*delimiterFrame*/ std::vector<uint8_t>/*dataFrame*/>>> responseQueue;
+    std::unordered_map<uint32_t, std::deque<FramePairPtr>> responseByRequest;
+    std::deque<FramePairPtr> noIdResponseQueue;
+    std::atomic<size_t> totalQueuedFrames{0};
+    std::atomic<int64_t> lastQueueWarnMs{0};
 
     // Dispatcher thread — owns ALL ZMQ recv operations.
     std::thread dispatchThread;
     std::atomic<bool> dispatcherActive{false};
+
+    // Bounded parallel-download worker pool used by requestFilesParallel.
+    // Owned by the client and torn down in cleanup() BEFORE the socket closes,
+    // so in-flight download threads are always joined and cannot outlive the
+    // ZMQ context.
+    struct FileDownloadTask {
+        std::function<void()> run;
+    };
+    void downloadWorkerLoop();
+    std::atomic<bool> downloadPoolActive{false};
+    std::deque<FileDownloadTask> downloadTaskQueue;
+    std::mutex downloadTaskMutex;
+    std::condition_variable downloadTaskCv;
+    std::vector<std::thread> downloadWorkers;
+    static constexpr int MAX_PARALLEL_DOWNLOADS = 8;
 private:
     // Dedicated background dispatcher: continuously polls the ZMQ socket
     // and enqueues every incoming frame pair into responseQueue.
@@ -260,8 +304,15 @@ private:
     std::atomic<size_t> maxMessageSize{104857600}; // 100MB default
     std::chrono::steady_clock::time_point lastHealthCheck;
 
+    // Notification callback (live update support)
+    std::mutex notificationCallbackMutex;
+    NotificationCallback notificationCallback;
+
     // Default chunk size for file requests
-    static constexpr uint32_t DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024; // 4MB
+    // Larger chunks = fewer ZMQ round-trips through the (single-loop) broker:
+    // a 76MB file is ~2-3 messages instead of 19. The broker/worker honor the
+    // requested size (capped server-side at 128MB).
+    static constexpr uint32_t DEFAULT_CHUNK_SIZE = 32 * 1024 * 1024; // 32MB
 
 private:
     // Extract request_id from a data frame (first 4 bytes = magic, next 4 = type, next 4 = request_id)
@@ -280,8 +331,36 @@ private:
 
     // Attempt to dequeue a matching message (non-blocking).
     bool tryDequeueMatching(uint32_t requestId,
-                            std::vector<uint8_t>& outDelimiter,
-                            std::vector<uint8_t>& outData);
+                             std::vector<uint8_t>& outDelimiter,
+                             std::vector<uint8_t>& outData);
+
+    // Handle notification message (called from dispatcher thread)
+    void handleNotification(const std::vector<uint8_t>& data);
+
+    // Async file download frame handler — called from dispatcher thread.
+    // Returns true if frame was consumed by an async download, false to forward to blocking queue.
+    bool asyncFileFrameHandler(uint32_t requestId, const uint8_t* data, size_t size, uint32_t msgType);
+
+private:
+    // Async file state for non-blocking downloads.
+    struct AsyncFileState {
+        uint32_t request_id;
+        std::string filename;
+        int32_t target_rank;
+        std::chrono::steady_clock::time_point deadline;
+        std::vector<uint8_t> accumulated_data;
+        uint64_t expected_file_size = 0;
+        uint64_t received_bytes = 0;
+        bool completed = false;
+        bool failed = false;
+        FileChunkCallback chunk_callback;
+        FileCompleteCallback complete_callback;
+        ErrorCallback error_callback;
+    };
+
+    // Async download tracking — populated by requestFileAsync, consumed by dispatcher.
+    std::mutex asyncFilesMutex;
+    std::map<uint32_t, std::unique_ptr<AsyncFileState>> asyncFiles;
 };
 
 } // namespace anari_usd_middleware

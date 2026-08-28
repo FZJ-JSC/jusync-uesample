@@ -306,6 +306,31 @@ ANARI_USD_MIDDLEWARE_C_API int LoadUSDFull_C(
     CPointCloudData** out_clouds,
     size_t* out_cloud_count);
 
+/**
+ * Zero-copy variant: avoids copies at the C API boundary and, when the USD
+ * content contains none of the known preprocessing quirks (`0: None`,
+ * `asset:images/`, `texCoord2f`), parses the caller's buffer in place with
+ * ZERO copies. Accepts raw pointer + size directly (e.g. from TArray<uint8>).
+ * Internally delegates to UsdProcessor::LoadUSDBufferFromRaw.
+ *
+ * @param buffer Raw USD buffer data (must stay alive during call)
+ * @param buffer_size Size of buffer in bytes
+ * @param filename Original filename for format detection
+ * @param out_meshes Output: allocated array of CMeshData (NULL if no meshes)
+ * @param out_mesh_count Output: number of meshes extracted
+ * @param out_clouds Output: allocated array of CPointCloudData (NULL if no point clouds)
+ * @param out_cloud_count Output: number of point clouds extracted
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int LoadUSDFullFromPointer_C(
+    const unsigned char* buffer,
+    size_t buffer_size,
+    const char* filename,
+    CMeshData** out_meshes,
+    size_t* out_mesh_count,
+    CPointCloudData** out_clouds,
+    size_t* out_cloud_count);
+
 // ============================================================================
 // USD PROCESSING FUNCTIONS WITH COLLISION SUPPORT
 // ============================================================================
@@ -630,21 +655,6 @@ ANARI_USD_MIDDLEWARE_C_API int ValidateUSDFormat_C(const unsigned char* buffer,
  */
 ANARI_USD_MIDDLEWARE_C_API const char* GetSupportedUSDExtensions_C(void);
 
-/**
- * Reset processing statistics
- * Clears all internal counters and statistics
- * Useful for performance monitoring and testing
- */
-ANARI_USD_MIDDLEWARE_C_API void ResetProcessingStats_C(void);
-
-/**
- * Get processing statistics as formatted string
- * Returns detailed information about processed files, meshes, errors, etc.
- *
- * @return Pointer to statistics string (valid until next call)
- */
-ANARI_USD_MIDDLEWARE_C_API const char* GetProcessingStats_C(void);
-
 // ============================================================================
 // BROKER CONNECTION AND FILE REQUEST FUNCTIONS
 // ============================================================================
@@ -779,6 +789,47 @@ ANARI_USD_MIDDLEWARE_C_API int RequestFile_C(
     int32_t target_rank,
     unsigned char** out_data,
     size_t* out_size,
+    int timeout_ms);
+
+// ============================================================================
+// ASYNC FILE DOWNLOAD (Non-Blocking)
+// ============================================================================
+
+/**
+ * Callback signature for async file complete notifications.
+ * Called from the dispatcher thread when a file download finishes or fails.
+ * UE5 must marshal to game thread before using the data.
+ *
+ * @param filename Name of the downloaded file
+ * @param data Pointer to file data (valid until callback returns, DO NOT store)
+ * @param data_size Size of file data in bytes
+ * @param success 1 if download succeeded, 0 if failed
+ * @param userData Opaque pointer passed through from AsyncRequestFile_C
+ */
+typedef void (*AsyncFileComplete_C)(
+    const char* filename,
+    const unsigned char* data,
+    size_t data_size,
+    int success,
+    void* userData);
+
+/**
+ * Async (non-blocking) file request that fires immediately and returns a download handle.
+ * When the download completes or fails, the provided completeCallback is invoked from the
+ * dispatcher thread.
+ *
+ * @param filename Name of file to request
+ * @param target_rank Target worker rank
+ * @param completeCallback Callback to invoke when download completes
+ * @param userData Opaque pointer passed to callback
+ * @param timeout_ms Timeout in milliseconds (size-based recommended)
+ * @return Positive download_id on success (for tracking), 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int AsyncRequestFile_C(
+    const char* filename,
+    int32_t target_rank,
+    AsyncFileComplete_C completeCallback,
+    void* userData,
     int timeout_ms);
 
 /**
