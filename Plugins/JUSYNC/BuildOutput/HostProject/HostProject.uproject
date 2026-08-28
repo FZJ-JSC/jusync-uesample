@@ -1,7 +1,0 @@
-{
-  "FileVersion": 3,
-  "Plugins": [
-    { "Name": "JUSYNC", "Enabled": true },
-    { "Name": "RealtimeMeshComponent", "Enabled": true }
-  ]
-}
