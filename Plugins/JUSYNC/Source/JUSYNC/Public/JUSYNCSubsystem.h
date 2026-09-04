@@ -126,6 +126,18 @@ public:
         URealtimeMeshComponent* RealtimeMeshComponent
     );
 
+    /**
+     * In-place RealtimeMesh update. If the component already owns a
+     * URealtimeMeshSimple, the existing USDGroup section group is updated instead
+     * of destroying/recreating the actor. If no mesh exists yet, this creates it.
+     */
+    bool UpdateRealtimeMeshFromJUSYNC(
+        const FJUSYNCMeshData& MeshData,
+        URealtimeMeshComponent* RealtimeMeshComponent,
+        UMaterialInterface* MaterialToApply,
+        RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams = nullptr
+    );
+
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Mesh|Legacy", DisplayName = "Batch Create Realtime Meshes From JUSYNC (Legacy)")
     bool BatchCreateRealtimeMeshesFromJUSYNC(const TArray<FJUSYNCMeshData>& MeshDataArray, const TArray<URealtimeMeshComponent*>& MeshComponents);

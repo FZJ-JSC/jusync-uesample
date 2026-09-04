@@ -12,7 +12,8 @@
 #include "Misc/FileHelper.h"
 #include "Engine/GameInstance.h"
 #include "Kismet/GameplayStatics.h"
-#include "RealtimeMeshSimple.h" 
+#include "RealtimeMeshSimple.h"
+#include "JUSYNCStreamBuilder.h"
 #include "UObject/UObjectGlobals.h"  // For MakeUniqueObjectName
 #include "Misc/DateTime.h"  // For FDateTime
 #include "HAL/PlatformTime.h"  // For FPlatformTime
@@ -504,7 +505,7 @@ void UJUSYNCSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     // Initialize async point cloud spawner
     PCSpawner = MakeUnique<FJUSYNCPointCloudSpawner>(TWeakObjectPtr<UJUSYNCSubsystem>(this));
     PCSpawner->SetMaxPoolSize(16);
-    PCSpawner->SetBudgetMs(500.0f);
+    PCSpawner->SetBudgetMs(33.0f);
 
     // Set LiDAR point budget to handle many simultaneous point clouds (100M+ points)
     // Prevents the LOD manager from culling distant clouds due to adaptive budget scaling
@@ -526,7 +527,12 @@ void UJUSYNCSubsystem::Deinitialize()
     
     // Clear global instance
     g_SubsystemInstance.store(nullptr);
-    
+
+    if (PCSpawner.IsValid())
+    {
+        PCSpawner->WaitForCompletion(5.0f);
+    }
+
     Super::Deinitialize();
     UE_LOG(LogJUSYNC, Log, TEXT("JUSYNCSubsystem deinitialized"));
 }
@@ -1416,6 +1422,95 @@ void RecalculateNormals(FJUSYNCMeshData& MeshData)
     UE_LOG(LogJUSYNC, Log, TEXT("Recalculated normals with correct CCW winding"));
 }
 
+bool UJUSYNCSubsystem::UpdateRealtimeMeshFromJUSYNC(
+    const FJUSYNCMeshData& MeshData,
+    URealtimeMeshComponent* RealtimeMeshComponent,
+    UMaterialInterface* MaterialToApply,
+    RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams)
+{
+    if (!RealtimeMeshComponent || !RealtimeMeshComponent->IsValidLowLevel())
+    {
+        return false;
+    }
+    if (!MeshData.IsValid())
+    {
+        return false;
+    }
+
+    const double UpdateStart = FPlatformTime::Seconds();
+    RealtimeMesh::FRealtimeMeshStreamSet Streams;
+    if (PrebuiltStreams)
+    {
+        Streams = MoveTemp(*PrebuiltStreams);
+    }
+    else
+    {
+        const double BuildStart = FPlatformTime::Seconds();
+        if (!JUSYNCBuildRealtimeMeshStreams(MeshData, Streams))
+        {
+            return false;
+        }
+        UE_LOG(LogJUSYNC, Verbose, TEXT("JUSYNC PERF BuildStreams '%s' %.3f ms"),
+               *MeshData.ElementName, (FPlatformTime::Seconds() - BuildStart) * 1000.0);
+    }
+
+    URealtimeMeshSimple* RealtimeMesh = Cast<URealtimeMeshSimple>(RealtimeMeshComponent->GetRealtimeMesh());
+    if (!RealtimeMesh)
+    {
+        RealtimeMesh = RealtimeMeshComponent->InitializeRealtimeMesh<URealtimeMeshSimple>();
+    }
+    if (!RealtimeMesh)
+    {
+        return false;
+    }
+
+    RealtimeMesh->SetupMaterialSlot(0, TEXT("PrimaryMaterial"));
+
+    UMaterialInterface* ActiveMaterial = MaterialToApply ? MaterialToApply : RealtimeMeshComponent->GetMaterial(0);
+    if (!ActiveMaterial)
+    {
+        ActiveMaterial = GetCachedMaterial(TEXT("/Game/Materials/M_VertexColor"));
+        if (!ActiveMaterial)
+        {
+            UMaterialInterface* DefaultMat = GetCachedMaterial(TEXT("/Engine/EngineMaterials/DefaultMaterial"));
+            if (DefaultMat)
+            {
+                auto* DynMat = UMaterialInstanceDynamic::Create(DefaultMat, RealtimeMeshComponent);
+                if (DynMat)
+                {
+                    DynMat->SetScalarParameterValue(TEXT("UseVertexColor"), 1.0f);
+                    ActiveMaterial = DynMat;
+                }
+            }
+        }
+    }
+    const FRealtimeMeshSectionGroupKey GroupKey = FRealtimeMeshSectionGroupKey::Create(0, TEXT("USDGroup"));
+    const FRealtimeMeshSectionKey SectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 0);
+
+    if (RealtimeMesh->GetSectionGroup(GroupKey))
+    {
+        RealtimeMesh->UpdateSectionGroup(GroupKey, MoveTemp(Streams));
+    }
+    else
+    {
+        RealtimeMesh->CreateSectionGroup(GroupKey, MoveTemp(Streams));
+    }
+
+    FRealtimeMeshSectionConfig SectionConfig(0);
+    SectionConfig.bIsVisible = true;
+    SectionConfig.bCastsShadow = true;
+    RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, false);
+
+    if (ActiveMaterial)
+    {
+        RealtimeMeshComponent->SetMaterial(0, ActiveMaterial);
+    }
+
+    UE_LOG(LogJUSYNC, Verbose, TEXT("JUSYNC PERF UpdateRealtimeMesh '%s' %.3f ms"),
+           *MeshData.ElementName, (FPlatformTime::Seconds() - UpdateStart) * 1000.0);
+    return true;
+}
+
 bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNC(
     const FJUSYNCMeshData& InMeshData,
     URealtimeMeshComponent* RealtimeMeshComponent)
@@ -1507,81 +1602,20 @@ bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNC(
 
 
     RealtimeMesh::FRealtimeMeshStreamSet Streams;
-    auto Builder = RealtimeMesh::TRealtimeMeshBuilderLocal<uint32>(Streams);
-    Builder.EnableTangents();
-    Builder.EnableTexCoords();
-    Builder.EnableColors();
-    Builder.EnablePolyGroups();
-
-    // Add vertices and attributes - OPTIMIZED for performance
-    // Pre-calculate common values to avoid repeated function calls
-    const bool bHasNormals = MeshData.HasNormals();
-    const bool bHasUVs = MeshData.HasUVs();
-    const bool bHasVertexColors = MeshData.HasVertexColors();
-    
-    for (int32 i = 0; i < FinalVertexCount; ++i)
+    if (!JUSYNCBuildRealtimeMeshStreams(MeshData, Streams))
     {
-        Builder.AddVertex(FVector3f(MeshData.Vertices[i]));
-
-        // Normals - optimized check
-        FVector3f N = bHasNormals && MeshData.Normals.IsValidIndex(i) 
-            ? FVector3f(MeshData.Normals[i]) 
-            : FVector3f(0.0f, 0.0f, 1.0f); // Default up vector
-        Builder.SetNormal(i, N);
-
-        // UVs - optimized check
-        if (bHasUVs && MeshData.UVs.IsValidIndex(i))
-        {
-            Builder.SetTexCoord(i, 0, FVector2DHalf(FVector2f(MeshData.UVs[i])));
-        }
-        else
-        {
-            Builder.SetTexCoord(i, 0, FVector2DHalf(FVector2f::ZeroVector));
-        }
-
-        // Colors - optimized check
-        if (bHasVertexColors && MeshData.VertexColors.IsValidIndex(i))
-        {
-            FColor VertexColor = MeshData.VertexColors[i];
-            Builder.SetColor(i, VertexColor);
-        }
-        else
-        {
-            Builder.SetColor(i, FColor::White);
-        }
-    }
-
-    // Add triangles - OPTIMIZED
-    const int32* TrianglesPtr = MeshData.Triangles.GetData();
-    for (int32 Face = 0; Face < FinalTriCount; ++Face)
-    {
-        int32 baseIdx = Face * 3;
-        int32 i0 = TrianglesPtr[baseIdx];
-        int32 i1 = TrianglesPtr[baseIdx + 1];
-        int32 i2 = TrianglesPtr[baseIdx + 2];
-        
-        // Fast bounds checking - most triangles will be valid
-        if (i0 < FinalVertexCount && i1 < FinalVertexCount && i2 < FinalVertexCount)
-        {
-            Builder.AddTriangle(i0, i1, i2);
-        }
-        else
-        {
-            UE_LOG(LogJUSYNC, Error, TEXT("âŒ Invalid triangle %d: [%d,%d,%d] vs %d vertices"), 
-                   Face, i0, i1, i2, FinalVertexCount);
-        }
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to build RealtimeMesh streams for '%s'"), *MeshData.ElementName);
+        return false;
     }
 
     // Finalize the mesh section
     const FRealtimeMeshSectionGroupKey GroupKey = FRealtimeMeshSectionGroupKey::Create(0, TEXT("USDGroup"));
     const FRealtimeMeshSectionKey SectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 0);
-    RealtimeMesh->CreateSectionGroup(GroupKey, Streams);
+    RealtimeMesh->CreateSectionGroup(GroupKey, MoveTemp(Streams));
     FRealtimeMeshSectionConfig SectionConfig(0);
     SectionConfig.bIsVisible = true;
     SectionConfig.bCastsShadow = true;
-    RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, true);
-    
-    RealtimeMeshComponent->MarkRenderStateDirty();
+    RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, false);
 
     // CRITICAL FIX (mirrors async path): section creation can drop the material
     // binding, so force reapplication of the pre-set material afterwards.
@@ -1734,13 +1768,13 @@ bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNCWithSplitting(
         }
         
         // Create section group
-        RealtimeMesh->CreateSectionGroup(GroupKey, Streams);
-        
+        RealtimeMesh->CreateSectionGroup(GroupKey, MoveTemp(Streams));
+
         // Configure section
         FRealtimeMeshSectionConfig SectionConfig(0);
         SectionConfig.bIsVisible = true;
         SectionConfig.bCastsShadow = true;
-        RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, true);
+        RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, false);
         
         UE_LOG(LogJUSYNC, Log, TEXT("  Created chunk %d: %d vertices, %d triangles"),
                ChunkIdx, VertexCount, TriangleCount);
@@ -2406,6 +2440,11 @@ AActor* UJUSYNCSubsystem::SpawnLidarPointCloudAtLocation(const FJUSYNCPointCloud
         Comp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
         Comp->ColorSource = ELidarPointCloudColorationMode::Data;
         Comp->PointSize = 1.0f;
+        Comp->SetPointShape(ELidarPointCloudSpriteShape::Circle);
+        if (PCSpawner.IsValid())
+        {
+            PCSpawner->ApplyVisualSettingsToComponent(Comp);
+        }
         // Disable node-based streaming culling so all loaded clouds render at any camera distance
         Comp->MinDepth = 0;
         Comp->MaxDepth = -1;
@@ -2423,15 +2462,19 @@ AActor* UJUSYNCSubsystem::SpawnLidarPointCloudAtLocation(const FJUSYNCPointCloud
     // Copy gradient LUT for thread-safe use (same as spawner path)
     TArray<FColor> PCLUT = PCSpawner.IsValid() ? PCSpawner->GetGradientLUT() : TArray<FColor>();
     bool bUseGradient = PCLUT.Num() > 0 && !bHasColors && Widths.Num() > 0;
+    FJUSYNCPointCloudSpawner* PCSpawnerPtr = PCSpawner.Get();
 
     TWeakObjectPtr<ALidarPointCloudActor> WeakActor = SpawnedActor;
     TWeakObjectPtr<ULidarPointCloudComponent> WeakComp = Comp;
     FString ElementNameForLog = PointCloudData.ElementName;
 
-    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [PointCount, Positions, Colors, bHasColors, Widths, WeakActor, WeakComp, PCLUT, bUseGradient, ElementNameForLog]()
-    {
-        if (!WeakActor.IsValid() || !WeakComp.IsValid()) return;
+    // UObject creation must happen on the game thread. The point array is still built asynchronously.
+    ULidarPointCloud* LidarCloud = NewObject<ULidarPointCloud>(SpawnedActor);
+    LidarCloud->SetOptimizedForDynamicData(true);
+    SpawnedActor->SetActorHiddenInGame(true);
 
+    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [PointCount, Positions, Colors, bHasColors, Widths, WeakActor, WeakComp, PCLUT, bUseGradient, ElementNameForLog, LidarCloud, PCSpawnerPtr]()
+    {
         // Build LiDAR points on background thread
         TArray<FLidarPointCloudPoint> Points;
         Points.SetNum(PointCount);
@@ -2500,17 +2543,25 @@ AActor* UJUSYNCSubsystem::SpawnLidarPointCloudAtLocation(const FJUSYNCPointCloud
             }
         }
 
-        // Create and set point cloud data
-        ULidarPointCloud* LidarCloud = ULidarPointCloud::CreateFromData(Points, false);
-
-        // Marshal back to game thread for component assignment
+        // Marshal back to game thread for data insertion and component assignment
         FFunctionGraphTask::CreateAndDispatchWhenReady(
-            [WeakActor, WeakComp, LidarCloud]()
+            [WeakActor, WeakComp, LidarCloud, Points = MoveTemp(Points), PCSpawnerPtr]() mutable
             {
-                if (WeakComp.IsValid() && LidarCloud)
+                if (!WeakComp.IsValid() || !LidarCloud)
                 {
-                    LidarCloud->RefreshBounds();
-                    WeakComp->SetPointCloud(LidarCloud);
+                    return;
+                }
+
+                const bool bDataAccepted = LidarCloud->SetData(Points);
+                WeakComp->SetPointCloud(LidarCloud);
+
+                if (WeakActor.IsValid() && bDataAccepted)
+                {
+                    if (PCSpawnerPtr)
+                    {
+                        PCSpawnerPtr->RequestNormalCalculation(LidarCloud, WeakActor.Get(), static_cast<int32>(Points.Num()));
+                    }
+                    WeakActor->SetActorHiddenInGame(false);
                 }
             },
             TStatId(), nullptr, ENamedThreads::GameThread);
@@ -2840,7 +2891,7 @@ void UJUSYNCSubsystem::ApplyProcessedMeshToComponent(const FProcessedMeshData& P
     FRealtimeMeshSectionConfig SectionConfig(0);
     SectionConfig.bIsVisible = true;
     SectionConfig.bCastsShadow = true;
-    RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, true);
+    RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, false);
     
     RealtimeMeshComponent->MarkRenderStateDirty();
     
