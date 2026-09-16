@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------------------
+# Git LFS configuration
+#
+# Files matching the patterns below are stored in Git LFS on new commits.
+# Every machine working on this repo needs:
+#   apt install git-lfs   (or brew install git-lfs / choco install git-lfs)
+#   git lfs install       (once, per machine)
+#
+# Note: files already in history keep their current storage until a
+# history migration is run (git lfs migrate import).
+# ---------------------------------------------------------------------------
+
+# --- Unreal Engine content ---
+*.uasset    filter=lfs diff=lfs -text
+*.umap      filter=lfs diff=lfs -text
+*.uexp      filter=lfs diff=lfs -text
+*.ktn       filter=lfs diff=lfs -text
+
+# --- USD / OpenUSD scene data ---
+*.usd       filter=lfs diff=lfs -text
+*.usda      filter=lfs diff=lfs -text
+*.usdc      filter=lfs diff=lfs -text
+*.usdz      filter=lfs diff=lfs -text
+*.urp       filter=lfs diff=lfs -text
+*.ztl       filter=lfs diff=lfs -text
+*.ztx       filter=lfs diff=lfs -text
+
+# --- Cooked / packaged data ---
+*.pak       filter=lfs diff=lfs -text
+*.ucas      filter=lfs diff=lfs -text
+*.utoc      filter=lfs diff=lfs -text
+
+# --- Textures ---
+*.png       filter=lfs diff=lfs -text
+*.jpg       filter=lfs diff=lfs -text
+*.jpeg      filter=lfs diff=lfs -text
+*.tga       filter=lfs diff=lfs -text
+*.psd       filter=lfs diff=lfs -text
+*.exr       filter=lfs diff=lfs -text
+*.hdr       filter=lfs diff=lfs -text
+
+# --- Audio / video ---
+*.mp4       filter=lfs diff=lfs -text
+*.mov       filter=lfs diff=lfs -text
+*.avi       filter=lfs diff=lfs -text
+*.mkv       filter=lfs diff=lfs -text
+*.wav       filter=lfs diff=lfs -text
+*.mp3       filter=lfs diff=lfs -text
+*.ogg       filter=lfs diff=lfs -text
+*.aiff      filter=lfs diff=lfs -text
+
+# --- DCC / interchange formats ---
+*.fbx       filter=lfs diff=lfs -text
+*.blend     filter=lfs diff=lfs -text
+*.abc       filter=lfs diff=lfs -text
+*.glb       filter=lfs diff=lfs -text
