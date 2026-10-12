@@ -27,6 +27,12 @@ private:
     void UnregisterModuleSystems();
     void CleanupPlatformSpecific();
 
+#if WITH_ANARI_USD_MIDDLEWARE
+    // Cmdline-driven headless perf harness (-JusyncAutoSpawner / -JusyncAutoDiag /
+    // -JusyncAutoQuit). Inert when no flags are present.
+    void MaybeStartHeadlessHarness();
+#endif
+
     // Cross-platform library validation
     bool ValidateLibraries(
         const FString& LibraryPath, const TArray<FString>& RequiredLibraries, const FString& Extension
@@ -40,9 +46,6 @@ private:
 
 #if PLATFORM_LINUX
     bool InitializeLinux();
-    void CheckLinuxDependencies();
 #endif
 
-    // Storage for loaded library handles
-    TMap<FString, void*> LoadedLibraryHandles;
 };

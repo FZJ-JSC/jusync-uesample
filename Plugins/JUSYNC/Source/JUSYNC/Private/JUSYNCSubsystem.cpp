@@ -1,4 +1,4 @@
-﻿#include "JUSYNCSubsystem.h"
+#include "JUSYNCSubsystem.h"
 #include "JUSYNCBlueprintLibrary.h"
 #include <cfloat>
 #include "Engine/Engine.h"
@@ -10,35 +10,238 @@
 #include "JUSYNCModule.h"
 #include "HAL/FileManager.h"
 #include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 #include "Engine/GameInstance.h"
 #include "Kismet/GameplayStatics.h"
-#include "RealtimeMeshSimple.h" 
-#include "UObject/UObjectGlobals.h"  // For MakeUniqueObjectName
-#include "Misc/DateTime.h"  // For FDateTime
-#include "HAL/PlatformTime.h"  // For FPlatformTime
-#include "HAL/PlatformProcess.h"  // For FPlatformProcess::Sleep
-#include "HAL/PlatformMisc.h"     // For FPlatformMisc::NumberOfCoresIncludingHyperthreads
-#include "Async/ParallelFor.h"    // For ParallelFor
-#include "GameFramework/Actor.h"   // For SpawnActor
+#include "RealtimeMeshSimple.h"
+#include "JUSYNCStreamBuilder.h"
+#include "UObject/UObjectGlobals.h"
+#include "Misc/DateTime.h"
+#include "HAL/PlatformTime.h"
+#include "HAL/PlatformProcess.h"
+#include "HAL/PlatformMisc.h"
+#include "Async/ParallelFor.h"
+#include "GameFramework/Actor.h"
+#include "Engine/World.h"
+#include "Engine/EngineBaseTypes.h"
+#include "Materials/Material.h"
+#include "Materials/MaterialInterface.h"
+#include "Materials/MaterialInstanceDynamic.h"
+#include "Materials/MaterialExpressionVertexColor.h"
+#include "Materials/MaterialExpressionTextureSampleParameter2D.h"
+#include "Materials/MaterialExpressionScalarParameter.h"
 #include "JUSYNCPointCloudSpawner.h"
+#include "JUSYNCMeshMorpher.h"
 #ifdef WITH_ANARI_USD_MIDDLEWARE
-#include "LidarPointCloud.h"        // For ULidarPointCloud
+#include "LidarPointCloud.h"
 #include "LidarPointCloudComponent.h"
 #include "LidarPointCloudActor.h"
 #endif
-#include <atomic>  // For std::atomic
+#include <atomic>
 
 // Include the C-wrapper header
 #ifdef WITH_ANARI_USD_MIDDLEWARE
 extern "C" {
 #include "AnariUsdMiddleware_C.h"
+#include "AnariUsdProtocol.h" // anari_usd_protocol::JusyncRawGeoHeader (raw point stream wire format)
 }
-#include <cstdint>  // For uint32_t
+#include <cstdint>
 #endif
 
 // Global callback handlers for C interface
 // Use atomic for thread-safe access from ZMQ callback threads
 static std::atomic<UJUSYNCSubsystem*> g_SubsystemInstance = nullptr;
+
+// True only while a live game/PIE world exists that is NOT tearing down.
+// Queued ZMQ->game-thread continuations must drop their broadcasts when this
+// returns false: firing Blueprint handlers during PIE teardown (world already
+// in BeginTearingDown) hits NewObject/SpawnActor with an invalid world
+// context and asserts (Obj.cpp World && bSupported).
+static bool JUSYNCGameSessionActive()
+{
+    if (!GEngine)
+    {
+        return false;
+    }
+    for (const FWorldContext& Context : GEngine->GetWorldContexts())
+    {
+        if (Context.WorldType == EWorldType::Game || Context.WorldType == EWorldType::PIE)
+        {
+            UWorld* World = Context.World();
+            if (World && !World->bIsTearingDown)
+            {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// ---- Vertex-color material resolution -------------------------------------
+// RealtimeMesh streams can carry per-vertex colors, but UE only shows them if
+// the bound material actually samples VertexColor (or a UseVertexColor switch).
+// UAnariDataset pre-sets a generic texture material (MID_M_DatasetBase) on the
+// component and the mesh-creation paths preserved it unconditionally, so
+// colored meshes rendered flat. These helpers keep a material that already
+// supports vertex colors or has a real color texture bound (intentional
+// texture/gradient-PNG flow), and otherwise substitute M_VertexColor.
+
+static bool JUSYNCMatHasVertexColorNode(UMaterialInterface* Material)
+{
+    if (!Material)
+    {
+        return false;
+    }
+    const UMaterial* BaseMat = Cast<UMaterial>(Material->GetMaterial());
+    if (!BaseMat)
+    {
+        return false;
+    }
+    return BaseMat->HasAnyExpressionsInMaterialAndFunctionsOfType<UMaterialExpressionVertexColor>();
+}
+
+static bool JUSYNCMatHasScalarParam(UMaterialInterface* Material, const TCHAR* ParamName)
+{
+    if (!Material)
+    {
+        return false;
+    }
+    const UMaterial* BaseMat = Cast<UMaterial>(Material->GetMaterial());
+    if (!BaseMat)
+    {
+        return false;
+    }
+    TArray<UMaterialExpressionScalarParameter*> ScalarParams;
+    BaseMat->GetAllExpressionsInMaterialAndFunctionsOfType<UMaterialExpressionScalarParameter>(ScalarParams);
+    for (UMaterialExpressionScalarParameter* Param : ScalarParams)
+    {
+        if (Param && Param->ParameterName == FName(ParamName))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool JUSYNCMatHasBoundColorTexture(UMaterialInterface* Material)
+{
+    if (!Material)
+    {
+        return false;
+    }
+    const UMaterial* BaseMat = Cast<UMaterial>(Material->GetMaterial());
+    if (!BaseMat)
+    {
+        return false;
+    }
+    TArray<UMaterialExpressionTextureSampleParameter2D*> TextureParams;
+    BaseMat->GetAllExpressionsInMaterialAndFunctionsOfType<UMaterialExpressionTextureSampleParameter2D>(TextureParams);
+    for (UMaterialExpressionTextureSampleParameter2D* Param : TextureParams)
+    {
+        if (!Param)
+        {
+            continue;
+        }
+        const FString ParamStr = Param->ParameterName.ToString();
+        if (ParamStr.Contains(TEXT("Normal")) || ParamStr.Contains(TEXT("Rough")) ||
+            ParamStr.Contains(TEXT("Metal")) || ParamStr.Contains(TEXT("Opacity")) ||
+            ParamStr.Contains(TEXT("Mask")) || ParamStr.Contains(TEXT("AO")) ||
+            ParamStr.Contains(TEXT("AmbientOcclusion")))
+        {
+            continue;
+        }
+        UTexture* BoundTexture = nullptr;
+        if (Material->GetTextureParameterValue(Param->ParameterName, BoundTexture) && BoundTexture)
+        {
+            const FString TexName = BoundTexture->GetName();
+            if (TexName.Contains(TEXT("Default")) || TexName.Contains(TEXT("None")) ||
+                TexName.Contains(TEXT("TransparentBlack")))
+            {
+                continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool JUSYNCColorsAreMeaningful(const TArray<FColor>& Colors)
+{
+    if (Colors.Num() < 2)
+    {
+        return false;
+    }
+    const FColor First = Colors[0];
+    for (const FColor& C : Colors)
+    {
+        if (C != First)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static UMaterialInterface* JUSYNCResolveMaterialForColoredMesh(
+    UJUSYNCSubsystem* Subsystem,
+    UMaterialInterface* Provided,
+    const TArray<FColor>& Colors,
+    UObject* Owner,
+    const TCHAR* Context)
+{
+    if (!Provided || !JUSYNCColorsAreMeaningful(Colors))
+    {
+        return Provided;
+    }
+    if (JUSYNCMatHasVertexColorNode(Provided))
+    {
+        return Provided;
+    }
+
+    if (JUSYNCMatHasScalarParam(Provided, TEXT("UseVertexColor")))
+    {
+        UMaterialInstanceDynamic* DynMat = UMaterialInstanceDynamic::Create(Provided, Owner);
+        if (DynMat)
+        {
+            DynMat->SetScalarParameterValue(TEXT("UseVertexColor"), 1.0f);
+            UE_LOG(LogJUSYNC, Display, TEXT("[%s] Enabled UseVertexColor on provided material '%s'"),
+                Context, *Provided->GetName());
+            return DynMat;
+        }
+    }
+
+    if (JUSYNCMatHasBoundColorTexture(Provided))
+    {
+        UE_LOG(LogJUSYNC, Verbose, TEXT("[%s] Provided material '%s' has a bound color texture; keeping it"),
+            Context, *Provided->GetName());
+        return Provided;
+    }
+
+    static const TCHAR* CandidatePaths[] = {
+        TEXT("/Game/Materials/M_VertexColor"),
+        TEXT("/Game/Datasets/M_VertexColor"),
+        TEXT("/Game/M_VertexColor"),
+    };
+    if (Subsystem)
+    {
+        for (const TCHAR* Path : CandidatePaths)
+        {
+            UMaterialInterface* VertexColorMaterial = Subsystem->GetCachedMaterial(Path);
+            if (VertexColorMaterial)
+            {
+                UE_LOG(LogJUSYNC, Display,
+                    TEXT("[%s] Provided material '%s' ignores vertex colors and has no bound color texture; substituting %s"),
+                    Context, *Provided->GetName(), Path);
+                return VertexColorMaterial;
+            }
+        }
+    }
+
+    UE_LOG(LogJUSYNC, Warning,
+        TEXT("[%s] Colored mesh but material '%s' ignores vertex colors and no M_VertexColor asset exists under /Game (create one: VertexColor node -> BaseColor)"),
+        Context, *Provided->GetName());
+    return Provided;
+}
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
 static TArray<FJUSYNCWorkerStatus> g_CapturedWorkers;
@@ -61,10 +264,10 @@ static void WorkerListCallback(uint32_t count, const int32_t* ranks, const char*
 static TSet<FString> ProcessedFiles;
 static FCriticalSection ProcessedFilesCriticalSection;
 
-// Enhanced callback functions with detailed debugging
+// C-interface callback handlers
 extern "C" void FileReceivedCallback_Static(const CFileData* file_data)
 {
-    UE_LOG(LogJUSYNC, Log, TEXT("=== ZMQ CALLBACK TRIGGERED ==="));
+    UE_LOG(LogJUSYNC, Verbose, TEXT("File received callback triggered"));
     
     if (!file_data)
     {
@@ -83,13 +286,17 @@ extern "C" void FileReceivedCallback_Static(const CFileData* file_data)
             return;
         }
         ProcessedFiles.Add(Filename);
+
+        // Bound memory: this set only needs recent entries to drop multi-rank duplicates within a
+        // single broadcast. Reset the window once it grows large (long sessions with live updates).
+        if (ProcessedFiles.Num() >= 4096)
+        {
+            ProcessedFiles.Reset();
+        }
     }
     
-    UE_LOG(LogJUSYNC, Log, TEXT("ZMQ File Received:"));
-    UE_LOG(LogJUSYNC, Log, TEXT("  - Filename: %s"), *Filename);
-    UE_LOG(LogJUSYNC, Log, TEXT("  - File Type: %s"), UTF8_TO_TCHAR(file_data->file_type));
-    UE_LOG(LogJUSYNC, Log, TEXT("  - Data Size: %d bytes"), file_data->data_size);
-    UE_LOG(LogJUSYNC, Log, TEXT("  - Hash: %s"), UTF8_TO_TCHAR(file_data->hash));
+    UE_LOG(LogJUSYNC, Verbose, TEXT("ZMQ file received: %s (type=%s, %d bytes)"),
+           *Filename, UTF8_TO_TCHAR(file_data->file_type), file_data->data_size);
     
     UJUSYNCSubsystem* Subsystem = g_SubsystemInstance.load();
     if (!Subsystem)
@@ -98,8 +305,6 @@ extern "C" void FileReceivedCallback_Static(const CFileData* file_data)
         return;
     }
     
-    UE_LOG(LogJUSYNC, Log, TEXT("Creating async task for file processing..."));
-
     // Single-copy: capture FString on-stack + TArray for binary data
     // C strings are fixed-size arrays (char[1024]), check [0] != '\0' instead of pointer
     FString CapturedFilename = file_data->filename[0] != '\0' ? FString(UTF8_TO_TCHAR(file_data->filename)) : TEXT("");
@@ -115,16 +320,16 @@ extern "C" void FileReceivedCallback_Static(const CFileData* file_data)
 
     AsyncTask(ENamedThreads::GameThread, [CapturedFilename = MoveTemp(CapturedFilename), CapturedHash = MoveTemp(CapturedHash), CapturedFileType = MoveTemp(CapturedFileType), DataCopy = MoveTemp(DataCopy)]()
     {
-        UE_LOG(LogJUSYNC, Log, TEXT("=== ASYNC TASK EXECUTING ON GAME THREAD ==="));
-
         UJUSYNCSubsystem* Subsystem = g_SubsystemInstance.load();
         if (!Subsystem)
         {
             UE_LOG(LogJUSYNC, Error, TEXT("Async Task: g_SubsystemInstance is NULL on game thread"));
             return;
         }
-
-        UE_LOG(LogJUSYNC, Log, TEXT("Converting C data to UE format..."));
+        if (!JUSYNCGameSessionActive())
+        {
+            return;
+        }
 
         FJUSYNCFileData UEFileData;
         UEFileData.Filename = CapturedFilename;
@@ -132,22 +337,87 @@ extern "C" void FileReceivedCallback_Static(const CFileData* file_data)
         UEFileData.FileType = CapturedFileType;
         UEFileData.Data = DataCopy;
 
-        UE_LOG(LogJUSYNC, Log, TEXT("Broadcasting to Blueprint events..."));
-        UE_LOG(LogJUSYNC, Log, TEXT("  - UE Filename: %s"), *UEFileData.Filename);
-        UE_LOG(LogJUSYNC, Log, TEXT("  - UE File Type: %s"), *UEFileData.FileType);
-        UE_LOG(LogJUSYNC, Log, TEXT("  - UE Data Size: %d"), UEFileData.Data.Num());
-
         Subsystem->HandleFileReceivedForLibrary(UEFileData);
         Subsystem->OnFileReceived.Broadcast(UEFileData);
 
-        UE_LOG(LogJUSYNC, Log, TEXT("=== FILE PROCESSING COMPLETE ==="));
+    });
+}
+
+extern "C" void FileReceivedSpanCallback_Static(
+    const char* filename,
+    const unsigned char* /*data*/,
+    size_t data_size,
+    const char* hash,
+    const char* file_type)
+{
+    UE_LOG(LogJUSYNC, Verbose, TEXT("File received span callback triggered"));
+
+    if (!filename)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("FileReceivedSpanCallback_Static: NULL filename received"));
+        return;
+    }
+
+    FString CapturedFilename = FString(UTF8_TO_TCHAR(filename));
+
+    // Check for duplicate files (broadcast sends same file from multiple ranks)
+    {
+        FScopeLock Lock(&ProcessedFilesCriticalSection);
+        if (ProcessedFiles.Contains(CapturedFilename))
+        {
+            UE_LOG(LogJUSYNC, Log, TEXT("Skipping duplicate file: %s (already processed)"), *CapturedFilename);
+            return;
+        }
+        ProcessedFiles.Add(CapturedFilename);
+
+        // Bound memory: this set only needs recent entries to drop multi-rank duplicates within a
+        // single broadcast. Reset the window once it grows large (long sessions with live updates).
+        if (ProcessedFiles.Num() >= 4096)
+        {
+            ProcessedFiles.Reset();
+        }
+    }
+
+    UE_LOG(LogJUSYNC, Verbose, TEXT("ZMQ file received (metadata only): %s (type=%s, %d bytes)"),
+        *CapturedFilename, file_type ? UTF8_TO_TCHAR(file_type) : TEXT(""), static_cast<int32>(data_size));
+
+    UJUSYNCSubsystem* Subsystem = g_SubsystemInstance.load();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("FileReceivedSpanCallback_Static: g_SubsystemInstance is NULL"));
+        return;
+    }
+
+    FString CapturedHash = hash ? FString(UTF8_TO_TCHAR(hash)) : TEXT("");
+    FString CapturedFileType = file_type ? FString(UTF8_TO_TCHAR(file_type)) : TEXT("");
+
+    AsyncTask(ENamedThreads::GameThread, [CapturedFilename = MoveTemp(CapturedFilename),
+        CapturedHash = MoveTemp(CapturedHash),
+        CapturedFileType = MoveTemp(CapturedFileType)]()
+    {
+        UJUSYNCSubsystem* Subsystem = g_SubsystemInstance.load();
+        if (!Subsystem)
+        {
+            UE_LOG(LogJUSYNC, Error, TEXT("FileReceivedSpanCallback_Static: Subsystem null on game thread"));
+            return;
+        }
+        if (!JUSYNCGameSessionActive())
+        {
+            return;
+        }
+
+        FJUSYNCFileData UEFileData;
+        UEFileData.Filename = CapturedFilename;
+        UEFileData.Hash = CapturedHash;
+        UEFileData.FileType = CapturedFileType;
+
+        Subsystem->HandleFileReceivedForLibrary(UEFileData);
+        Subsystem->OnFileReceived.Broadcast(UEFileData);
     });
 }
 
 extern "C" void MessageReceivedCallback_Static(const char* message)
 {
-    UE_LOG(LogJUSYNC, Log, TEXT("=== ZMQ MESSAGE CALLBACK TRIGGERED ==="));
-    
     if (!message)
     {
         UE_LOG(LogJUSYNC, Error, TEXT("MessageReceivedCallback_Static: NULL message received"));
@@ -162,7 +432,7 @@ extern "C" void MessageReceivedCallback_Static(const char* message)
     AsyncTask(ENamedThreads::GameThread, [MessageCopy]()
     {
         UJUSYNCSubsystem* Subsystem = g_SubsystemInstance.load();
-        if (Subsystem)
+        if (Subsystem && JUSYNCGameSessionActive())
         {
             UE_LOG(LogJUSYNC, Log, TEXT("Broadcasting message to Blueprint: %s"), *MessageCopy);
             Subsystem->OnMessageReceived.Broadcast(MessageCopy);
@@ -175,18 +445,40 @@ extern "C" void MessageReceivedCallback_Static(const char* message)
     });
 }
 
+// Filter helper: determine if a file path is relevant for live updates (geometry clips only)
+static bool IsNotificationForSkippableFile(const char* filename)
+{
+    if (!filename) return false;
+    const char* p = filename;
+    while (*p)
+    {
+        if (p[0] == 'i' && p[1] == 'm' && p[2] == 'a' && p[3] == 'g' && p[4] == 'e' && p[5] == 's' && p[6] == '/') return true;
+        if (p[0] == 's' && p[1] == 'h' && p[2] == 'a' && p[3] == 'r' && p[4] == 'e' && p[5] == 'd' && p[6] == '/') return true;
+        if (p[0] == 'm' && p[1] == 'a' && p[2] == 'n' && p[3] == 'i' && p[4] == 'f' && p[5] == 'e' && p[6] == 's' && p[7] == 't') return true;
+        if (p[0] == 'S' && p[1] == 'e' && p[2] == 's' && p[3] == 's' && p[4] == 'i' && p[5] == 'o' && p[6] == 'n' && p[7] == '_') return true;
+        if (p[0] == 'p' && p[1] == 'r' && p[2] == 'i' && p[3] == 'm' && p[4] == 's' && p[5] == 't' && p[6] == 'a' && p[7] == 'g' && p[8] == 'e' && p[9] == 's') return true;
+        if ((p[0] == '.' || p[0] == '/') && (p[1] == 'p' || p[1] == 'P') && (p[2] == 'n' || p[2] == 'N') && (p[3] == 'g' || p[3] == 'G')) return true;
+        p++;
+    }
+    return false;
+}
+
 extern "C" void NotificationCallback_Static(uint32_t messageType, int32_t sourceRank,
                                               const char* filename, uint64_t fileSize, uint64_t timestamp,
                                               uint64_t hashLo, uint64_t hashHi,
                                               uint64_t hashPrevLo, uint64_t hashPrevHi,
                                               bool hasOldData)
 {
+    // CommitComplete has no filename - always pass through
+    if (messageType != 301 && IsNotificationForSkippableFile(filename))
+        return;  // Drop images/, shared/, .png, manifest, Session_, primstages/ early
+
     FString NotifType = TEXT("NOTIFY_UNKNOWN");
     if (messageType == 302)      NotifType = TEXT("NOTIFY_FILE_UPDATE_V2");
     else if (messageType == 301) NotifType = TEXT("NOTIFY_COMMIT_COMPLETE");
     else if (messageType == 300) NotifType = TEXT("NOTIFY_FILE_UPDATE");
 
-    UE_LOG(LogJUSYNC, Display, TEXT("=== ZMQ NOTIFICATION: %s (rank %d, file '%s', %llu bytes, hash %llx:%llx, old %llx:%llx, diff=%d) ==="),
+    UE_LOG(LogJUSYNC, Display, TEXT("ZMQ NOTIFICATION: %s (rank %d, file '%s', %llu bytes, hash %llx:%llx, old %llx:%llx, diff=%d)"),
            *NotifType, sourceRank, filename ? UTF8_TO_TCHAR(filename) : TEXT("(none)"),
            static_cast<unsigned long long>(fileSize),
            static_cast<unsigned long long>(hashLo),
@@ -204,6 +496,10 @@ extern "C" void NotificationCallback_Static(uint32_t messageType, int32_t source
         if (!Subsystem)
         {
             UE_LOG(LogJUSYNC, Warning, TEXT("NotificationCallback_Static: Subsystem instance is null, notification dropped"));
+            return;
+        }
+        if (!JUSYNCGameSessionActive())
+        {
             return;
         }
 
@@ -229,15 +525,162 @@ extern "C" void NotificationCallback_Static(uint32_t messageType, int32_t source
         Notification.bHasOldData  = hasOldData;
 
         UE_LOG(LogJUSYNC, Log, TEXT("Broadcasting notification to Blueprint: %s '%s'"),
-               (NotifType == EJUSYNCNotificationType::FileUpdateV2) ? TEXT("FileUpdateV2") :
-               (NotifType == EJUSYNCNotificationType::CommitComplete) ? TEXT("CommitComplete") : TEXT("FileUpdate"),
-               *Notification.Filename);
+                (NotifType == EJUSYNCNotificationType::FileUpdateV2) ? TEXT("FileUpdateV2") :
+                (NotifType == EJUSYNCNotificationType::CommitComplete) ? TEXT("CommitComplete") : TEXT("FileUpdate"),
+                *Notification.Filename);
         Subsystem->OnNotificationReceived.Broadcast(Notification);
     });
 }
 
-// Helper function to convert C mesh data to UE format
-// Enhanced ConvertCMeshDataToUE_Helper with FORCED vertex interpolation while preserving all functionality
+static EJUSYNCSceneChangeType ConvertCSceneChangeType(int32 ChangeType)
+{
+    switch (ChangeType)
+    {
+        case 1:  return EJUSYNCSceneChangeType::Created;
+        case 2:  return EJUSYNCSceneChangeType::Removed;
+        case 3:  return EJUSYNCSceneChangeType::Visibility;
+        case 4:  return EJUSYNCSceneChangeType::Transform;
+        case 5:  return EJUSYNCSceneChangeType::Material;
+        case 6:  return EJUSYNCSceneChangeType::Attribute;
+        case 7:  return EJUSYNCSceneChangeType::Commit;
+        case 8:  return EJUSYNCSceneChangeType::Property;
+        case 0:
+        default: return EJUSYNCSceneChangeType::None;
+    }
+}
+
+static EJUSYNCPropertyValueType ConvertCPropertyValueType(int32 ValueType)
+{
+    switch (ValueType)
+    {
+        case 1:  return EJUSYNCPropertyValueType::Int;
+        case 2:  return EJUSYNCPropertyValueType::Bool;
+        case 3:  return EJUSYNCPropertyValueType::Float;
+        case 4:  return EJUSYNCPropertyValueType::Float2;
+        case 5:  return EJUSYNCPropertyValueType::Float3;
+        case 6:  return EJUSYNCPropertyValueType::Float4;
+        case 7:  return EJUSYNCPropertyValueType::String;
+        case 8:  return EJUSYNCPropertyValueType::Path;
+        case 9:  return EJUSYNCPropertyValueType::ArrayRef;
+        case 0:
+        default: return EJUSYNCPropertyValueType::None;
+    }
+}
+
+extern "C" void JUSYNCSceneUpdateCallback_Static(
+    uint32_t messageType,
+    int32_t sourceRank,
+    uint64_t timestamp,
+    uint64_t commitId,
+    uint64_t revision,
+    const char* primPath,
+    const char* propertyName,
+    int32_t changeType,
+    int32_t valueType,
+    int64_t intValue,
+    float floatValue,
+    const float* vec4,
+    const char* stringValue,
+    uint32_t payloadSize)
+{
+    const FString PrimPathCopy = primPath ? FString(UTF8_TO_TCHAR(primPath)) : TEXT("");
+    const FString PropertyNameCopy = propertyName ? FString(UTF8_TO_TCHAR(propertyName)) : TEXT("");
+    const FString StringValueCopy = stringValue ? FString(UTF8_TO_TCHAR(stringValue)) : TEXT("");
+
+    const FVector4 Vec4Copy = vec4
+        ? FVector4(static_cast<double>(vec4[0]), static_cast<double>(vec4[1]), static_cast<double>(vec4[2]), static_cast<double>(vec4[3]))
+        : FVector4(0.0, 0.0, 0.0, 0.0);
+
+    UE_LOG(LogJUSYNC, Display,
+        TEXT("SCENE/PROPERTY UPDATE: type=%u rank=%d prim='%s' property='%s' change=%d valueType=%d commit=%llu revision=%llu int=%lld float=%f vec=(%f,%f,%f,%f) string='%s' payload=%u"),
+        messageType,
+        sourceRank,
+        *PrimPathCopy,
+        *PropertyNameCopy,
+        changeType,
+        valueType,
+        static_cast<unsigned long long>(commitId),
+        static_cast<unsigned long long>(revision),
+        static_cast<long long>(intValue),
+        static_cast<double>(floatValue),
+        Vec4Copy.X, Vec4Copy.Y, Vec4Copy.Z, Vec4Copy.W,
+        *StringValueCopy,
+        payloadSize);
+
+    AsyncTask(ENamedThreads::GameThread, [messageType, sourceRank, timestamp, commitId, revision,
+                                           PrimPathCopy, PropertyNameCopy, changeType, valueType,
+                                           intValue, floatValue, Vec4Copy, StringValueCopy, payloadSize]()
+    {
+        UJUSYNCSubsystem* Subsystem = g_SubsystemInstance.load();
+        if (!Subsystem)
+        {
+            UE_LOG(LogJUSYNC, Warning, TEXT("JUSYNCSceneUpdateCallback_Static: Subsystem instance is null, scene update dropped"));
+            return;
+        }
+        if (!JUSYNCGameSessionActive())
+        {
+            return;
+        }
+
+        FJUSYNCSceneUpdate Update;
+        Update.MessageType      = static_cast<int32>(messageType);
+        Update.SourceRank       = sourceRank;
+        Update.Timestamp        = static_cast<int64>(timestamp);
+        Update.CommitId         = static_cast<int64>(commitId);
+        Update.Revision         = static_cast<int64>(revision);
+        Update.PrimPath         = PrimPathCopy;
+        Update.PropertyName     = PropertyNameCopy;
+        Update.ChangeType       = ConvertCSceneChangeType(changeType);
+        Update.ValueType        = ConvertCPropertyValueType(valueType);
+        Update.IntValue         = intValue;
+        Update.FloatValue       = floatValue;
+        Update.Vec4             = Vec4Copy;
+        Update.StringValue      = StringValueCopy;
+        Update.PayloadSize      = static_cast<int32>(payloadSize);
+
+        Subsystem->OnSceneUpdateReceived.Broadcast(Update);
+    });
+}
+
+extern "C" void JUSYNCProtocolDiagnosticsCallback_Static(
+    const char* event,
+    const char* message,
+    uint64_t value0,
+    uint64_t value1)
+{
+    const FString EventCopy = event ? FString(UTF8_TO_TCHAR(event)) : TEXT("unknown");
+    const FString MessageCopy = message ? FString(UTF8_TO_TCHAR(message)) : TEXT("");
+
+    UE_LOG(LogJUSYNC, Display,
+        TEXT("PROTOCOL DIAGNOSTICS: %s | %s (%llu, %llu)"),
+        *EventCopy,
+        *MessageCopy,
+        static_cast<unsigned long long>(value0),
+        static_cast<unsigned long long>(value1));
+
+    AsyncTask(ENamedThreads::GameThread, [EventCopy, MessageCopy, value0, value1]()
+    {
+        UJUSYNCSubsystem* Subsystem = g_SubsystemInstance.load();
+        if (!Subsystem)
+        {
+            return;
+        }
+        if (!JUSYNCGameSessionActive())
+        {
+            return;
+        }
+
+        FJUSYNCProtocolDiagnostics Diagnostics;
+        Diagnostics.Event   = EventCopy;
+        Diagnostics.Message = MessageCopy;
+        Diagnostics.Value0  = static_cast<int64>(value0);
+        Diagnostics.Value1  = static_cast<int64>(value1);
+
+        Subsystem->OnProtocolDiagnosticsReceived.Broadcast(Diagnostics);
+    });
+}
+
+// Convert C mesh data to the UE format (vertex interpolation is forced by default).
 static FJUSYNCMeshData ConvertCMeshDataToUE_Helper(const CMeshData& CMesh, bool bForceVertexInterpolation = true)
 {
     FJUSYNCMeshData UEMesh;
@@ -246,7 +689,7 @@ static FJUSYNCMeshData ConvertCMeshDataToUE_Helper(const CMeshData& CMesh, bool 
     UEMesh.ElementName = FString(UTF8_TO_TCHAR(CMesh.element_name));
     UEMesh.TypeName = FString(UTF8_TO_TCHAR(CMesh.type_name));
 
-    // 2. Convert points (OPTIMIZED - flat array â†’ FVector array)
+    // 2. Convert points (OPTIMIZED - flat array -> FVector array)
     size_t PointCount = CMesh.points_count / 3;
     UEMesh.Vertices.Reserve(PointCount);
     
@@ -305,7 +748,7 @@ static FJUSYNCMeshData ConvertCMeshDataToUE_Helper(const CMeshData& CMesh, bool 
         }
     }
 
-    // 6. âœ… ENHANCED: Vertexâ€colors with FORCED vertex interpolation while preserving all functionality
+    // 6. ENHANCED: Vertex-colors with FORCED vertex interpolation while preserving all functionality
     if (CMesh.vertex_colors && CMesh.vertex_colors_count >= 4)
     {
         int32 VertexCount = static_cast<int32>(PointCount);
@@ -333,8 +776,8 @@ static FJUSYNCMeshData ConvertCMeshDataToUE_Helper(const CMeshData& CMesh, bool 
         }
         else if (bDetectedUniformInterp && bForceVertexInterpolation)
         {
-            // âœ… CASE 2: Uniform detected + Force Vertex = Convert uniform to smooth vertex interpolation
-            // UE_LOG(LogJUSYNC, Log, TEXT("ðŸŽ¨ CONVERTING uniform to smooth VERTEX interpolation"));
+            // CASE 2: Uniform detected + Force Vertex = Convert uniform to smooth vertex interpolation
+            // UE_LOG(LogJUSYNC, Log, TEXT("CONVERTING uniform to smooth VERTEX interpolation"));
             
             // Initialize vertex color accumulation arrays
             TArray<FLinearColor> AccumulatedColors;
@@ -342,7 +785,7 @@ static FJUSYNCMeshData ConvertCMeshDataToUE_Helper(const CMeshData& CMesh, bool 
             AccumulatedColors.SetNumZeroed(VertexCount);
             ColorCounts.SetNumZeroed(VertexCount);
             
-            // âœ… ENHANCED: Accumulate colors from all faces that use each vertex (for smooth blending)
+            // Accumulate colors from all faces using each vertex (for smooth blending)
             for (int32 FaceIdx = 0; FaceIdx < FaceCount && FaceIdx < ColorCount; ++FaceIdx)
             {
                 int32 i0 = UEMesh.Triangles[FaceIdx * 3 + 0];
@@ -361,7 +804,7 @@ static FJUSYNCMeshData ConvertCMeshDataToUE_Helper(const CMeshData& CMesh, bool 
                         CMesh.vertex_colors[cidx + 3]
                     );
                     
-                    // âœ… SMOOTH BLENDING: Accumulate this face color to all three vertices
+                    // SMOOTH BLENDING: Accumulate this face color to all three vertices
                     AccumulatedColors[i0] += FaceColor;
                     AccumulatedColors[i1] += FaceColor;
                     AccumulatedColors[i2] += FaceColor;
@@ -372,7 +815,7 @@ static FJUSYNCMeshData ConvertCMeshDataToUE_Helper(const CMeshData& CMesh, bool 
                 }
             }
             
-            // âœ… FINALIZE: Average the accumulated colors and convert to FColor
+            // FINALIZE: Average the accumulated colors and convert to FColor
             for (int32 i = 0; i < VertexCount; ++i)
             {
                 FLinearColor FinalColor;
@@ -443,10 +886,10 @@ static FJUSYNCMeshData ConvertCMeshDataToUE_Helper(const CMeshData& CMesh, bool 
             }
         }
 
-        // âœ… PRESERVED: Debug logging for color verification
-        UE_LOG(LogJUSYNC, Log, TEXT("ðŸŽ¨ Final vertex colors: %d"), UEMesh.VertexColors.Num());
+        // PRESERVED: Debug logging for color verification
+        UE_LOG(LogJUSYNC, Log, TEXT("Final vertex colors: %d"), UEMesh.VertexColors.Num());
         
-        // âœ… PRESERVED: DEBUG dump first 20 different colours
+        // PRESERVED: DEBUG dump first 20 different colours
         TSet<FColor> Unique;
         for (int32 i = 0; i < UEMesh.VertexColors.Num(); ++i)
         {
@@ -478,29 +921,64 @@ void UJUSYNCSubsystem::Initialize(FSubsystemCollectionBase& Collection)
     // Initialize async point cloud spawner
     PCSpawner = MakeUnique<FJUSYNCPointCloudSpawner>(TWeakObjectPtr<UJUSYNCSubsystem>(this));
     PCSpawner->SetMaxPoolSize(16);
-    PCSpawner->SetBudgetMs(500.0f);
+    PCSpawner->SetBudgetMs(33.0f);
 
-    // Set LiDAR point budget to handle many simultaneous point clouds (100M+ points)
-    // Prevents the LOD manager from culling distant clouds due to adaptive budget scaling
-    if (GEngine)
-    {
-        GEngine->Exec(nullptr, TEXT("r.LidarPointBudget 200000000"));
-    }
+    // GPU time-morphing of streamed mesh updates (jusync.Morph.Enabled)
+    MeshMorpher = MakeUnique<FJUSYNCMeshMorpher>(TWeakObjectPtr<UJUSYNCSubsystem>(this));
 
-    UE_LOG(LogJUSYNC, Log, TEXT("=== JUSYNC SUBSYSTEM INITIALIZED ==="));
+    // LiDAR LOD / point budget. The adaptive budget (r.LidarPointBudget 0 + r.LidarTargetFPS)
+    // turned out too aggressive at 90 FPS - it over-culled and left empty patches - so use a
+    // fixed budget instead, but let the incremental budget ramp detail up while the camera is
+    // still. Close nodes keep full resolution, far nodes are decimated to a coarse LOD, and the
+    // two importance CVars bias that detail towards the viewer so the rest stays low-res instead
+    // of disappearing. BaseLODImportance stays moderate (1.0 kept every far tile's coarse LOD
+    // visible and cost real overdraw). All four values are UPROPERTYs now - tune them live and
+    // call ApplyLidarPerformanceCvars() (Blueprint/console) instead of recompiling.
+    ApplyLidarPerformanceCvars();
+
     UE_LOG(LogJUSYNC, Log, TEXT("Global instance set: %p"), g_SubsystemInstance.load());
     UE_LOG(LogJUSYNC, Log, TEXT("JUSYNCSubsystem initialized with C-wrapper interface"));
 }
 
+void UJUSYNCSubsystem::ApplyLidarPerformanceCvars() const
+{
+    if (!GEngine)
+    {
+        return;
+    }
+
+    GEngine->Exec(nullptr, *FString::Printf(TEXT("r.LidarPointBudget %d"), LidarPointBudget));
+    GEngine->Exec(nullptr, *FString::Printf(TEXT("r.LidarIncrementalBudget %d"), bLidarIncrementalBudget ? 1 : 0));
+    GEngine->Exec(nullptr, *FString::Printf(TEXT("r.LidarScreenCenterImportance %.3f"), LidarScreenCenterImportance));
+    GEngine->Exec(nullptr, *FString::Printf(TEXT("r.LidarBaseLODImportance %.3f"), LidarBaseLODImportance));
+
+    UE_LOG(LogJUSYNC, Log, TEXT("LiDAR cvars: Budget=%d Incremental=%d ScreenCenter=%.2f BaseLOD=%.2f"),
+        LidarPointBudget, bLidarIncrementalBudget ? 1 : 0, LidarScreenCenterImportance, LidarBaseLODImportance);
+}
+
 void UJUSYNCSubsystem::Deinitialize()
 {
-    UE_LOG(LogJUSYNC, Log, TEXT("=== JUSYNC SUBSYSTEM DEINITIALIZING ==="));
-    
     ShutdownMiddleware();
     
     // Clear global instance
     g_SubsystemInstance.store(nullptr);
-    
+
+    // Drop all Blueprint/native bindings: queued game-thread continuations may
+    // still run after shutdown; with cleared delegates they become no-ops
+    // instead of firing handlers bound to a tearing-down PIE world.
+    OnFileReceived.Clear();
+    OnMessageReceived.Clear();
+    OnNotificationReceived.Clear();
+    OnSceneUpdateReceived.Clear();
+    OnProtocolDiagnosticsReceived.Clear();
+
+    if (PCSpawner.IsValid())
+    {
+        // Covers the slowest measured off-thread 10M octree build (~6 s) so a
+        // shutdown during streaming never races the Epic build worker.
+        PCSpawner->WaitForCompletion(10.0f);
+    }
+
     Super::Deinitialize();
     UE_LOG(LogJUSYNC, Log, TEXT("JUSYNCSubsystem deinitialized"));
 }
@@ -514,7 +992,6 @@ bool UJUSYNCSubsystem::InitializeMiddleware(const FString& Endpoint)
 {
     FScopeLock Lock(&MiddlewareMutex);
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== INITIALIZING JUSYNC MIDDLEWARE ==="));
     UE_LOG(LogJUSYNC, Log, TEXT("Requested Endpoint: %s"), *Endpoint);
     UE_LOG(LogJUSYNC, Log, TEXT("Subsystem instance: %p"), this);
     UE_LOG(LogJUSYNC, Log, TEXT("Global instance: %p"), g_SubsystemInstance.load());
@@ -543,16 +1020,16 @@ bool UJUSYNCSubsystem::InitializeMiddleware(const FString& Endpoint)
     
     if (Result == 1)
     {
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… USD processors initialized (DEALER-only mode)"));
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Ready to connect to broker via DEALER socket"));
+        UE_LOG(LogJUSYNC, Log, TEXT("USD processors initialized (DEALER-only mode)"));
+        UE_LOG(LogJUSYNC, Log, TEXT("Ready to connect to broker via DEALER socket"));
         
         // Register callbacks AFTER initialization (g_middleware must exist)
         // NOTE: Notification callback is registered AFTER ConnectToBroker because the AnariUsdClient
         // is created lazily inside connectToBroker(). Registering it here would be a no-op.
         UE_LOG(LogJUSYNC, Log, TEXT("Registering ZMQ callbacks (deferred)..."));
-        RegisterUpdateCallback_C(FileReceivedCallback_Static);
+        RegisterUpdateCallbackSpan_C(FileReceivedSpanCallback_Static);
         RegisterMessageCallback_C(MessageReceivedCallback_Static);
-        UE_LOG(LogJUSYNC, Log, TEXT(" File & message callbacks registered"));
+        UE_LOG(LogJUSYNC, Log, TEXT("File & message callbacks registered"));
         
         // Test connection status
         int ConnectionStatus = IsConnected_C();
@@ -562,11 +1039,11 @@ bool UJUSYNCSubsystem::InitializeMiddleware(const FString& Endpoint)
         const char* StatusInfo = GetStatusInfo_C();
         UE_LOG(LogJUSYNC, Log, TEXT("Middleware status: %s"), UTF8_TO_TCHAR(StatusInfo));
         
-        UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC Middleware initialized successfully (DEALER-only mode)"));
+        UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC middleware initialized (DEALER-only mode)"));
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to initialize JUSYNC Middleware (Result: %d)"), Result);
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to initialize JUSYNC Middleware (Result: %d)"), Result);
     }
     
     return Result == 1;
@@ -579,8 +1056,6 @@ bool UJUSYNCSubsystem::InitializeMiddleware(const FString& Endpoint)
 void UJUSYNCSubsystem::ShutdownMiddleware()
 {
     FScopeLock Lock(&MiddlewareMutex);
-    
-    UE_LOG(LogJUSYNC, Log, TEXT("=== SHUTTING DOWN JUSYNC MIDDLEWARE ==="));
     
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     // Clear global instance BEFORE shutting down to prevent callbacks from using destroyed instance
@@ -637,12 +1112,10 @@ bool UJUSYNCSubsystem::StartReceiving()
 {
     FScopeLock Lock(&MiddlewareMutex);
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== STARTING JUSYNC RECEIVING ==="));
-    
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot start receiving - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot start receiving - middleware not initialized"));
         return false;
     }
     
@@ -654,8 +1127,8 @@ bool UJUSYNCSubsystem::StartReceiving()
     
     if (Result == 1)
     {
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… JUSYNC Started Receiving Data"));
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… ROUTER is now listening for DEALER messages"));
+        UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC Started Receiving Data"));
+        UE_LOG(LogJUSYNC, Log, TEXT("ROUTER is now listening for DEALER messages"));
         
         // Additional status checks
         int ConnectionStatus = IsConnected_C();
@@ -668,7 +1141,7 @@ bool UJUSYNCSubsystem::StartReceiving()
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to start receiving (Result: %d)"), Result);
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to start receiving (Result: %d)"), Result);
         UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC Start receiving: Failed"));
     }
     
@@ -683,8 +1156,6 @@ void UJUSYNCSubsystem::StopReceiving()
 {
     FScopeLock Lock(&MiddlewareMutex);
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== STOPPING JUSYNC RECEIVING ==="));
-    
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     StopReceiving_C();
     UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC Stopped receiving"));
@@ -693,7 +1164,6 @@ void UJUSYNCSubsystem::StopReceiving()
 
 void UJUSYNCSubsystem::HandleFileReceivedForLibrary(const FJUSYNCFileData& FileData)
 {
-    UE_LOG(LogJUSYNC, Log, TEXT("=== ADDING FILE TO BLUEPRINT LIBRARY ==="));
     UE_LOG(LogJUSYNC, Log, TEXT("File: %s (%d bytes, %s)"), 
            *FileData.Filename, FileData.Data.Num(), *FileData.FileType);
     
@@ -704,12 +1174,11 @@ void UJUSYNCSubsystem::HandleFileReceivedForLibrary(const FJUSYNCFileData& FileD
     int32 NewCount = UJUSYNCBlueprintLibrary::ReceivedFiles.Num();
     
     UE_LOG(LogJUSYNC, Log, TEXT("Blueprint Library file count: %d -> %d"), PreviousCount, NewCount);
-    UE_LOG(LogJUSYNC, Log, TEXT("âœ… File added to Blueprint Library: %s"), *FileData.Filename);
+    UE_LOG(LogJUSYNC, Log, TEXT("File added to Blueprint Library: %s"), *FileData.Filename);
 }
 
 void UJUSYNCSubsystem::HandleMessageReceivedForLibrary(const FString& Message)
 {
-    UE_LOG(LogJUSYNC, Log, TEXT("=== ADDING MESSAGE TO BLUEPRINT LIBRARY ==="));
     UE_LOG(LogJUSYNC, Log, TEXT("Message: %s"), *Message);
     
     FScopeLock Lock(&UJUSYNCBlueprintLibrary::DataMutex);
@@ -725,6 +1194,11 @@ void UJUSYNCSubsystem::HandleMessageReceivedForLibrary(const FString& Message)
 bool UJUSYNCSubsystem::LoadUSDFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCMeshData>& OutMeshData)
 {
 #ifdef WITH_ANARI_USD_MIDDLEWARE
+    // ParseMutex is taken only around the C-call below (brace-scoped), not the whole
+    // function - this lets the single-threaded C->UE conversion overlap the next parse.
+    // (Uses ParseMutex, not the general MiddlewareMutex, so a long parse on a background
+    // thread never stalls game-thread ops.)
+
     if (!bIsInitialized.load())
     {
         UE_LOG(LogJUSYNC, Error, TEXT("JUSYNC Middleware not initialized"));
@@ -738,8 +1212,14 @@ bool UJUSYNCSubsystem::LoadUSDFromBuffer(const TArray<uint8>& Buffer, const FStr
     CMeshData* CMeshes = nullptr;
     size_t MeshCount = 0;
     
-    // Call C interface
-    int Result = LoadUSDBuffer_C(Buffer.GetData(), Buffer.Num(), FilenameCStr, &CMeshes, &MeshCount);
+    // Serialize ONLY the tinyusdz C-call (not thread-safe for concurrent loads). The
+    // single-threaded conversion below runs OUTSIDE the lock so the next queued parse can
+    // overlap this file's conversion and keep all cores busy.
+    int Result = 0;
+    {
+        FScopeLock Lock(&ParseMutex);
+        Result = LoadUSDBuffer_C(Buffer.GetData(), Buffer.Num(), FilenameCStr, &CMeshes, &MeshCount);
+    }
     
     if (Result == 1 && CMeshes && MeshCount > 0)
     {
@@ -756,7 +1236,7 @@ bool UJUSYNCSubsystem::LoadUSDFromBuffer(const TArray<uint8>& Buffer, const FStr
         // Free C memory
         FreeMeshData_C(CMeshes, MeshCount);
         
-        UE_LOG(LogJUSYNC, Log, TEXT("Successfully loaded %d meshes from USD buffer"), OutMeshData.Num());
+        UE_LOG(LogJUSYNC, Log, TEXT("Loaded %d meshes from USD buffer"), OutMeshData.Num());
         return true;
     }
     else
@@ -805,7 +1285,7 @@ bool UJUSYNCSubsystem::LoadUSDFromDisk(const FString& FilePath, TArray<FJUSYNCMe
         // Free C memory
         FreeMeshData_C(CMeshes, MeshCount);
         
-        UE_LOG(LogJUSYNC, Log, TEXT("Successfully loaded %d meshes from USD file"), OutMeshData.Num());
+        UE_LOG(LogJUSYNC, Log, TEXT("Loaded %d meshes from USD file"), OutMeshData.Num());
         return true;
     }
     else
@@ -838,7 +1318,7 @@ bool UJUSYNCSubsystem::LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const 
         return false;
     }
 
-    FScopeLock Lock(&MiddlewareMutex);
+    FScopeLock Lock(&ParseMutex);
 
     FTCHARToUTF8 FilenameConverter(*Filename);
     const char* FilenameCStr = FilenameConverter.Get();
@@ -891,7 +1371,7 @@ bool UJUSYNCSubsystem::LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const 
             pc.PointCount = static_cast<int32>(cpc.points_count);
             pc.bHasColors = cpc.has_colors != 0;
             pc.bHasNormals = cpc.has_normals != 0;
-            // Transform bounds from USD-space → UE-space, matching position transform
+            // Transform bounds from USD-space -> UE-space, matching position transform
             pc.BoundingBoxMin = FVector(cpc.bounding_box_min[0], cpc.bounding_box_min[2], -cpc.bounding_box_min[1]);
             pc.BoundingBoxMax = FVector(cpc.bounding_box_max[0], cpc.bounding_box_max[2], -cpc.bounding_box_max[1]);
 
@@ -934,6 +1414,557 @@ bool UJUSYNCSubsystem::LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const 
     return true;
 #else
     UE_LOG(LogTemp, Warning, TEXT("JUSYNC: LoadUSDFullFromBuffer called but middleware not available"));
+    return false;
+#endif
+}
+
+bool UJUSYNCSubsystem::LoadUSDFullFromBufferNoCopy(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData)
+{
+#ifdef WITH_ANARI_USD_MIDDLEWARE
+    if (!bIsInitialized.load())
+    {
+        UE_LOG(LogTemp, Error, TEXT("JUSYNC: LoadUSDFullFromBufferNoCopy called but middleware is not initialized"));
+        return false;
+    }
+
+    OutMeshData.Empty();
+    OutPointCloudData.Empty();
+
+    if (Buffer.Num() == 0)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("JUSYNC: LoadUSDFullFromBufferNoCopy called with empty buffer"));
+        return false;
+    }
+
+    FTCHARToUTF8 FilenameConverter(*Filename);
+    const char* FilenameCStr = FilenameConverter.Get();
+
+    void* ParseHandle = nullptr;
+    CMeshLayout* MeshLayouts = nullptr;
+    size_t MeshCount = 0;
+    CPointCloudLayout* CloudLayouts = nullptr;
+    size_t CloudCount = 0;
+
+    // In-situ two-phase parse:
+    // 1) QueryUSDFullLayout_C - the only non-thread-safe part (the tinyusdz
+    // C-call), serialized on ParseMutex like before.
+    // 2) UE allocates its final TArrays; FillUSDFull_C writes the geometry
+    // straight into them - no CMeshData new[] intermediate, no C->UE
+    // conversion copy. Filling runs OUTSIDE the parse lock so the next
+    // queued file's parse can overlap this file's fill.
+    int Result = 0;
+    {
+        FScopeLock Lock(&ParseMutex);
+        Result = QueryUSDFullLayout_C(
+            Buffer.GetData(), Buffer.Num(), FilenameCStr,
+            &ParseHandle, &MeshLayouts, &MeshCount,
+            &CloudLayouts, &CloudCount
+        );
+    }
+
+    if (Result != 1 || !ParseHandle)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("JUSYNC: LoadUSDFullFromBufferNoCopy failed for '%s' (buffer=%d bytes, C_result=%d MeshCount=%llu CloudCount=%llu)"),
+            *Filename, Buffer.Num(), Result, (uint64)MeshCount, (uint64)CloudCount);
+        if (ParseHandle) FreeParsedUSD_C(ParseHandle);
+        FreeUSDFullLayouts_C(MeshLayouts, MeshCount, CloudLayouts, CloudCount);
+        return false;
+    }
+
+    // -- Meshes: allocate final TArrays, fill in place --
+    if (MeshCount > 0)
+    {
+        OutMeshData.SetNum(static_cast<int32>(MeshCount));
+        CMeshDataFill* FillMeshes = reinterpret_cast<CMeshDataFill*>(FMemory::Malloc(MeshCount * sizeof(CMeshDataFill)));
+        FMemory::Memzero(FillMeshes, MeshCount * sizeof(CMeshDataFill)); // POD struct
+
+        for (size_t i = 0; i < MeshCount; ++i)
+        {
+            const CMeshLayout& lay = MeshLayouts[i];
+            FJUSYNCMeshData& UEMesh = OutMeshData[i];
+            CMeshDataFill& dst = FillMeshes[i];
+
+            UEMesh.ElementName = UTF8_TO_TCHAR(lay.element_name);
+            UEMesh.TypeName = UTF8_TO_TCHAR(lay.type_name);
+
+            if (lay.points_count > 0) UEMesh.Vertices.SetNumUninitialized(static_cast<int32>(lay.points_count));
+            if (lay.indices_count > 0) UEMesh.Triangles.SetNumUninitialized(static_cast<int32>(lay.indices_count));
+            if (lay.normals_count > 0) UEMesh.Normals.SetNumUninitialized(static_cast<int32>(lay.normals_count));
+            if (lay.uvs_count > 0) UEMesh.UVs.SetNumUninitialized(static_cast<int32>(lay.uvs_count));
+            if (lay.vertex_colors_count > 0) UEMesh.VertexColors.SetNumUninitialized(static_cast<int32>(lay.vertex_colors_count));
+
+            // Point the C fill struct at the final UE arrays. UE5 layout:
+            // FVector == double[3], FVector2D == double[2], FColor == uint8[4].
+            dst.points = UEMesh.Vertices.Num() > 0 ? reinterpret_cast<double*>(UEMesh.Vertices.GetData()) : nullptr;
+            dst.indices = UEMesh.Triangles.Num() > 0 ? UEMesh.Triangles.GetData() : nullptr;
+            dst.normals = UEMesh.Normals.Num() > 0 ? reinterpret_cast<double*>(UEMesh.Normals.GetData()) : nullptr;
+            dst.uvs = UEMesh.UVs.Num() > 0 ? reinterpret_cast<double*>(UEMesh.UVs.GetData()) : nullptr;
+            dst.vertex_colors8 = UEMesh.VertexColors.Num() > 0 ? reinterpret_cast<unsigned char*>(UEMesh.VertexColors.GetData()) : nullptr;
+        }
+
+        const int FillResult = FillUSDFull_C(ParseHandle, FillMeshes, MeshCount, nullptr, 0);
+        FMemory::Free(FillMeshes);
+        if (FillResult != 1)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("JUSYNC: FillUSDFull_C (meshes) failed for '%s'"), *Filename);
+            FreeParsedUSD_C(ParseHandle);
+            FreeUSDFullLayouts_C(MeshLayouts, MeshCount, CloudLayouts, CloudCount);
+            return false;
+        }
+
+        // The legacy UE conversion re-normalized normals after conversion -
+        // replicate that in place (bit-identical result).
+        for (int32 i = 0; i < OutMeshData.Num(); ++i)
+        {
+            TArray<FVector>& Normals = OutMeshData[i].Normals;
+            for (int32 j = 0; j < Normals.Num(); ++j)
+            {
+                Normals[j].Normalize();
+            }
+        }
+    }
+
+    // -- Point clouds: allocate final TArrays, fill in place --
+    if (CloudCount > 0)
+    {
+        OutPointCloudData.SetNum(static_cast<int32>(CloudCount));
+        CPointCloudDataFill* FillClouds = reinterpret_cast<CPointCloudDataFill*>(FMemory::Malloc(CloudCount * sizeof(CPointCloudDataFill)));
+        FMemory::Memzero(FillClouds, CloudCount * sizeof(CPointCloudDataFill)); // POD struct
+
+        for (size_t i = 0; i < CloudCount; ++i)
+        {
+            const CPointCloudLayout& lay = CloudLayouts[i];
+            FJUSYNCPointCloudData& pc = OutPointCloudData[i];
+            CPointCloudDataFill& dst = FillClouds[i];
+
+            pc.ElementName = UTF8_TO_TCHAR(lay.element_name);
+            pc.TypeName = TEXT("GeomPoints");
+            pc.PointCount = static_cast<int32>(lay.point_count);
+            pc.bHasColors = lay.has_colors != 0;
+            pc.bHasNormals = lay.has_normals != 0;
+
+            const bool bLUTReadyForDirectFill = PCSpawner.IsValid() && PCSpawner->GetGradientLUT().Num() > 0;
+            const bool bUseDirectLidarFill = lay.point_count > 0 &&
+                (lay.has_colors || !lay.has_widths || bLUTReadyForDirectFill);
+
+            if (bUseDirectLidarFill)
+            {
+                static_assert(sizeof(FLidarPointCloudPoint) == sizeof(CPointCloudLidarPoint_v1),
+                    "FLidarPointCloudPoint layout no longer matches CPointCloudLidarPoint_v1");
+
+                pc.bHasLidarPoints = true;
+                pc.LidarPoints.SetNumUninitialized(pc.PointCount);
+
+                dst.lidar_points = pc.LidarPoints.Num() > 0 ? pc.LidarPoints.GetData() : nullptr;
+                dst.lidar_point_stride = static_cast<int32_t>(sizeof(FLidarPointCloudPoint));
+                dst.lidar_point_version = 1u;
+            }
+            else
+            {
+                if (lay.point_count > 0) pc.Positions.SetNumUninitialized(pc.PointCount);
+                if (lay.has_colors && lay.point_count > 0) pc.Colors.SetNumUninitialized(pc.PointCount);
+            }
+
+            if (lay.has_widths && lay.point_count > 0) pc.Widths.SetNumUninitialized(pc.PointCount);
+
+            dst.positions = pc.Positions.Num() > 0 ? reinterpret_cast<double*>(pc.Positions.GetData()) : nullptr;
+            dst.colors8 = pc.Colors.Num() > 0 ? reinterpret_cast<unsigned char*>(pc.Colors.GetData()) : nullptr;
+            dst.widths = pc.Widths.Num() > 0 ? pc.Widths.GetData() : nullptr;
+        }
+
+        const int FillResult = FillUSDFull_C(ParseHandle, nullptr, 0, FillClouds, CloudCount);
+        if (FillResult != 1)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("JUSYNC: FillUSDFull_C (point clouds) failed for '%s'"), *Filename);
+            FMemory::Free(FillClouds);
+            FreeParsedUSD_C(ParseHandle);
+            FreeUSDFullLayouts_C(MeshLayouts, MeshCount, CloudLayouts, CloudCount);
+            return false;
+        }
+
+        // Bounding boxes arrive in USD space (origin-inclusive, legacy quirk);
+        // transform to UE space exactly like the legacy conversion: (x, z, -y).
+        for (int32 i = 0; i < OutPointCloudData.Num(); ++i)
+        {
+            const CPointCloudDataFill& dst = FillClouds[i];
+            OutPointCloudData[i].BoundingBoxMin = FVector(dst.bounding_box_min[0], dst.bounding_box_min[2], -dst.bounding_box_min[1]);
+            OutPointCloudData[i].BoundingBoxMax = FVector(dst.bounding_box_max[0], dst.bounding_box_max[2], -dst.bounding_box_max[1]);
+        }
+        FMemory::Free(FillClouds);
+    }
+
+    FreeParsedUSD_C(ParseHandle);
+    FreeUSDFullLayouts_C(MeshLayouts, MeshCount, CloudLayouts, CloudCount);
+
+    UE_LOG(LogTemp, Log, TEXT("JUSYNC: LoadUSDFullFromBufferNoCopy: %d meshes + %d point clouds from '%s' (in-situ fill)"),
+           OutMeshData.Num(), OutPointCloudData.Num(), *Filename);
+    return true;
+#else
+    UE_LOG(LogTemp, Warning, TEXT("JUSYNC: LoadUSDFullFromBufferNoCopy called but middleware not available"));
+    return false;
+#endif
+}
+
+// JUSYNC RawGeo (sender JUSYNC_RAWGEO=1): fill FJUSYNCPointCloudData straight
+// from a JSG1 payload — same conversions as the middleware direct LiDAR fill
+// (USD (x,y,z) -> UE (x,z,-y), colors 0..1, attribute0.x -> widths), but with
+// no tinyusdz parse anywhere.
+#ifdef WITH_ANARI_USD_MIDDLEWARE
+static bool JUSYNCParseRawGeoBuffer(const TArray<uint8>& Buffer, FJUSYNCPointCloudRef& OutCloud)
+{
+    using namespace anari_usd_protocol;
+
+    if (Buffer.Num() < (int32)sizeof(JusyncRawGeoHeader))
+        return false;
+
+    const uint8* Src = Buffer.GetData();
+    JusyncRawGeoHeader Hdr;
+    FMemory::Memcpy(&Hdr, Src, sizeof(Hdr));
+    if (!Hdr.valid((size_t)Buffer.Num()))
+        return false;
+    if (Hdr.num_points == 0 || Hdr.num_points > (uint64)MAX_int32 || Hdr.num_attributes > 16)
+        return false;
+
+    const int64 N = (int64)Hdr.num_points;
+    const int64 AttrTableBytes = (int64)Hdr.num_attributes * (int64)sizeof(JusyncRawGeoAttrDesc);
+    const JusyncRawGeoAttrDesc* Descs = reinterpret_cast<const JusyncRawGeoAttrDesc*>(Src + sizeof(Hdr));
+
+    uint64 Expected = sizeof(Hdr) + (uint64)AttrTableBytes + (uint64)N * 3 * sizeof(float);
+    if (Hdr.color_components)
+        Expected += (uint64)N * Hdr.color_components * sizeof(float);
+    for (uint32 a = 0; a < Hdr.num_attributes; ++a)
+    {
+        if (Descs[a].components == 0 || Descs[a].components > 4)
+            return false;
+        Expected += (uint64)Hdr.attr_uniform_count * Descs[a].components * sizeof(float);
+    }
+    if ((uint64)Buffer.Num() < Expected)
+        return false;
+
+    const float* PosF = reinterpret_cast<const float*>(Src + sizeof(Hdr) + AttrTableBytes);
+    const float* ColF = nullptr;
+    const float* AttrF = nullptr;
+    if (Hdr.color_components)
+    {
+        ColF = PosF + N * 3;
+        AttrF = ColF + N * Hdr.color_components;
+    }
+    else
+    {
+        AttrF = PosF + N * 3;
+    }
+
+    // attribute0 (gradient-LUT scalar channel), when the sender emitted one.
+    // VTK names arbitrary arrays "vtk_<ArrayName>" (usd::attributeN.name), so
+    // fall back to the first per-point attribute when no literal match exists.
+    const float* WidthF = nullptr;
+    int32 WidthComps = 0;
+    int64 WidthCount = 0;
+    {
+        const int64 Count = FMath::Min<int64>((int64)Hdr.attr_uniform_count, N);
+        const float* Section = AttrF;
+        for (uint32 a = 0; a < Hdr.num_attributes; ++a)
+        {
+            if (strcmp(Descs[a].name, "attribute0") == 0)
+            {
+                WidthF = Section;
+                WidthComps = (int32)Descs[a].components;
+                WidthCount = Count;
+                break;
+            }
+            Section += Count * Descs[a].components;
+        }
+        if (!WidthF && Hdr.num_attributes > 0 &&
+            Descs[0].components >= 1 && Descs[0].components <= 4)
+        {
+            WidthF = AttrF;
+            WidthComps = (int32)Descs[0].components;
+            WidthCount = Count;
+        }
+    }
+
+    auto PC = MakeShared<FJUSYNCPointCloudData, ESPMode::ThreadSafe>();
+    PC->ElementName = UTF8_TO_TCHAR(Hdr.prim_name);
+    PC->TypeName = TEXT("GeomPoints");
+    PC->PointCount = (int32)N;
+    PC->bHasColors = Hdr.color_components != 0;
+    PC->bHasNormals = false;
+
+    static_assert(sizeof(FLidarPointCloudPoint) == sizeof(CPointCloudLidarPoint_v1),
+        "FLidarPointCloudPoint layout no longer matches CPointCloudLidarPoint_v1");
+    PC->bHasLidarPoints = true;
+    PC->LidarPoints.SetNumUninitialized(N);
+
+    if (WidthF && WidthCount > 0)
+        PC->Widths.SetNumUninitialized((int32)WidthCount);
+
+    // Bounding box mirrors the legacy quirk: the box always contains the
+    // origin in USD space, then the (x, z, -y) transform is applied to it.
+    // Fill runs ParallelFor'd: point writes are index-independent, only the
+    // bbox reduces - done per chunk, merged serially with 0-init to keep the
+    // origin-in-bbox semantics.
+    struct FChunkBox { float Min[3]; float Max[3]; };
+    const int64 Per = FMath::DivideAndRoundUp<int64>(N, 64);
+    const int32 NumChunks = (int32)FMath::Clamp<int64>(
+        (N + Per - 1) / Per, 1, (N > 0) ? FMath::Min<int64>(64, N) : 1);
+    const int64 ChunkStride = FMath::DivideAndRoundUp<int64>(N, NumChunks);
+    TArray<FChunkBox> Boxes;
+    Boxes.SetNumUninitialized(NumChunks);
+
+    ParallelFor(NumChunks, [&](int32 c)
+    {
+        const int64 Begin = (int64)c * ChunkStride;
+        const int64 End = FMath::Min<int64>(N, Begin + ChunkStride);
+        float MinC[3] = { TNumericLimits<float>::Max(), TNumericLimits<float>::Max(), TNumericLimits<float>::Max() };
+        float MaxC[3] = { TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest(), TNumericLimits<float>::Lowest() };
+
+        for (int64 i = Begin; i < End; ++i)
+        {
+            const float x = PosF[i * 3 + 0];
+            const float y = PosF[i * 3 + 1];
+            const float z = PosF[i * 3 + 2];
+
+            MinC[0] = FMath::Min(MinC[0], x); MaxC[0] = FMath::Max(MaxC[0], x);
+            MinC[1] = FMath::Min(MinC[1], y); MaxC[1] = FMath::Max(MaxC[1], y);
+            MinC[2] = FMath::Min(MinC[2], z); MaxC[2] = FMath::Max(MaxC[2], z);
+
+            float r = 1.f, g = 1.f, b = 1.f, a = 1.f;
+            if (ColF)
+            {
+                const float* cc = ColF + i * Hdr.color_components;
+                r = cc[0]; g = cc[1]; b = cc[2];
+                if (Hdr.color_components == 4) a = cc[3];
+            }
+
+            PC->LidarPoints[i] = FLidarPointCloudPoint(
+                (double)x, (double)z, (double)(-y), r, g, b, a);
+
+            if (WidthF && i < WidthCount)
+                PC->Widths[(int32)i] = WidthF[i * WidthComps];
+        }
+
+        for (int32 k = 0; k < 3; ++k)
+        {
+            Boxes[c].Min[k] = MinC[k];
+            Boxes[c].Max[k] = MaxC[k];
+        }
+    });
+
+    float MinU[3] = { 0.f, 0.f, 0.f };
+    float MaxU[3] = { 0.f, 0.f, 0.f };
+    for (const FChunkBox& B : Boxes)
+    {
+        for (int32 k = 0; k < 3; ++k)
+        {
+            MinU[k] = FMath::Min(MinU[k], B.Min[k]);
+            MaxU[k] = FMath::Max(MaxU[k], B.Max[k]);
+        }
+    }
+
+    PC->BoundingBoxMin = FVector(MinU[0], MinU[2], -MinU[1]);
+    PC->BoundingBoxMax = FVector(MaxU[0], MaxU[2], -MaxU[1]);
+
+    OutCloud = MoveTemp(PC);
+    return true;
+}
+#endif // WITH_ANARI_USD_MIDDLEWARE
+
+bool UJUSYNCSubsystem::LoadUSDFullCompactFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCCompactMeshRef>& OutMeshes, TArray<FJUSYNCPointCloudRef>& OutPointCloudData)
+{
+#ifdef WITH_ANARI_USD_MIDDLEWARE
+    if (!bIsInitialized.load())
+    {
+        UE_LOG(LogTemp, Error, TEXT("JUSYNC: LoadUSDFullCompactFromBuffer called but middleware is not initialized"));
+        return false;
+    }
+
+    OutMeshes.Empty();
+    OutPointCloudData.Empty();
+
+    if (Buffer.Num() == 0)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("JUSYNC: LoadUSDFullCompactFromBuffer called with empty buffer"));
+        return false;
+    }
+
+    // JUSYNC RawGeo: a JSG1-magic payload fills the cloud struct straight
+    // from the raw float arrays — no USD parse at any stage.
+    {
+        uint32 MaybeMagic = 0;
+        FMemory::Memcpy(&MaybeMagic, Buffer.GetData(), sizeof(MaybeMagic));
+        if (MaybeMagic == anari_usd_protocol::JUSYNC_RAWGEO_MAGIC)
+        {
+            FJUSYNCPointCloudRef Cloud;
+            if (JUSYNCParseRawGeoBuffer(Buffer, Cloud))
+            {
+                OutPointCloudData.Add(MoveTemp(Cloud));
+                UE_LOG(LogTemp, Log, TEXT("JUSYNC: RawGeo payload: 1 point cloud (%d points) from '%s'"),
+                    OutPointCloudData[0]->PointCount, *Filename);
+                return true;
+            }
+            UE_LOG(LogTemp, Warning, TEXT("JUSYNC: RawGeo magic but malformed payload for '%s' (%d bytes)"),
+                *Filename, Buffer.Num());
+            return false;
+        }
+    }
+
+    FTCHARToUTF8 FilenameConverter(*Filename);
+    const char* FilenameCStr = FilenameConverter.Get();
+
+    void* ParseHandle = nullptr;
+    CMeshLayout* MeshLayouts = nullptr;
+    size_t MeshCount = 0;
+    CPointCloudLayout* CloudLayouts = nullptr;
+    size_t CloudCount = 0;
+
+    int Result = 0;
+    {
+        FScopeLock Lock(&ParseMutex);
+        Result = QueryUSDFullLayout_C(
+            Buffer.GetData(), Buffer.Num(), FilenameCStr,
+            &ParseHandle, &MeshLayouts, &MeshCount,
+            &CloudLayouts, &CloudCount
+        );
+    }
+
+    if (Result != 1 || !ParseHandle)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("JUSYNC: LoadUSDFullCompactFromBuffer failed for '%s' (buffer=%d bytes, C_result=%d MeshCount=%llu CloudCount=%llu)"),
+            *Filename, Buffer.Num(), Result, (uint64)MeshCount, (uint64)CloudCount);
+        if (ParseHandle) FreeParsedUSD_C(ParseHandle);
+        FreeUSDFullLayouts_C(MeshLayouts, MeshCount, CloudLayouts, CloudCount);
+        return false;
+    }
+
+    if (MeshCount > 0)
+    {
+        OutMeshes.SetNum(static_cast<int32>(MeshCount));
+        CMeshDataFillCompact* FillMeshes = reinterpret_cast<CMeshDataFillCompact*>(FMemory::Malloc(MeshCount * sizeof(CMeshDataFillCompact)));
+        FMemory::Memzero(FillMeshes, MeshCount * sizeof(CMeshDataFillCompact));
+
+        for (size_t i = 0; i < MeshCount; ++i)
+        {
+            const CMeshLayout& lay = MeshLayouts[i];
+            OutMeshes[i] = MakeShared<FJUSYNCCompactMeshData, ESPMode::ThreadSafe>();
+            FJUSYNCCompactMeshData& Mesh = *OutMeshes[i];
+            CMeshDataFillCompact& dst = FillMeshes[i];
+
+            Mesh.ElementName = UTF8_TO_TCHAR(lay.element_name);
+            Mesh.TypeName = UTF8_TO_TCHAR(lay.type_name);
+
+            if (lay.points_count > 0) Mesh.Points.SetNumUninitialized(static_cast<int32>(lay.points_count));
+            if (lay.indices_count > 0) Mesh.Triangles.SetNumUninitialized(static_cast<int32>(lay.indices_count));
+            if (lay.normals_count > 0) Mesh.Normals.SetNumUninitialized(static_cast<int32>(lay.normals_count));
+            if (lay.uvs_count > 0) Mesh.UVs.SetNumUninitialized(static_cast<int32>(lay.uvs_count));
+            if (lay.vertex_colors_count > 0) Mesh.VertexColors.SetNumUninitialized(static_cast<int32>(lay.vertex_colors_count));
+
+            dst.points = Mesh.Points.Num() > 0 ? reinterpret_cast<float*>(Mesh.Points.GetData()) : nullptr;
+            dst.indices = Mesh.Triangles.Num() > 0 ? Mesh.Triangles.GetData() : nullptr;
+            dst.normals = Mesh.Normals.Num() > 0 ? reinterpret_cast<float*>(Mesh.Normals.GetData()) : nullptr;
+            dst.uvs = Mesh.UVs.Num() > 0 ? reinterpret_cast<float*>(Mesh.UVs.GetData()) : nullptr;
+            dst.vertex_colors8 = Mesh.VertexColors.Num() > 0 ? reinterpret_cast<unsigned char*>(Mesh.VertexColors.GetData()) : nullptr;
+        }
+
+        const int FillResult = FillUSDFullCompact_C(ParseHandle, FillMeshes, MeshCount, nullptr, 0);
+        FMemory::Free(FillMeshes);
+        if (FillResult != 1)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("JUSYNC: FillUSDFullCompact_C (meshes) failed for '%s'"), *Filename);
+            FreeParsedUSD_C(ParseHandle);
+            FreeUSDFullLayouts_C(MeshLayouts, MeshCount, CloudLayouts, CloudCount);
+            return false;
+        }
+
+        for (int32 i = 0; i < OutMeshes.Num(); ++i)
+        {
+            FJUSYNCCompactMeshData& Mesh = *OutMeshes[i];
+            for (int32 j = 0; j < Mesh.Normals.Num(); ++j)
+            {
+                Mesh.Normals[j] = Mesh.Normals[j].GetSafeNormal();
+                if (Mesh.Normals[j].IsNearlyZero())
+                {
+                    Mesh.Normals[j] = FVector3f(0.0f, 0.0f, 1.0f);
+                }
+            }
+            Mesh.bHasBakedColors = Mesh.VertexColors.Num() > 0;
+        }
+    }
+
+    if (CloudCount > 0)
+    {
+        OutPointCloudData.SetNum(static_cast<int32>(CloudCount));
+        CPointCloudDataFill* FillClouds = reinterpret_cast<CPointCloudDataFill*>(FMemory::Malloc(CloudCount * sizeof(CPointCloudDataFill)));
+        FMemory::Memzero(FillClouds, CloudCount * sizeof(CPointCloudDataFill));
+
+        for (size_t i = 0; i < CloudCount; ++i)
+        {
+            const CPointCloudLayout& lay = CloudLayouts[i];
+            OutPointCloudData[i] = MakeShared<FJUSYNCPointCloudData, ESPMode::ThreadSafe>();
+            FJUSYNCPointCloudData& pc = *OutPointCloudData[i];
+            CPointCloudDataFill& dst = FillClouds[i];
+
+            pc.ElementName = UTF8_TO_TCHAR(lay.element_name);
+            pc.TypeName = TEXT("GeomPoints");
+            pc.PointCount = static_cast<int32>(lay.point_count);
+            pc.bHasColors = lay.has_colors != 0;
+            pc.bHasNormals = lay.has_normals != 0;
+
+            const bool bLUTReadyForDirectFill = PCSpawner.IsValid() && PCSpawner->GetGradientLUT().Num() > 0;
+            const bool bUseDirectLidarFill = lay.point_count > 0 &&
+                (lay.has_colors || !lay.has_widths || bLUTReadyForDirectFill);
+
+            if (bUseDirectLidarFill)
+            {
+                static_assert(sizeof(FLidarPointCloudPoint) == sizeof(CPointCloudLidarPoint_v1),
+                    "FLidarPointCloudPoint layout no longer matches CPointCloudLidarPoint_v1");
+
+                pc.bHasLidarPoints = true;
+                pc.LidarPoints.SetNumUninitialized(pc.PointCount);
+
+                dst.lidar_points = pc.LidarPoints.Num() > 0 ? pc.LidarPoints.GetData() : nullptr;
+                dst.lidar_point_stride = static_cast<int32_t>(sizeof(FLidarPointCloudPoint));
+                dst.lidar_point_version = 1u;
+            }
+            else
+            {
+                if (lay.point_count > 0) pc.Positions.SetNumUninitialized(pc.PointCount);
+                if (lay.has_colors && lay.point_count > 0) pc.Colors.SetNumUninitialized(pc.PointCount);
+            }
+
+            if (lay.has_widths && lay.point_count > 0) pc.Widths.SetNumUninitialized(pc.PointCount);
+
+            dst.positions = pc.Positions.Num() > 0 ? reinterpret_cast<double*>(pc.Positions.GetData()) : nullptr;
+            dst.colors8 = pc.Colors.Num() > 0 ? reinterpret_cast<unsigned char*>(pc.Colors.GetData()) : nullptr;
+            dst.widths = pc.Widths.Num() > 0 ? pc.Widths.GetData() : nullptr;
+        }
+
+        const int FillResult = FillUSDFullCompact_C(ParseHandle, nullptr, 0, FillClouds, CloudCount);
+        if (FillResult != 1)
+        {
+            UE_LOG(LogTemp, Warning, TEXT("JUSYNC: FillUSDFullCompact_C (point clouds) failed for '%s'"), *Filename);
+            FMemory::Free(FillClouds);
+            FreeParsedUSD_C(ParseHandle);
+            FreeUSDFullLayouts_C(MeshLayouts, MeshCount, CloudLayouts, CloudCount);
+            return false;
+        }
+
+        for (int32 i = 0; i < OutPointCloudData.Num(); ++i)
+        {
+            const CPointCloudDataFill& dst = FillClouds[i];
+            OutPointCloudData[i]->BoundingBoxMin = FVector(dst.bounding_box_min[0], dst.bounding_box_min[2], -dst.bounding_box_min[1]);
+            OutPointCloudData[i]->BoundingBoxMax = FVector(dst.bounding_box_max[0], dst.bounding_box_max[2], -dst.bounding_box_max[1]);
+        }
+        FMemory::Free(FillClouds);
+    }
+
+    FreeParsedUSD_C(ParseHandle);
+    FreeUSDFullLayouts_C(MeshLayouts, MeshCount, CloudLayouts, CloudCount);
+
+    UE_LOG(LogTemp, Log, TEXT("JUSYNC: LoadUSDFullCompactFromBuffer: %d compact meshes + %d point clouds from '%s'"),
+        OutMeshes.Num(), OutPointCloudData.Num(), *Filename);
+    return true;
+#else
+    UE_LOG(LogTemp, Warning, TEXT("JUSYNC: LoadUSDFullCompactFromBuffer called but middleware not available"));
     return false;
 #endif
 }
@@ -1076,6 +2107,23 @@ bool UJUSYNCSubsystem::GetPNGDimensions(const TArray<uint8>& Buffer, int32& OutW
     return false;
 }
 
+void UJUSYNCSubsystem::EnableSpawnedMeshCollision(URealtimeMeshComponent* RealtimeMeshComponent, URealtimeMeshSimple* RealtimeMesh) const
+{
+    if (!bEnableSpawnedMeshCollision || !RealtimeMeshComponent || !RealtimeMesh)
+    {
+        return;
+    }
+
+    FRealtimeMeshCollisionConfiguration CollisionConfig = RealtimeMesh->GetCollisionConfig();
+    CollisionConfig.bUseComplexAsSimpleCollision = true;
+    RealtimeMesh->SetCollisionConfig(CollisionConfig);
+
+    RealtimeMeshComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+    RealtimeMeshComponent->SetCollisionObjectType(ECC_WorldDynamic);
+    RealtimeMeshComponent->SetCollisionResponseToAllChannels(ECR_Block);
+    RealtimeMeshComponent->SetGenerateOverlapEvents(false);
+}
+
 void UJUSYNCSubsystem::ApplyCachedGradientToSpawner()
 {
 #ifndef WITH_ANARI_USD_MIDDLEWARE
@@ -1091,7 +2139,7 @@ void UJUSYNCSubsystem::ApplyCachedGradientToSpawner()
     int Result = GetCachedGradientTexture_C(&gradientData, &gradientSize, &width, &height);
     if (Result != 1 || !gradientData || gradientSize == 0 || width < 1 || height < 1)
     {
-        UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC: No cached gradient texture in middleware"));
+        UE_LOG(LogJUSYNC, Verbose, TEXT("JUSYNC: No cached gradient texture in middleware (expected if no PC parsed yet)"));
         return;
     }
 
@@ -1189,7 +2237,7 @@ void RecalculateNormals(FJUSYNCMeshData& MeshData)
             FVector v1 = MeshData.Vertices[i1];
             FVector v2 = MeshData.Vertices[i2];
             
-            // âœ… FIXED: Calculate normal for counter-clockwise winding (v2-v0 x v1-v0)
+            // FIXED: Calculate normal for counter-clockwise winding (v2-v0 x v1-v0)
             FVector FaceNormal = FVector::CrossProduct(v2 - v0, v1 - v0).GetSafeNormal();
             
             // Ensure normal points outward (you may need to flip this if still wrong)
@@ -1212,20 +2260,237 @@ void RecalculateNormals(FJUSYNCMeshData& MeshData)
     UE_LOG(LogJUSYNC, Log, TEXT("Recalculated normals with correct CCW winding"));
 }
 
+bool UJUSYNCSubsystem::UpdateRealtimeMeshFromJUSYNC(
+    const FJUSYNCMeshData& MeshData,
+    URealtimeMeshComponent* RealtimeMeshComponent,
+    UMaterialInterface* MaterialToApply,
+    RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams)
+{
+    if (!RealtimeMeshComponent || !RealtimeMeshComponent->IsValidLowLevel())
+    {
+        return false;
+    }
+    if (!MeshData.IsValid())
+    {
+        return false;
+    }
+
+    const double UpdateStart = FPlatformTime::Seconds();
+    RealtimeMesh::FRealtimeMeshStreamSet Streams;
+    if (PrebuiltStreams)
+    {
+        Streams = MoveTemp(*PrebuiltStreams);
+    }
+    else
+    {
+        const double BuildStart = FPlatformTime::Seconds();
+        if (!JUSYNCBuildRealtimeMeshStreams(MeshData, Streams))
+        {
+            return false;
+        }
+        UE_LOG(LogJUSYNC, Verbose, TEXT("JUSYNC PERF BuildStreams '%s' %.3f ms"),
+               *MeshData.ElementName, (FPlatformTime::Seconds() - BuildStart) * 1000.0);
+    }
+
+    URealtimeMeshSimple* RealtimeMesh = Cast<URealtimeMeshSimple>(RealtimeMeshComponent->GetRealtimeMesh());
+    if (!RealtimeMesh)
+    {
+        RealtimeMesh = RealtimeMeshComponent->InitializeRealtimeMesh<URealtimeMeshSimple>();
+    }
+    if (!RealtimeMesh)
+    {
+        return false;
+    }
+
+    RealtimeMesh->SetupMaterialSlot(0, TEXT("PrimaryMaterial"));
+
+    UMaterialInterface* ActiveMaterial = MaterialToApply ? MaterialToApply : RealtimeMeshComponent->GetMaterial(0);
+    if (!ActiveMaterial)
+    {
+        ActiveMaterial = GetCachedMaterial(TEXT("/Game/Materials/M_VertexColor"));
+        if (!ActiveMaterial)
+        {
+            UMaterialInterface* DefaultMat = GetCachedMaterial(TEXT("/Engine/EngineMaterials/DefaultMaterial"));
+            if (DefaultMat)
+            {
+                auto* DynMat = UMaterialInstanceDynamic::Create(DefaultMat, RealtimeMeshComponent);
+                if (DynMat)
+                {
+                    DynMat->SetScalarParameterValue(TEXT("UseVertexColor"), 1.0f);
+                    ActiveMaterial = DynMat;
+                }
+            }
+        }
+    }
+    const FRealtimeMeshSectionGroupKey GroupKey = FRealtimeMeshSectionGroupKey::Create(0, TEXT("USDGroup"));
+    const FRealtimeMeshSectionKey SectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 0);
+
+    if (RealtimeMesh->GetSectionGroup(GroupKey))
+    {
+        RealtimeMesh->UpdateSectionGroup(GroupKey, MoveTemp(Streams));
+    }
+    else
+    {
+        RealtimeMesh->CreateSectionGroup(GroupKey, MoveTemp(Streams));
+    }
+
+    FRealtimeMeshSectionConfig SectionConfig(0);
+    SectionConfig.bIsVisible = true;
+    SectionConfig.bCastsShadow = true;
+    RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, bEnableSpawnedMeshCollision);
+    EnableSpawnedMeshCollision(RealtimeMeshComponent, RealtimeMesh);
+
+    if (ActiveMaterial)
+    {
+        RealtimeMeshComponent->SetMaterial(0, ActiveMaterial);
+    }
+
+    UE_LOG(LogJUSYNC, Verbose, TEXT("JUSYNC PERF UpdateRealtimeMesh '%s' %.3f ms"),
+           *MeshData.ElementName, (FPlatformTime::Seconds() - UpdateStart) * 1000.0);
+    return true;
+}
+
+bool UJUSYNCSubsystem::UpdateRealtimeMeshFromJUSYNC_WithCompact(
+    const FJUSYNCCompactMeshData& MeshData,
+    URealtimeMeshComponent* RealtimeMeshComponent,
+    UMaterialInterface* MaterialToApply,
+    RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams)
+{
+    if (!RealtimeMeshComponent || !RealtimeMeshComponent->IsValidLowLevel())
+    {
+        return false;
+    }
+    if (!MeshData.IsValid())
+    {
+        return false;
+    }
+
+    const double UpdateStart = FPlatformTime::Seconds();
+
+    // GPU time-morph: previous displayed sample goes into UV1/UV2 (float32),
+    // the material's WPO branch interpolates Position(prev -> curr) via JusyncMorphT.
+    bool bMorphBlend = false;
+    TArray<FVector3f> MorphPrev;
+    if (MeshMorpher.IsValid())
+    {
+        UMaterialInterface* IntentMaterial = MaterialToApply
+            ? MaterialToApply
+            : static_cast<UMaterialInterface*>(RealtimeMeshComponent->GetMaterial(0));
+        bMorphBlend = (MeshMorpher->BeginUpdate(RealtimeMeshComponent, IntentMaterial,
+                                                MeshData, UpdateStart, MorphPrev)
+                       == FJUSYNCMeshMorpher::EApplyMode::Blend);
+    }
+
+    RealtimeMesh::FRealtimeMeshStreamSet Streams;
+    bool bStreamsBuilt = false;
+    if (bMorphBlend)
+    {
+        bStreamsBuilt = JUSYNCBuildRealtimeMeshStreams(MeshData, Streams, &MorphPrev);
+        if (!bStreamsBuilt)
+        {
+            bMorphBlend = false;
+        }
+    }
+    if (!bStreamsBuilt)
+    {
+        if (PrebuiltStreams)
+        {
+            Streams = MoveTemp(*PrebuiltStreams);
+        }
+        else if (!JUSYNCBuildRealtimeMeshStreams(MeshData, Streams))
+        {
+            return false;
+        }
+    }
+
+    URealtimeMeshSimple* RealtimeMesh = Cast<URealtimeMeshSimple>(RealtimeMeshComponent->GetRealtimeMesh());
+    if (!RealtimeMesh)
+    {
+        RealtimeMesh = RealtimeMeshComponent->InitializeRealtimeMesh<URealtimeMeshSimple>();
+    }
+    if (!RealtimeMesh)
+    {
+        return false;
+    }
+
+    RealtimeMesh->SetupMaterialSlot(0, TEXT("PrimaryMaterial"));
+
+    UMaterialInterface* ActiveMaterial = MaterialToApply ? MaterialToApply : RealtimeMeshComponent->GetMaterial(0);
+    if (!ActiveMaterial)
+    {
+        ActiveMaterial = GetCachedMaterial(TEXT("/Game/Materials/M_VertexColor"));
+        if (!ActiveMaterial)
+        {
+            UMaterialInterface* DefaultMat = GetCachedMaterial(TEXT("/Engine/EngineMaterials/DefaultMaterial"));
+            if (DefaultMat)
+            {
+                auto* DynMat = UMaterialInstanceDynamic::Create(DefaultMat, RealtimeMeshComponent);
+                if (DynMat)
+                {
+                    DynMat->SetScalarParameterValue(TEXT("UseVertexColor"), 1.0f);
+                    ActiveMaterial = DynMat;
+                }
+            }
+        }
+    }
+
+    const FRealtimeMeshSectionGroupKey GroupKey = FRealtimeMeshSectionGroupKey::Create(0, TEXT("USDGroup"));
+    const FRealtimeMeshSectionKey SectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 0);
+
+    if (RealtimeMesh->GetSectionGroup(GroupKey))
+    {
+        RealtimeMesh->UpdateSectionGroup(GroupKey, MoveTemp(Streams));
+    }
+    else
+    {
+        RealtimeMesh->CreateSectionGroup(GroupKey, MoveTemp(Streams));
+    }
+
+    FRealtimeMeshSectionConfig SectionConfig(0);
+    SectionConfig.bIsVisible = true;
+    SectionConfig.bCastsShadow = true;
+    RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, bEnableSpawnedMeshCollision);
+    EnableSpawnedMeshCollision(RealtimeMeshComponent, RealtimeMesh);
+
+    if (ActiveMaterial)
+    {
+        RealtimeMeshComponent->SetMaterial(0, ActiveMaterial);
+    }
+
+    if (MeshMorpher.IsValid())
+    {
+        // After the material slot is finalized so the MID wraps the material that will
+        // actually render this update. Records the new key + starts (or skips) the blend.
+        MeshMorpher->Commit(RealtimeMeshComponent, MeshData, FPlatformTime::Seconds(),
+                            bMorphBlend, MoveTemp(MorphPrev));
+    }
+
+    UE_LOG(LogJUSYNC, Verbose, TEXT("JUSYNC PERF UpdateRealtimeMeshCompact '%s' %.3f ms"),
+        *MeshData.ElementName, (FPlatformTime::Seconds() - UpdateStart) * 1000.0);
+    return true;
+}
+
 bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNC(
     const FJUSYNCMeshData& InMeshData,
     URealtimeMeshComponent* RealtimeMeshComponent)
 {
-    // Enhanced safety checks
+    return CreateRealtimeMeshFromJUSYNC_WithStreams(InMeshData, RealtimeMeshComponent, nullptr);
+}
+
+bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNC_WithStreams(
+    const FJUSYNCMeshData& InMeshData,
+    URealtimeMeshComponent* RealtimeMeshComponent,
+    RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams)
+{
     if (!RealtimeMeshComponent || !RealtimeMeshComponent->IsValidLowLevel())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Invalid or destroyed RealtimeMeshComponent"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Invalid or destroyed RealtimeMeshComponent"));
         return false;
     }
 
     if (!InMeshData.IsValid())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Invalid mesh data"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Invalid mesh data"));
         return false;
     }
 
@@ -1235,17 +2500,16 @@ bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNC(
     // Additional validation of mesh data arrays
     if (MeshData.Vertices.Num() == 0)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Mesh has no vertices"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Mesh has no vertices"));
         return false;
     }
 
     if (MeshData.Triangles.Num() < 3 || (MeshData.Triangles.Num() % 3) != 0)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Invalid triangle count: %d (must be multiple of 3)"), MeshData.Triangles.Num());
+        UE_LOG(LogJUSYNC, Error, TEXT("Invalid triangle count: %d (must be multiple of 3)"), MeshData.Triangles.Num());
         return false;
     }
 
-    UE_LOG(LogJUSYNC, Log, TEXT("ðŸŽ¨ === SMOOTH VERTEX INTERPOLATION MESH CREATION ==="));
     UE_LOG(LogJUSYNC, Log, TEXT("Mesh: %d vertices, %d triangles, %d colors"),
            MeshData.Vertices.Num(), MeshData.Triangles.Num() / 3, MeshData.VertexColors.Num());
 
@@ -1256,28 +2520,35 @@ bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNC(
     // Safety: Ensure we don't exceed reasonable limits
     if (FinalVertexCount > 1000000)
     {
-        UE_LOG(LogJUSYNC, Warning, TEXT("âš ï¸ Very large mesh: %d vertices (consider splitting)"), FinalVertexCount);
+        UE_LOG(LogJUSYNC, Warning, TEXT("Very large mesh: %d vertices (consider splitting)"), FinalVertexCount);
     }
 
     // Initialize RealtimeMesh builder
     URealtimeMeshSimple* RealtimeMesh = RealtimeMeshComponent->InitializeRealtimeMesh<URealtimeMeshSimple>();
     if (!RealtimeMesh)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to initialize RealtimeMesh"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to initialize RealtimeMesh"));
         return false;
     }
 
     RealtimeMesh->SetupMaterialSlot(0, TEXT("PrimaryMaterial"));
 
+    // Capture any material set before mesh creation (e.g. spawner SpawnMaterial).
+    // Section creation below can drop the binding, so it is re-applied afterwards.
+    UMaterialInterface* ExistingMaterial = RealtimeMeshComponent->GetMaterial(0);
+
+    ExistingMaterial = JUSYNCResolveMaterialForColoredMesh(this, ExistingMaterial, MeshData.VertexColors,
+        RealtimeMeshComponent, TEXT("CreateRealtimeMeshFromJUSYNC"));
+
     // Only apply vertex color material if no material is already set
-    if (!RealtimeMeshComponent->GetMaterial(0))
+    if (!ExistingMaterial)
     {
         // Use cached material instead of loading synchronously each time
         UMaterialInterface* VertexColorMaterial = GetCachedMaterial(TEXT("/Game/Materials/M_VertexColor"));
         if (VertexColorMaterial)
         {
             RealtimeMeshComponent->SetMaterial(0, VertexColorMaterial);
-            UE_LOG(LogJUSYNC, Log, TEXT("âœ… Applied cached M_VertexColor material as fallback"));
+            UE_LOG(LogJUSYNC, Log, TEXT("Applied cached M_VertexColor material as fallback"));
         }
         else
         {
@@ -1288,97 +2559,152 @@ bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNC(
                 auto* DynMat = UMaterialInstanceDynamic::Create(DefaultMat, RealtimeMeshComponent);
                 DynMat->SetScalarParameterValue(TEXT("UseVertexColor"), 1.0f);
                 RealtimeMeshComponent->SetMaterial(0, DynMat);
-                UE_LOG(LogJUSYNC, Log, TEXT("âœ… Applied enhanced default material as fallback"));
+                UE_LOG(LogJUSYNC, Log, TEXT("Applied enhanced default material as fallback"));
             }
         }
     }
     else
     {
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Using provided material (preserving texture material from Blueprint)"));
+        UE_LOG(LogJUSYNC, Log, TEXT("Using provided material (preserving texture material from Blueprint)"));
     }
 
 
     RealtimeMesh::FRealtimeMeshStreamSet Streams;
-    auto Builder = RealtimeMesh::TRealtimeMeshBuilderLocal<uint32>(Streams);
-    Builder.EnableTangents();
-    Builder.EnableTexCoords();
-    Builder.EnableColors();
-    Builder.EnablePolyGroups();
-
-    // Add vertices and attributes - OPTIMIZED for performance
-    // Pre-calculate common values to avoid repeated function calls
-    const bool bHasNormals = MeshData.HasNormals();
-    const bool bHasUVs = MeshData.HasUVs();
-    const bool bHasVertexColors = MeshData.HasVertexColors();
-    
-    for (int32 i = 0; i < FinalVertexCount; ++i)
+    if (PrebuiltStreams)
     {
-        Builder.AddVertex(FVector3f(MeshData.Vertices[i]));
-
-        // Normals - optimized check
-        FVector3f N = bHasNormals && MeshData.Normals.IsValidIndex(i) 
-            ? FVector3f(MeshData.Normals[i]) 
-            : FVector3f(0.0f, 0.0f, 1.0f); // Default up vector
-        Builder.SetNormal(i, N);
-
-        // UVs - optimized check
-        if (bHasUVs && MeshData.UVs.IsValidIndex(i))
-        {
-            Builder.SetTexCoord(i, 0, FVector2DHalf(FVector2f(MeshData.UVs[i])));
-        }
-        else
-        {
-            Builder.SetTexCoord(i, 0, FVector2DHalf(FVector2f::ZeroVector));
-        }
-
-        // Colors - optimized check
-        if (bHasVertexColors && MeshData.VertexColors.IsValidIndex(i))
-        {
-            FColor VertexColor = MeshData.VertexColors[i];
-            Builder.SetColor(i, VertexColor);
-        }
-        else
-        {
-            Builder.SetColor(i, FColor::White);
-        }
+        Streams = MoveTemp(*PrebuiltStreams);
     }
-
-    // Add triangles - OPTIMIZED
-    const int32* TrianglesPtr = MeshData.Triangles.GetData();
-    for (int32 Face = 0; Face < FinalTriCount; ++Face)
+    else if (!JUSYNCBuildRealtimeMeshStreams(MeshData, Streams))
     {
-        int32 baseIdx = Face * 3;
-        int32 i0 = TrianglesPtr[baseIdx];
-        int32 i1 = TrianglesPtr[baseIdx + 1];
-        int32 i2 = TrianglesPtr[baseIdx + 2];
-        
-        // Fast bounds checking - most triangles will be valid
-        if (i0 < FinalVertexCount && i1 < FinalVertexCount && i2 < FinalVertexCount)
-        {
-            Builder.AddTriangle(i0, i1, i2);
-        }
-        else
-        {
-            UE_LOG(LogJUSYNC, Error, TEXT("âŒ Invalid triangle %d: [%d,%d,%d] vs %d vertices"), 
-                   Face, i0, i1, i2, FinalVertexCount);
-        }
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to build RealtimeMesh streams for '%s'"), *MeshData.ElementName);
+        return false;
     }
 
     // Finalize the mesh section
     const FRealtimeMeshSectionGroupKey GroupKey = FRealtimeMeshSectionGroupKey::Create(0, TEXT("USDGroup"));
     const FRealtimeMeshSectionKey SectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 0);
-    RealtimeMesh->CreateSectionGroup(GroupKey, Streams);
+    RealtimeMesh->CreateSectionGroup(GroupKey, MoveTemp(Streams));
     FRealtimeMeshSectionConfig SectionConfig(0);
     SectionConfig.bIsVisible = true;
     SectionConfig.bCastsShadow = true;
-    RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, true);
+    RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, bEnableSpawnedMeshCollision);
+    EnableSpawnedMeshCollision(RealtimeMeshComponent, RealtimeMesh);
 
-    RealtimeMeshComponent->MarkRenderStateDirty();
+    // Mirrors the async path: section creation can drop the material
+    // binding, so force reapplication of the pre-set material afterwards.
+    if (ExistingMaterial)
+    {
+        RealtimeMeshComponent->SetMaterial(0, ExistingMaterial);
+        UE_LOG(LogJUSYNC, Log, TEXT("Reapplied existing material after sync mesh creation: %s"),
+               *ExistingMaterial->GetName());
+    }
     
-    UE_LOG(LogJUSYNC, Log, TEXT("ðŸŽ¨ === SMOOTH VERTEX INTERPOLATION MESH CREATION COMPLETE ==="));
-    UE_LOG(LogJUSYNC, Log, TEXT("âœ… CreateRealtimeMeshFromJUSYNC: Smooth mesh created '%s' (%d verts, %d tris)"),
+    UE_LOG(LogJUSYNC, Log, TEXT("CreateRealtimeMeshFromJUSYNC: Smooth mesh created '%s' (%d verts, %d tris)"),
            *MeshData.ElementName, FinalVertexCount, FinalTriCount);
 
+    return true;
+}
+
+bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNC_WithCompact(
+    const FJUSYNCCompactMeshData& InMeshData,
+    URealtimeMeshComponent* RealtimeMeshComponent,
+    RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams)
+{
+    if (!RealtimeMeshComponent || !RealtimeMeshComponent->IsValidLowLevel())
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("Invalid or destroyed RealtimeMeshComponent"));
+        return false;
+    }
+
+    if (!InMeshData.IsValid())
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("Invalid compact mesh data"));
+        return false;
+    }
+
+    const FJUSYNCCompactMeshData& MeshData = InMeshData;
+
+    if (MeshData.Points.Num() == 0 ||
+        MeshData.Triangles.Num() < 3 ||
+        (MeshData.Triangles.Num() % 3) != 0)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("Invalid compact mesh arrays"));
+        return false;
+    }
+
+    UE_LOG(LogJUSYNC, Log, TEXT("COMPACT REALTIME MESH CREATION: %s (%d verts, %d tris, colors=%d)"),
+        *MeshData.ElementName, MeshData.Points.Num(), MeshData.Triangles.Num() / 3, MeshData.HasVertexColors() ? 1 : 0);
+
+    URealtimeMeshSimple* RealtimeMesh = RealtimeMeshComponent->InitializeRealtimeMesh<URealtimeMeshSimple>();
+    if (!RealtimeMesh)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to initialize RealtimeMesh"));
+        return false;
+    }
+
+    RealtimeMesh->SetupMaterialSlot(0, TEXT("PrimaryMaterial"));
+
+    UMaterialInterface* ExistingMaterial = RealtimeMeshComponent->GetMaterial(0);
+
+    ExistingMaterial = JUSYNCResolveMaterialForColoredMesh(this, ExistingMaterial, MeshData.VertexColors,
+        RealtimeMeshComponent, TEXT("CreateRealtimeMeshFromJUSYNC_WithCompact"));
+
+    if (!ExistingMaterial)
+    {
+        UMaterialInterface* VertexColorMaterial = GetCachedMaterial(TEXT("/Game/Materials/M_VertexColor"));
+        if (VertexColorMaterial)
+        {
+            RealtimeMeshComponent->SetMaterial(0, VertexColorMaterial);
+        }
+        else
+        {
+            UMaterialInterface* DefaultMat = GetCachedMaterial(TEXT("/Engine/EngineMaterials/DefaultMaterial"));
+            if (DefaultMat)
+            {
+                auto* DynMat = UMaterialInstanceDynamic::Create(DefaultMat, RealtimeMeshComponent);
+                if (DynMat)
+                {
+                    DynMat->SetScalarParameterValue(TEXT("UseVertexColor"), 1.0f);
+                    RealtimeMeshComponent->SetMaterial(0, DynMat);
+                }
+            }
+        }
+    }
+
+    RealtimeMesh::FRealtimeMeshStreamSet Streams;
+    if (PrebuiltStreams)
+    {
+        Streams = MoveTemp(*PrebuiltStreams);
+    }
+    else if (!JUSYNCBuildRealtimeMeshStreams(MeshData, Streams))
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to build compact RealtimeMesh streams for '%s'"), *MeshData.ElementName);
+        return false;
+    }
+
+    const FRealtimeMeshSectionGroupKey GroupKey = FRealtimeMeshSectionGroupKey::Create(0, TEXT("USDGroup"));
+    const FRealtimeMeshSectionKey SectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 0);
+    RealtimeMesh->CreateSectionGroup(GroupKey, MoveTemp(Streams));
+    FRealtimeMeshSectionConfig SectionConfig(0);
+    SectionConfig.bIsVisible = true;
+    SectionConfig.bCastsShadow = true;
+    RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, bEnableSpawnedMeshCollision);
+    EnableSpawnedMeshCollision(RealtimeMeshComponent, RealtimeMesh);
+
+    if (ExistingMaterial)
+    {
+        RealtimeMeshComponent->SetMaterial(0, ExistingMaterial);
+    }
+
+    if (MeshMorpher.IsValid())
+    {
+        // Baseline for GPU morphing: this spawn's positions become the first
+        // blend source so the NEXT update already moves smoothly.
+        MeshMorpher->Seed(RealtimeMeshComponent, MeshData, FPlatformTime::Seconds());
+    }
+
+    UE_LOG(LogJUSYNC, Log, TEXT("CreateRealtimeMeshFromJUSYNC_WithCompact: '%s' (%d verts, %d tris)"),
+        *MeshData.ElementName, MeshData.Points.Num(), MeshData.Triangles.Num() / 3);
     return true;
 }
 
@@ -1387,23 +2713,21 @@ bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNCWithSplitting(
     URealtimeMeshComponent* RealtimeMeshComponent,
     int32 MaxVerticesPerChunk)
 {
-    // Enhanced safety checks
     if (!RealtimeMeshComponent || !RealtimeMeshComponent->IsValidLowLevel())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Invalid or destroyed RealtimeMeshComponent"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Invalid or destroyed RealtimeMeshComponent"));
         return false;
     }
 
     if (!MeshData.IsValid())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Invalid mesh data"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Invalid mesh data"));
         return false;
     }
 
     const int32 TotalVertices = MeshData.Vertices.Num();
     const int32 TotalTriangles = MeshData.Triangles.Num() / 3;
 
-    UE_LOG(LogJUSYNC, Log, TEXT("ðŸŽ¨ === MESH CREATION WITH SPLITTING ==="));
     UE_LOG(LogJUSYNC, Log, TEXT("Mesh: %d vertices, %d triangles, MaxVerticesPerChunk: %d"),
            TotalVertices, TotalTriangles, MaxVerticesPerChunk);
 
@@ -1422,11 +2746,19 @@ bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNCWithSplitting(
     URealtimeMeshSimple* RealtimeMesh = RealtimeMeshComponent->InitializeRealtimeMesh<URealtimeMeshSimple>();
     if (!RealtimeMesh)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to initialize RealtimeMesh"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to initialize RealtimeMesh"));
         return false;
     }
 
     RealtimeMesh->SetupMaterialSlot(0, TEXT("PrimaryMaterial"));
+
+    UMaterialInterface* ProvidedMaterial = JUSYNCResolveMaterialForColoredMesh(this,
+        RealtimeMeshComponent->GetMaterial(0), MeshData.VertexColors,
+        RealtimeMeshComponent, TEXT("CreateRealtimeMeshFromJUSYNCWithSplitting"));
+    if (ProvidedMaterial && RealtimeMeshComponent->GetMaterial(0) != ProvidedMaterial)
+    {
+        RealtimeMeshComponent->SetMaterial(0, ProvidedMaterial);
+    }
 
     // Apply material if none is set
     if (!RealtimeMeshComponent->GetMaterial(0))
@@ -1435,7 +2767,7 @@ bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNCWithSplitting(
         if (VertexColorMaterial)
         {
             RealtimeMeshComponent->SetMaterial(0, VertexColorMaterial);
-            UE_LOG(LogJUSYNC, Log, TEXT("âœ… Applied cached M_VertexColor material"));
+            UE_LOG(LogJUSYNC, Log, TEXT("Applied cached M_VertexColor material"));
         }
     }
 
@@ -1444,11 +2776,11 @@ bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNCWithSplitting(
     
     if (SplitMeshes.Num() == 0)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to split mesh"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to split mesh"));
         return false;
     }
 
-    UE_LOG(LogJUSYNC, Log, TEXT("âœ… Successfully split mesh into %d chunks"), SplitMeshes.Num());
+    UE_LOG(LogJUSYNC, Log, TEXT("Split mesh into %d chunks"), SplitMeshes.Num());
 
     // Create mesh sections for each chunk
     for (int32 ChunkIdx = 0; ChunkIdx < SplitMeshes.Num(); ++ChunkIdx)
@@ -1511,27 +2843,26 @@ bool UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNCWithSplitting(
             }
             else
             {
-                UE_LOG(LogJUSYNC, Error, TEXT("âŒ Invalid triangle %d in chunk %d: [%d,%d,%d] vs %d vertices"),
+                UE_LOG(LogJUSYNC, Error, TEXT("Invalid triangle %d in chunk %d: [%d,%d,%d] vs %d vertices"),
                        Face, ChunkIdx, i0, i1, i2, VertexCount);
             }
         }
         
         // Create section group
-        RealtimeMesh->CreateSectionGroup(GroupKey, Streams);
-        
+        RealtimeMesh->CreateSectionGroup(GroupKey, MoveTemp(Streams));
+
         // Configure section
         FRealtimeMeshSectionConfig SectionConfig(0);
         SectionConfig.bIsVisible = true;
         SectionConfig.bCastsShadow = true;
-        RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, true);
+        RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, bEnableSpawnedMeshCollision);
+    EnableSpawnedMeshCollision(RealtimeMeshComponent, RealtimeMesh);
         
-        UE_LOG(LogJUSYNC, Log, TEXT("  Created chunk %d: %d vertices, %d triangles"),
+        UE_LOG(LogJUSYNC, Log, TEXT("Created chunk %d: %d vertices, %d triangles"),
                ChunkIdx, VertexCount, TriangleCount);
     }
 
-    UE_LOG(LogJUSYNC, Log, TEXT("âœ… Successfully created mesh with %d sections"), SplitMeshes.Num());
-    UE_LOG(LogJUSYNC, Log, TEXT("ðŸŽ¨ === MESH CREATION WITH SPLITTING COMPLETE ==="));
-
+    UE_LOG(LogJUSYNC, Log, TEXT("Created mesh with %d sections"), SplitMeshes.Num());
     return true;
 }
 
@@ -1544,14 +2875,13 @@ TArray<FJUSYNCMeshData> UJUSYNCSubsystem::SplitLargeMeshForRealtimeMesh(
     
     if (!LargeMesh.IsValid())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot split invalid mesh"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot split invalid mesh"));
         return SplitMeshes;
     }
 
     const int32 TotalVertices = LargeMesh.Vertices.Num();
     const int32 TotalTriangles = LargeMesh.Triangles.Num() / 3;
 
-    UE_LOG(LogJUSYNC, Log, TEXT("ðŸ”ª === SPLITTING LARGE MESH ==="));
     UE_LOG(LogJUSYNC, Log, TEXT("Input: %d vertices, %d triangles"), TotalVertices, TotalTriangles);
     UE_LOG(LogJUSYNC, Log, TEXT("Max vertices per chunk: %d, Preserve connectivity: %s"),
            MaxVerticesPerChunk, bPreserveConnectivity ? TEXT("Yes") : TEXT("No"));
@@ -1737,14 +3067,12 @@ TArray<FJUSYNCMeshData> UJUSYNCSubsystem::SplitLargeMeshForRealtimeMesh(
             SplitMeshes.Add(ChunkMesh);
             ValidChunks++;
             
-            UE_LOG(LogJUSYNC, Log, TEXT("  Chunk %d: %d vertices, %d triangles"),
+            UE_LOG(LogJUSYNC, Log, TEXT("Chunk %d: %d vertices, %d triangles"),
                    ChunkIdx, ChunkMesh.Vertices.Num(), ChunkMesh.Triangles.Num() / 3);
         }
     }
 
-    UE_LOG(LogJUSYNC, Log, TEXT("âœ… Split mesh into %d valid chunks (from %d total grid cells)"), ValidChunks, NumChunks);
-    UE_LOG(LogJUSYNC, Log, TEXT("ðŸ”ª === SPLITTING COMPLETE ==="));
-
+    UE_LOG(LogJUSYNC, Log, TEXT("Split mesh into %d valid chunks (from %d total grid cells)"), ValidChunks, NumChunks);
     // Record the split for benchmarking
     double EndTime = FPlatformTime::Seconds();
     float SplitTime_ms = (EndTime - StartTime) * 1000.0f;
@@ -1764,14 +3092,13 @@ bool UJUSYNCSubsystem::CheckMemoryLimitsForMesh(
 
     if (!MeshData.IsValid())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot check memory limits for invalid mesh"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot check memory limits for invalid mesh"));
         return false;
     }
 
     const int32 TotalVertices = MeshData.Vertices.Num();
     const int32 TotalTriangles = MeshData.Triangles.Num() / 3;
 
-    UE_LOG(LogJUSYNC, Log, TEXT("ðŸ’¾ === MEMORY LIMIT CHECK ==="));
     UE_LOG(LogJUSYNC, Log, TEXT("Mesh: %d vertices, %d triangles"), TotalVertices, TotalTriangles);
     UE_LOG(LogJUSYNC, Log, TEXT("Safety margin: %.1f%%"), SafetyMarginPercent);
 
@@ -1809,7 +3136,7 @@ bool UJUSYNCSubsystem::CheckMemoryLimitsForMesh(
     // Check RAM limits
     if (OutRequiredRAM_MB > SafeAvailableRAMMB)
     {
-        UE_LOG(LogJUSYNC, Warning, TEXT("âš ï¸ Mesh exceeds available RAM (%.2f MB > %.2f MB)"),
+        UE_LOG(LogJUSYNC, Warning, TEXT("Mesh exceeds available RAM (%.2f MB > %.2f MB)"),
                OutRequiredRAM_MB, SafeAvailableRAMMB);
         bCanLoad = false;
     }
@@ -1820,21 +3147,19 @@ bool UJUSYNCSubsystem::CheckMemoryLimitsForMesh(
     
     if (TotalVertices > RecommendedMaxVertices)
     {
-        UE_LOG(LogJUSYNC, Warning, TEXT("âš ï¸ Mesh exceeds RMC vertex limit (%d > %d)"),
+        UE_LOG(LogJUSYNC, Warning, TEXT("Mesh exceeds RMC vertex limit (%d > %d)"),
                TotalVertices, RecommendedMaxVertices);
         bCanLoad = false;
     }
 
     if (TotalTriangles > RecommendedMaxTriangles)
     {
-        UE_LOG(LogJUSYNC, Warning, TEXT("âš ï¸ Mesh exceeds RMC triangle limit (%d > %d)"),
+        UE_LOG(LogJUSYNC, Warning, TEXT("Mesh exceeds RMC triangle limit (%d > %d)"),
                TotalTriangles, RecommendedMaxTriangles);
         bCanLoad = false;
     }
 
-    UE_LOG(LogJUSYNC, Log, TEXT("Can load: %s"), bCanLoad ? TEXT("âœ… Yes") : TEXT("âŒ No"));
-    UE_LOG(LogJUSYNC, Log, TEXT("ðŸ’¾ === MEMORY CHECK COMPLETE ==="));
-
+    UE_LOG(LogJUSYNC, Log, TEXT("Can load: %s"), bCanLoad ? TEXT("Yes") : TEXT("No"));
     return bCanLoad;
 }
 
@@ -1847,17 +3172,16 @@ TArray<URealtimeMeshComponent*> UJUSYNCSubsystem::CreateMultipleRMCComponentsFor
 
     if (!LargeMesh.IsValid())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot create RMC components for invalid mesh"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot create RMC components for invalid mesh"));
         return CreatedComponents;
     }
 
     if (!ParentActor)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Parent actor is null"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Parent actor is null"));
         return CreatedComponents;
     }
 
-    UE_LOG(LogJUSYNC, Log, TEXT("ðŸ—ï¸ === CREATING MULTIPLE RMC COMPONENTS ==="));
     UE_LOG(LogJUSYNC, Log, TEXT("Large mesh: %d vertices, %d triangles"),
            LargeMesh.Vertices.Num(), LargeMesh.Triangles.Num() / 3);
     UE_LOG(LogJUSYNC, Log, TEXT("Parent actor: %s"), *ParentActor->GetName());
@@ -1874,11 +3198,11 @@ TArray<URealtimeMeshComponent*> UJUSYNCSubsystem::CreateMultipleRMCComponentsFor
 
     if (SplitMeshes.Num() == 0)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to split mesh"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to split mesh"));
         return CreatedComponents;
     }
 
-    UE_LOG(LogJUSYNC, Log, TEXT("Successfully split mesh into %d chunks"), SplitMeshes.Num());
+    UE_LOG(LogJUSYNC, Log, TEXT("Split mesh into %d chunks"), SplitMeshes.Num());
 
     // Create RMC component for each split mesh
     for (int32 ChunkIdx = 0; ChunkIdx < SplitMeshes.Num(); ++ChunkIdx)
@@ -1892,7 +3216,7 @@ TArray<URealtimeMeshComponent*> UJUSYNCSubsystem::CreateMultipleRMCComponentsFor
         URealtimeMeshComponent* ChunkComponent = NewObject<URealtimeMeshComponent>(ParentActor, FName(*ComponentName));
         if (!ChunkComponent)
         {
-            UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to create RMC component for chunk %d"), ChunkIdx);
+            UE_LOG(LogJUSYNC, Error, TEXT("Failed to create RMC component for chunk %d"), ChunkIdx);
             continue;
         }
 
@@ -1911,20 +3235,18 @@ TArray<URealtimeMeshComponent*> UJUSYNCSubsystem::CreateMultipleRMCComponentsFor
 
             CreatedComponents.Add(ChunkComponent);
             
-            UE_LOG(LogJUSYNC, Log, TEXT("âœ… Created chunk %d: %s (%d vertices, %d triangles)"),
+            UE_LOG(LogJUSYNC, Log, TEXT("Created chunk %d: %s (%d vertices, %d triangles)"),
                    ChunkIdx, *ChunkComponent->GetName(),
                    ChunkMesh.Vertices.Num(), ChunkMesh.Triangles.Num() / 3);
         }
         else
         {
-            UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to create mesh for chunk %d"), ChunkIdx);
+            UE_LOG(LogJUSYNC, Error, TEXT("Failed to create mesh for chunk %d"), ChunkIdx);
             ChunkComponent->DestroyComponent();
         }
     }
 
-    UE_LOG(LogJUSYNC, Log, TEXT("ðŸ—ï¸ Created %d RMC components for large mesh"), CreatedComponents.Num());
-    UE_LOG(LogJUSYNC, Log, TEXT("ðŸ—ï¸ === RMC COMPONENT CREATION COMPLETE ==="));
-
+    UE_LOG(LogJUSYNC, Log, TEXT("Created %d RMC components for large mesh"), CreatedComponents.Num());
     return CreatedComponents;
 }
 
@@ -2020,7 +3342,7 @@ FJUSYNCRealtimeMeshData UJUSYNCSubsystem::ConvertToRealtimeMeshFormat(const FJUS
             Vertex.UV = FVector2D::ZeroVector;
         }
 
-        // âœ… NEW: Handle vertex colors
+        // NEW: Handle vertex colors
         if (i < StandardMesh.VertexColors.Num())
         {
             Vertex.Color = StandardMesh.VertexColors[i];
@@ -2103,7 +3425,7 @@ bool UJUSYNCSubsystem::LoadPointCloudFromBuffer(const TArray<uint8>& Buffer, con
         pc.BoundingBoxMin = FVector(cpc.bounding_box_min[0], cpc.bounding_box_min[2], -cpc.bounding_box_min[1]);
         pc.BoundingBoxMax = FVector(cpc.bounding_box_max[0], cpc.bounding_box_max[2], -cpc.bounding_box_max[1]);
 
-        // Convert positions: right-handed Z-up (USD) â†’ left-handed Y-up (UE)
+        // Convert positions: right-handed Z-up (USD) -> left-handed Y-up (UE)
         // UE transform: X stays, Y becomes Z, Z becomes -Y
         if (cpc.points_count > 0 && cpc.positions)
         {
@@ -2117,7 +3439,7 @@ bool UJUSYNCSubsystem::LoadPointCloudFromBuffer(const TArray<uint8>& Buffer, con
             }
         }
 
-        // Colors (already 0.0-1.0 floats â†’ FColor 0-255)
+        // Colors (already 0.0-1.0 floats -> FColor 0-255)
         if (cpc.has_colors && cpc.colors && pc.PointCount > 0)
         {
             pc.Colors.SetNum(pc.PointCount);
@@ -2156,14 +3478,14 @@ AActor* UJUSYNCSubsystem::SpawnLidarPointCloudAtLocation(const FJUSYNCPointCloud
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!PointCloudData.IsValid())
     {
-        UE_LOG(LogTemp, Warning, TEXT("JUSYNC: Cannot spawn point cloud â€” invalid data"));
+        UE_LOG(LogTemp, Warning, TEXT("JUSYNC: Cannot spawn point cloud - invalid data"));
         return nullptr;
     }
 
     UWorld* World = GetWorld();
     if (!World)
     {
-        UE_LOG(LogTemp, Warning, TEXT("JUSYNC: Cannot spawn point cloud â€” no valid world"));
+        UE_LOG(LogTemp, Warning, TEXT("JUSYNC: Cannot spawn point cloud - no valid world"));
         return nullptr;
     }
 
@@ -2189,10 +3511,16 @@ AActor* UJUSYNCSubsystem::SpawnLidarPointCloudAtLocation(const FJUSYNCPointCloud
         Comp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
         Comp->ColorSource = ELidarPointCloudColorationMode::Data;
         Comp->PointSize = 1.0f;
-        // Disable node-based streaming culling so all loaded clouds render at any camera distance
+        Comp->SetPointShape(ELidarPointCloudSpriteShape::Square);
+        if (PCSpawner.IsValid())
+        {
+            PCSpawner->ApplyVisualSettingsToComponent(Comp);
+        }
+        // LOD streaming: full depth range, but render only nodes within the view frustum.
+        // r.LidarPointBudget (adaptive) then decimates far nodes to hold the target FPS.
         Comp->MinDepth = 0;
         Comp->MaxDepth = -1;
-        Comp->bUseFrustumCulling = false;
+        Comp->bUseFrustumCulling = true;
     }
 
     // Convert on background thread to avoid blocking the game thread
@@ -2206,15 +3534,19 @@ AActor* UJUSYNCSubsystem::SpawnLidarPointCloudAtLocation(const FJUSYNCPointCloud
     // Copy gradient LUT for thread-safe use (same as spawner path)
     TArray<FColor> PCLUT = PCSpawner.IsValid() ? PCSpawner->GetGradientLUT() : TArray<FColor>();
     bool bUseGradient = PCLUT.Num() > 0 && !bHasColors && Widths.Num() > 0;
+    FJUSYNCPointCloudSpawner* PCSpawnerPtr = PCSpawner.Get();
 
     TWeakObjectPtr<ALidarPointCloudActor> WeakActor = SpawnedActor;
     TWeakObjectPtr<ULidarPointCloudComponent> WeakComp = Comp;
     FString ElementNameForLog = PointCloudData.ElementName;
 
-    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [PointCount, Positions, Colors, bHasColors, Widths, WeakActor, WeakComp, PCLUT, bUseGradient, ElementNameForLog]()
-    {
-        if (!WeakActor.IsValid() || !WeakComp.IsValid()) return;
+    // UObject creation must happen on the game thread. The point array is still built asynchronously.
+    ULidarPointCloud* LidarCloud = NewObject<ULidarPointCloud>(SpawnedActor);
+    LidarCloud->SetOptimizedForDynamicData(true);
+    SpawnedActor->SetActorHiddenInGame(true);
 
+    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [PointCount, Positions, Colors, bHasColors, Widths, WeakActor, WeakComp, PCLUT, bUseGradient, ElementNameForLog, LidarCloud, PCSpawnerPtr]()
+    {
         // Build LiDAR points on background thread
         TArray<FLidarPointCloudPoint> Points;
         Points.SetNum(PointCount);
@@ -2283,17 +3615,25 @@ AActor* UJUSYNCSubsystem::SpawnLidarPointCloudAtLocation(const FJUSYNCPointCloud
             }
         }
 
-        // Create and set point cloud data
-        ULidarPointCloud* LidarCloud = ULidarPointCloud::CreateFromData(Points, false);
-
-        // Marshal back to game thread for component assignment
+        // Marshal back to game thread for data insertion and component assignment
         FFunctionGraphTask::CreateAndDispatchWhenReady(
-            [WeakActor, WeakComp, LidarCloud]()
+            [WeakActor, WeakComp, LidarCloud, Points = MoveTemp(Points), PCSpawnerPtr]() mutable
             {
-                if (WeakComp.IsValid() && LidarCloud)
+                if (!WeakComp.IsValid() || !LidarCloud)
                 {
-                    LidarCloud->RefreshBounds();
-                    WeakComp->SetPointCloud(LidarCloud);
+                    return;
+                }
+
+                const bool bDataAccepted = LidarCloud->SetData(Points);
+                WeakComp->SetPointCloud(LidarCloud);
+
+                if (WeakActor.IsValid() && bDataAccepted)
+                {
+                    if (PCSpawnerPtr)
+                    {
+                        PCSpawnerPtr->RequestNormalCalculation(LidarCloud, WeakActor.Get(), static_cast<int32>(Points.Num()));
+                    }
+                    WeakActor->SetActorHiddenInGame(false);
                 }
             },
             TStatId(), nullptr, ENamedThreads::GameThread);
@@ -2450,7 +3790,7 @@ UMaterialInterface* UJUSYNCSubsystem::GetCachedMaterial(const FString& MaterialP
     if (Material)
     {
         MaterialCache.Add(MaterialPath, Material);
-        UE_LOG(LogJUSYNC, Log, TEXT("Successfully cached material: %s"), *MaterialPath);
+        UE_LOG(LogJUSYNC, Log, TEXT("Cached material: %s"), *MaterialPath);
     }
     else
     {
@@ -2527,19 +3867,21 @@ void UJUSYNCSubsystem::ApplyProcessedMeshToComponent(const FProcessedMeshData& P
 {
     if (!RealtimeMeshComponent)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Invalid component for applying processed mesh"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Invalid component for applying processed mesh"));
         return;
     }
     
     UE_LOG(LogJUSYNC, Log, TEXT("Applying processed mesh to component on game thread: %s"), *ProcessedData.ElementName);
     
-    // **CRITICAL FIX: Store existing material BEFORE any mesh operations**
+    // Store the existing material before mesh operations (they can drop it)
     UMaterialInterface* ExistingMaterial = RealtimeMeshComponent->GetMaterial(0);
+    ExistingMaterial = JUSYNCResolveMaterialForColoredMesh(this, ExistingMaterial, ProcessedData.Colors,
+        RealtimeMeshComponent, TEXT("ApplyProcessedMeshToComponent"));
     bool bHadExistingMaterial = (ExistingMaterial != nullptr);
     
     if (bHadExistingMaterial)
     {
-        UE_LOG(LogJUSYNC, Log, TEXT("ðŸ“¦ Storing existing material for reapplication: %s"),
+        UE_LOG(LogJUSYNC, Log, TEXT("Storing existing material for reapplication: %s"),
                *ExistingMaterial->GetName());
     }
     
@@ -2547,13 +3889,13 @@ void UJUSYNCSubsystem::ApplyProcessedMeshToComponent(const FProcessedMeshData& P
     URealtimeMeshSimple* RealtimeMesh = RealtimeMeshComponent->InitializeRealtimeMesh<URealtimeMeshSimple>();
     if (!RealtimeMesh)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to initialize RealtimeMesh"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to initialize RealtimeMesh"));
         return;
     }
     
     RealtimeMesh->SetupMaterialSlot(0, TEXT("PrimaryMaterial"));
     
-    // **ENHANCED MATERIAL HANDLING**
+    // Material handling
     if (!bHadExistingMaterial)
     {
         // Only apply vertex color material if no material is already set
@@ -2561,7 +3903,7 @@ void UJUSYNCSubsystem::ApplyProcessedMeshToComponent(const FProcessedMeshData& P
         if (VertexColorMaterial)
         {
             RealtimeMeshComponent->SetMaterial(0, VertexColorMaterial);
-            UE_LOG(LogJUSYNC, Log, TEXT("âœ… Applied cached M_VertexColor material as fallback"));
+            UE_LOG(LogJUSYNC, Log, TEXT("Applied cached M_VertexColor material as fallback"));
         }
         else
         {
@@ -2572,13 +3914,13 @@ void UJUSYNCSubsystem::ApplyProcessedMeshToComponent(const FProcessedMeshData& P
                 auto* DynMat = UMaterialInstanceDynamic::Create(DefaultMat, RealtimeMeshComponent);
                 DynMat->SetScalarParameterValue(TEXT("UseVertexColor"), 1.0f);
                 RealtimeMeshComponent->SetMaterial(0, DynMat);
-                UE_LOG(LogJUSYNC, Log, TEXT("âœ… Applied enhanced default material as fallback"));
+                UE_LOG(LogJUSYNC, Log, TEXT("Applied enhanced default material as fallback"));
             }
         }
     }
     else
     {
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Using provided material (preserving texture material from Blueprint)"));
+        UE_LOG(LogJUSYNC, Log, TEXT("Using provided material (preserving texture material from Blueprint)"));
     }
     
     // Create mesh streams from processed data
@@ -2611,7 +3953,7 @@ void UJUSYNCSubsystem::ApplyProcessedMeshToComponent(const FProcessedMeshData& P
         }
         else
         {
-            UE_LOG(LogJUSYNC, Error, TEXT("âŒ Invalid triangle %d: [%d,%d,%d] vs %d vertices"), 
+            UE_LOG(LogJUSYNC, Error, TEXT("Invalid triangle %d: [%d,%d,%d] vs %d vertices"), 
                    Face, i0, i1, i2, ProcessedData.FinalVertexCount);
         }
     }
@@ -2623,33 +3965,34 @@ void UJUSYNCSubsystem::ApplyProcessedMeshToComponent(const FProcessedMeshData& P
     FRealtimeMeshSectionConfig SectionConfig(0);
     SectionConfig.bIsVisible = true;
     SectionConfig.bCastsShadow = true;
-    RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, true);
+    RealtimeMesh->UpdateSectionConfig(SectionKey, SectionConfig, bEnableSpawnedMeshCollision);
+    EnableSpawnedMeshCollision(RealtimeMeshComponent, RealtimeMesh);
     
     RealtimeMeshComponent->MarkRenderStateDirty();
     
-    // **CRITICAL FIX: Reapply existing material after mesh operations**
+    // Reapply the existing material after mesh operations
     if (bHadExistingMaterial && ExistingMaterial)
     {
         // Force reapplication of the material to ensure it's properly bound
         RealtimeMeshComponent->SetMaterial(0, ExistingMaterial);
-        UE_LOG(LogJUSYNC, Log, TEXT("ðŸ”„ Reapplied existing material after mesh creation: %s"),
+        UE_LOG(LogJUSYNC, Log, TEXT("Reapplied existing material after mesh creation: %s"),
                *ExistingMaterial->GetName());
         
         // Additional verification
         UMaterialInterface* CurrentMaterial = RealtimeMeshComponent->GetMaterial(0);
         if (CurrentMaterial == ExistingMaterial)
         {
-            UE_LOG(LogJUSYNC, Log, TEXT("âœ… Material verification passed: Material correctly applied"));
+            UE_LOG(LogJUSYNC, Log, TEXT("Material verification passed: Material correctly applied"));
         }
         else
         {
-            UE_LOG(LogJUSYNC, Warning, TEXT("âš ï¸ Material verification failed: Expected %s, Got %s"),
+            UE_LOG(LogJUSYNC, Warning, TEXT("Material verification failed: Expected %s, Got %s"),
                    *ExistingMaterial->GetName(),
                    CurrentMaterial ? *CurrentMaterial->GetName() : TEXT("NULL"));
         }
     }
     
-    UE_LOG(LogJUSYNC, Log, TEXT("âœ… Applied processed mesh '%s' (%d verts, %d tris)"),
+    UE_LOG(LogJUSYNC, Log, TEXT("Applied processed mesh '%s' (%d verts, %d tris)"),
            *ProcessedData.ElementName, ProcessedData.FinalVertexCount, ProcessedData.FinalTriCount);
 }
 
@@ -2659,11 +4002,11 @@ void UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNC_Async(
 {
     if (!RealtimeMeshComponent || !MeshData.IsValid())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Invalid input to CreateRealtimeMeshFromJUSYNC_Async"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Invalid input to CreateRealtimeMeshFromJUSYNC_Async"));
         return;
     }
     
-    UE_LOG(LogJUSYNC, Log, TEXT("ðŸš€ Starting async mesh creation for: %s"), *MeshData.ElementName);
+    UE_LOG(LogJUSYNC, Log, TEXT("Starting async mesh creation for: %s"), *MeshData.ElementName);
     
     // Make copies for the lambda captures
     FJUSYNCMeshData MeshDataCopy = MeshData;
@@ -2683,7 +4026,7 @@ void UJUSYNCSubsystem::CreateRealtimeMeshFromJUSYNC_Async(
             if (ComponentPtr.IsValid())
             {
                 ApplyProcessedMeshToComponent(ProcessedData, ComponentPtr.Get());
-                UE_LOG(LogJUSYNC, Log, TEXT("ðŸŽ‰ Async mesh creation complete: %s"), *ProcessedData.ElementName);
+                UE_LOG(LogJUSYNC, Log, TEXT("Async mesh creation complete: %s"), *ProcessedData.ElementName);
             }
             else
             {
@@ -2751,7 +4094,7 @@ void UJUSYNCSubsystem::CreateMaterialFromTexture_Async_Return_Internal(
                 // Apply the texture to the material using the specified parameter name
                 DynamicMaterial->SetTextureParameterValue(CapturedTextureParameterName, TexturePtr.Get());
                 
-                UE_LOG(LogJUSYNC, Log, TEXT("âœ… Created dynamic material from texture (Base: %s, Param: %s)"),
+                UE_LOG(LogJUSYNC, Log, TEXT("Created dynamic material from texture (Base: %s, Param: %s)"),
                        *BaseMaterialPtr->GetName(), *CapturedTextureParameterName.ToString());
                 
                 // Call the callback with the created material
@@ -2762,7 +4105,7 @@ void UJUSYNCSubsystem::CreateMaterialFromTexture_Async_Return_Internal(
             }
             else
             {
-                UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to create dynamic material instance"));
+                UE_LOG(LogJUSYNC, Error, TEXT("Failed to create dynamic material instance"));
             }
         });
     });
@@ -2771,6 +4114,11 @@ void UJUSYNCSubsystem::CreateMaterialFromTexture_Async_Return_Internal(
 // ========== REALTIMEMESH SPAWNING IMPLEMENTATION ==========
 
 AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshAtLocation(const FJUSYNCMeshData& MeshData, const FVector& SpawnLocation, const FRotator& SpawnRotation, UMaterialInterface* CustomMaterial)
+{
+    return SpawnRealtimeMeshAtLocation_WithStreams(MeshData, SpawnLocation, SpawnRotation, CustomMaterial, nullptr);
+}
+
+AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshAtLocation_WithStreams(const FJUSYNCMeshData& MeshData, const FVector& SpawnLocation, const FRotator& SpawnRotation, UMaterialInterface* CustomMaterial, RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams)
 {
     if (!MeshData.IsValid())
     {
@@ -2792,7 +4140,7 @@ AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshAtLocation(const FJUSYNCMeshDa
         return nullptr;
     }
 
-    // âœ… CORRECTED: Spawn actor first at origin
+    // CORRECTED: Spawn actor first at origin
     FActorSpawnParameters SpawnParams;
     SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
     
@@ -2818,7 +4166,7 @@ AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshAtLocation(const FJUSYNCMeshDa
     // Actor already has the unique name from spawn parameters
     UE_LOG(LogJUSYNC, Log, TEXT("Spawned actor with final name: %s (original base: %s)"), *SpawnedActor->GetName(), *BaseActorName);
 
-    // âœ… CORRECTED: Create and set root component FIRST
+    // CORRECTED: Create and set root component FIRST
     URealtimeMeshComponent* MeshComp = NewObject<URealtimeMeshComponent>(SpawnedActor);
     SpawnedActor->SetRootComponent(MeshComp);
     MeshComp->RegisterComponent();
@@ -2829,18 +4177,18 @@ AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshAtLocation(const FJUSYNCMeshDa
         MeshComp->SetMaterial(0, CustomMaterial);
     }
     
-    // âœ… CORRECTED: Now set the location AFTER root component is set
+    // CORRECTED: Now set the location AFTER root component is set
     SpawnedActor->SetActorLocation(SpawnLocation);
     SpawnedActor->SetActorRotation(SpawnRotation);
 
     // Create the mesh using your existing function
-    bool bSuccess = Subsystem->CreateRealtimeMeshFromJUSYNC(MeshData, MeshComp);
+    bool bSuccess = Subsystem->CreateRealtimeMeshFromJUSYNC_WithStreams(MeshData, MeshComp, PrebuiltStreams);
     
     if (bSuccess)
     {
-        // âœ… CORRECTED: Verify the actual location after setting
+        // CORRECTED: Verify the actual location after setting
         FVector ActualLocation = SpawnedActor->GetActorLocation();
-        FString Message = FString::Printf(TEXT("âœ… RealtimeMesh spawned: %s at %s"), *MeshData.ElementName, *ActualLocation.ToString());
+        FString Message = FString::Printf(TEXT("RealtimeMesh spawned: %s at %s"), *MeshData.ElementName, *ActualLocation.ToString());
         //DisplayDebugMessage(Message, 5.0f, FLinearColor::Green);
         UE_LOG(LogJUSYNC, Log, TEXT("%s"), *Message);
         return SpawnedActor;
@@ -2853,6 +4201,68 @@ AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshAtLocation(const FJUSYNCMeshDa
     }
 }
 
+
+AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshAtLocation_WithCompact(const FJUSYNCCompactMeshData& MeshData, const FVector& SpawnLocation, const FRotator& SpawnRotation, UMaterialInterface* CustomMaterial, RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams)
+{
+    if (!MeshData.IsValid())
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("Invalid compact mesh data for spawning"));
+        return nullptr;
+    }
+
+    UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
+    if (!Subsystem)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("No JUSYNC subsystem available for spawning"));
+        return nullptr;
+    }
+
+    UWorld* World = Subsystem->GetWorld();
+    if (!World)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("No valid world context for spawning"));
+        return nullptr;
+    }
+
+    FActorSpawnParameters SpawnParams;
+    SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+
+    static std::atomic<int32> GlobalSpawnCounter{0};
+    int32 SpawnIdx = GlobalSpawnCounter.fetch_add(1, std::memory_order_relaxed);
+    uint32 FilenameHash = GetTypeHash(MeshData.ElementName);
+    FString BaseActorName = FString::Printf(TEXT("JUSYNC_H%x_N%d"), FilenameHash, SpawnIdx);
+    FName UniqueActorName = MakeUniqueObjectName(World, AActor::StaticClass(), FName(*BaseActorName));
+    SpawnParams.Name = UniqueActorName;
+
+    AActor* SpawnedActor = World->SpawnActor<AActor>(SpawnParams);
+    if (!SpawnedActor)
+    {
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to spawn actor"));
+        return nullptr;
+    }
+
+    URealtimeMeshComponent* MeshComp = NewObject<URealtimeMeshComponent>(SpawnedActor);
+    SpawnedActor->SetRootComponent(MeshComp);
+    MeshComp->RegisterComponent();
+
+    if (CustomMaterial)
+    {
+        MeshComp->SetMaterial(0, CustomMaterial);
+    }
+
+    SpawnedActor->SetActorLocation(SpawnLocation);
+    SpawnedActor->SetActorRotation(SpawnRotation);
+
+    bool bSuccess = Subsystem->CreateRealtimeMeshFromJUSYNC_WithCompact(MeshData, MeshComp, PrebuiltStreams);
+    if (bSuccess)
+    {
+        return SpawnedActor;
+    }
+
+    SpawnedActor->Destroy();
+    UE_LOG(LogJUSYNC, Error, TEXT("Failed to create compact RealtimeMesh, destroying actor"));
+    return nullptr;
+}
 
 AActor* UJUSYNCBlueprintLibrary::SpawnRealtimeMeshAtActor(const FJUSYNCMeshData& MeshData, AActor* TargetActor, UMaterialInterface* CustomMaterial)
 {
@@ -2876,8 +4286,6 @@ TArray<AActor*> UJUSYNCBlueprintLibrary::BatchSpawnRealtimeMeshesAtLocations(
     int32 BatchSize,
     float BatchDelay)
 {
-    // Enhanced validation with rotation support
-    UE_LOG(LogJUSYNC, Log, TEXT("=== BATCH SPAWN DEBUG ==="));
     UE_LOG(LogJUSYNC, Log, TEXT("MeshDataArray.Num(): %d"), MeshDataArray.Num());
     UE_LOG(LogJUSYNC, Log, TEXT("SpawnLocations.Num(): %d"), SpawnLocations.Num());
     UE_LOG(LogJUSYNC, Log, TEXT("SpawnRotations.Num(): %d"), SpawnRotations.Num());
@@ -2892,7 +4300,7 @@ TArray<AActor*> UJUSYNCBlueprintLibrary::BatchSpawnRealtimeMeshesAtLocations(
     }
     else if (FinalLocations.Num() != MeshDataArray.Num())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Array size mismatch! Meshes: %d, Locations: %d"),
+        UE_LOG(LogJUSYNC, Error, TEXT("Array size mismatch! Meshes: %d, Locations: %d"),
                MeshDataArray.Num(), FinalLocations.Num());
         return TArray<AActor*>();
     }
@@ -2906,7 +4314,7 @@ TArray<AActor*> UJUSYNCBlueprintLibrary::BatchSpawnRealtimeMeshesAtLocations(
     }
     else if (FinalRotations.Num() != MeshDataArray.Num())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Rotation array size mismatch! Expected: %d, Got: %d"), 
+        UE_LOG(LogJUSYNC, Error, TEXT("Rotation array size mismatch! Expected: %d, Got: %d"), 
                MeshDataArray.Num(), FinalRotations.Num());
         return TArray<AActor*>();
     }
@@ -2918,7 +4326,7 @@ TArray<AActor*> UJUSYNCBlueprintLibrary::BatchSpawnRealtimeMeshesAtLocations(
     }
 
     // Async spawning logic
-    UE_LOG(LogJUSYNC, Log, TEXT("ðŸš€ Starting ASYNC batch spawn with rotations"));
+    UE_LOG(LogJUSYNC, Log, TEXT("Starting ASYNC batch spawn with rotations"));
     TSharedPtr<TArray<AActor*>> SharedSpawnedActors = MakeShared<TArray<AActor*>>();
     SharedSpawnedActors->Reserve(MeshDataArray.Num());
 
@@ -2935,19 +4343,18 @@ TArray<FVector> UJUSYNCBlueprintLibrary::GetSpawnPointLocations(const FString& T
     UJUSYNCSubsystem* Subsystem = GetJUSYNCSubsystem();
     if (!Subsystem)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ No JUSYNC Subsystem"));
+        UE_LOG(LogJUSYNC, Error, TEXT("No JUSYNC Subsystem"));
         return SpawnLocations;
     }
 
     UWorld* World = Subsystem->GetWorld();
     if (!World)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ No World context"));
+        UE_LOG(LogJUSYNC, Error, TEXT("No World context"));
         return SpawnLocations;
     }
 
-    // ðŸ” DEBUG: Log search parameters
-    UE_LOG(LogJUSYNC, Log, TEXT("=== SEARCHING FOR SPAWN POINTS ==="));
+    // DEBUG: Log search parameters
     UE_LOG(LogJUSYNC, Log, TEXT("Tag Filter: '%s'"), *TagFilter);
 
     TArray<AActor*> FoundActors;
@@ -2968,7 +4375,7 @@ TArray<FVector> UJUSYNCBlueprintLibrary::GetSpawnPointLocations(const FString& T
         }
     }
 
-    UE_LOG(LogJUSYNC, Log, TEXT("=== TOTAL SPAWN POINTS: %d ==="), SpawnLocations.Num());
+    UE_LOG(LogJUSYNC, Log, TEXT("Total spawn points: %d"), SpawnLocations.Num());
     return SpawnLocations;
 }
 
@@ -2980,14 +4387,14 @@ bool UJUSYNCSubsystem::ConnectToBroker(const FString& BrokerEndpoint, int32 Time
 {
     FScopeLock Lock(&MiddlewareMutex);
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== CONNECTING TO ANARI USD BROKER ==="));
+    UE_LOG(LogJUSYNC, Log, TEXT("Connecting to ANARI USD broker"));
     UE_LOG(LogJUSYNC, Log, TEXT("Broker Endpoint: %s"), *BrokerEndpoint);
     UE_LOG(LogJUSYNC, Log, TEXT("Timeout: %d ms"), TimeoutMs);
     
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot connect to broker - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot connect to broker - middleware not initialized"));
         return false;
     }
     
@@ -3003,20 +4410,23 @@ bool UJUSYNCSubsystem::ConnectToBroker(const FString& BrokerEndpoint, int32 Time
     if (Result == 1)
     {
         UE_LOG(LogJUSYNC, Log, TEXT("Connected to ANARI USD broker at %s"), *BrokerEndpoint);
-        UE_LOG(LogJUSYNC, Log, TEXT(" DEALER socket connected through SSH tunnel"));
-        UE_LOG(LogJUSYNC, Log, TEXT(" Ready for synchronous file requests"));
+        UE_LOG(LogJUSYNC, Log, TEXT("DEALER socket connected through SSH tunnel"));
+        UE_LOG(LogJUSYNC, Log, TEXT("Ready for synchronous file requests"));
 
         // Register notification callback AFTER ConnectToBroker because AnariUsdClient is
         // only created lazily inside connectToBroker(). Before then, setNotificationCallback
         // would find nullptr client and return early.
         RegisterNotificationCallback_C(NotificationCallback_Static);
-        UE_LOG(LogJUSYNC, Log, TEXT(" Notification callback registered on live client"));
+        RegisterSceneUpdateCallback_C(JUSYNCSceneUpdateCallback_Static);
+        RegisterProtocolDiagnosticsCallback_C(JUSYNCProtocolDiagnosticsCallback_Static);
+        UE_LOG(LogJUSYNC, Log, TEXT("Notification, scene-update, and protocol-diagnostics callbacks registered"));
+        UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC protocol version: %u"), GetProtocolVersion_C());
 
         return true;
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to connect to broker (Result: %d)"), Result);
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to connect to broker (Result: %d)"), Result);
         return false;
     }
 #endif
@@ -3027,11 +4437,11 @@ void UJUSYNCSubsystem::DisconnectFromBroker()
 {
     FScopeLock Lock(&MiddlewareMutex);
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== DISCONNECTING FROM ANARI USD BROKER ==="));
+    UE_LOG(LogJUSYNC, Log, TEXT("Disconnecting from ANARI USD broker"));
     
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     DisconnectFromBroker_C();
-    UE_LOG(LogJUSYNC, Log, TEXT("âœ… Disconnected from ANARI USD broker"));
+    UE_LOG(LogJUSYNC, Log, TEXT("Disconnected from ANARI USD broker"));
 #endif
 }
 
@@ -3056,22 +4466,22 @@ bool UJUSYNCSubsystem::IsBrokerConnected() const
 
 bool UJUSYNCSubsystem::RequestFileList(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles)
 {
-    // âœ… FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
+    // FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== REQUESTING FILE LIST FROM BROKER ==="));
+    UE_LOG(LogJUSYNC, Log, TEXT("Requesting file list from broker"));
     UE_LOG(LogJUSYNC, Log, TEXT("Target Rank: %d"), TargetRank);
     UE_LOG(LogJUSYNC, Log, TEXT("Timeout: %d ms"), TimeoutMs);
     
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request file list - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request file list - middleware not initialized"));
         return false;
     }
     
     if (!IsBrokerConnected())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request file list - not connected to broker"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request file list - not connected to broker"));
         return false;
     }
     
@@ -3099,12 +4509,12 @@ bool UJUSYNCSubsystem::RequestFileList(int32 TargetRank, int32 TimeoutMs, TArray
         // Free C memory
         FreeFileList_C(FileList, FileCount);
         
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Retrieved %d files from broker"), OutFiles.Num());
+        UE_LOG(LogJUSYNC, Log, TEXT("Retrieved %d files from broker"), OutFiles.Num());
         return true;
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to request file list (Result: %d)"), Result);
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to request file list (Result: %d)"), Result);
         if (FileList)
         {
             FreeFileList_C(FileList, FileCount);
@@ -3116,7 +4526,7 @@ bool UJUSYNCSubsystem::RequestFileList(int32 TargetRank, int32 TimeoutMs, TArray
 
 bool UJUSYNCSubsystem::RequestFileListWithSizes(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes)
 {
-    // âœ… FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
+    // FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
     
     // For broadcast requests (target_rank = -1), dynamically determine worker count
     int32 AdjustedTimeoutMs = TimeoutMs;
@@ -3152,20 +4562,20 @@ bool UJUSYNCSubsystem::RequestFileListWithSizes(int32 TargetRank, int32 TimeoutM
         }
     }
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== REQUESTING FILE LIST WITH SIZES FROM BROKER ==="));
+    UE_LOG(LogJUSYNC, Log, TEXT("Requesting file list (with sizes) from broker"));
     UE_LOG(LogJUSYNC, Log, TEXT("Target Rank: %d"), TargetRank);
     UE_LOG(LogJUSYNC, Log, TEXT("Timeout: %d ms (adjusted from %d ms)"), AdjustedTimeoutMs, TimeoutMs);
     
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request file list - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request file list - middleware not initialized"));
         return false;
     }
     
     if (!IsBrokerConnected())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request file list - not connected to broker"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request file list - not connected to broker"));
         return false;
     }
     
@@ -3197,12 +4607,12 @@ bool UJUSYNCSubsystem::RequestFileListWithSizes(int32 TargetRank, int32 TimeoutM
         // Free C memory
         FreeFileListWithSizes_C(FileList, FileSizes, FileCount);
         
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Retrieved %d files with sizes from broker"), OutFiles.Num());
+        UE_LOG(LogJUSYNC, Log, TEXT("Retrieved %d files with sizes from broker"), OutFiles.Num());
         return true;
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to request file list with sizes (Result: %d)"), Result);
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to request file list with sizes (Result: %d)"), Result);
         if (FileList || FileSizes)
         {
             FreeFileListWithSizes_C(FileList, FileSizes, FileCount);
@@ -3212,58 +4622,30 @@ bool UJUSYNCSubsystem::RequestFileListWithSizes(int32 TargetRank, int32 TimeoutM
     return false;
 }
 
-bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks)
+bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks, TArray<uint64>* OutHashLo, TArray<uint64>* OutHashHi)
 {
-    // âœ… FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
-    
-    // For broadcast requests (target_rank = -1), dynamically determine worker count
-    int32 AdjustedTimeoutMs = TimeoutMs;
-    if (TargetRank == -1) {
-        // Query total worker count from broker (includes rank 0)
-        int32 TotalWorkerCount = 1; // Default to single-rank mode
-        if (RequestTotalWorkerCount(2000, TotalWorkerCount)) {
-            UE_LOG(LogJUSYNC, Log, TEXT("Broadcast request: dynamically detected %d total workers (including rank 0)"), TotalWorkerCount);
-            
-            // Adjust timeout based on actual worker count
-            // Single-rank mode: 3 seconds is enough
-            // Multi-rank mode: 15 seconds for up to 16 workers
-            if (TotalWorkerCount == 1) {
-                if (TimeoutMs < 3000) {
-                    AdjustedTimeoutMs = 3000;
-                    UE_LOG(LogJUSYNC, Log, TEXT("Single-rank mode: using 3000 ms timeout for broadcast"));
-                } else {
-                    AdjustedTimeoutMs = TimeoutMs;
-                }
-                UE_LOG(LogJUSYNC, Log, TEXT("Single-rank mode: broadcast (-1) will be handled as direct request to rank 0"));
-            } else {
-                // Multi-rank mode
-                if (TimeoutMs < 15000) {
-                    AdjustedTimeoutMs = 15000;
-                    UE_LOG(LogJUSYNC, Warning, TEXT("Multi-rank mode: increasing timeout from %d ms to %d ms for %d workers"), 
-                           TimeoutMs, AdjustedTimeoutMs, TotalWorkerCount);
-                }
-                UE_LOG(LogJUSYNC, Log, TEXT("Broadcast expecting responses from %d workers (ranks 0 to %d)"), 
-                       TotalWorkerCount, TotalWorkerCount - 1);
-            }
-        } else {
-            UE_LOG(LogJUSYNC, Warning, TEXT("Failed to get worker count, using default single-rank mode"));
-        }
-    }
-    
-    UE_LOG(LogJUSYNC, Log, TEXT("=== REQUESTING FILE LIST WITH SIZES AND RANKS FROM BROKER ==="));
+    // FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
+
+    // NOTE: the middleware resolves the broadcast (-1) worker count internally (and converts
+    // single-rank broadcasts to a direct rank-0 request), so we intentionally do NOT query it
+    // here again. The old duplicate RequestTotalWorkerCount(2000) added a full broker
+    // round-trip to every file-list call, which showed up as a startup stall.
+    const int32 AdjustedTimeoutMs = TimeoutMs;
+
+    UE_LOG(LogJUSYNC, Log, TEXT("Requesting file list (with sizes and ranks) from broker"));
     UE_LOG(LogJUSYNC, Log, TEXT("Target Rank: %d"), TargetRank);
-    UE_LOG(LogJUSYNC, Log, TEXT("Timeout: %d ms (adjusted from %d ms)"), AdjustedTimeoutMs, TimeoutMs);
+    UE_LOG(LogJUSYNC, Log, TEXT("Timeout: %d ms"), AdjustedTimeoutMs);
     
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request file list - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request file list - middleware not initialized"));
         return false;
     }
     
     if (!IsBrokerConnected())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request file list - not connected to broker"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request file list - not connected to broker"));
         return false;
     }
     
@@ -3287,7 +4669,9 @@ bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 
         OutFiles.Reserve(FileCount);
         OutSizes.Reserve(FileCount);
         OutRanks.Reserve(FileCount);
-        
+        if (OutHashLo) OutHashLo->Reserve(FileCount);
+        if (OutHashHi) OutHashHi->Reserve(FileCount);
+
         for (size_t i = 0; i < FileCount; ++i)
         {
             if (FileList[i])
@@ -3295,21 +4679,23 @@ bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 
                 OutFiles.Add(FString(UTF8_TO_TCHAR(FileList[i])));
                 OutSizes.Add(static_cast<int64>(FileSizes[i]));
                 OutRanks.Add(static_cast<int32>(FileRanks[i]));
+                if (OutHashLo && FileHashLo) OutHashLo->Add(FileHashLo[i]);
+                if (OutHashHi && FileHashHi) OutHashHi->Add(FileHashHi[i]);
             }
         }
         
         // Free C memory
         FreeFileListWithSizesAndRanks_C(FileList, FileSizes, FileRanks, nullptr, nullptr, FileCount);
         
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Retrieved %d files with sizes and ranks from broker"), OutFiles.Num());
+        UE_LOG(LogJUSYNC, Log, TEXT("Retrieved %d files with sizes and ranks from broker"), OutFiles.Num());
         return true;
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to request file list with sizes and ranks (Result: %d)"), Result);
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to request file list with sizes and ranks (Result: %d)"), Result);
         if (FileList || FileSizes || FileRanks)
         {
-            FreeFileListWithSizesAndRanks_C(FileList, FileSizes, FileRanks, nullptr, nullptr, FileCount);
+            FreeFileListWithSizesAndRanks_C(FileList, FileSizes, FileRanks, FileHashLo, FileHashHi, FileCount);
         }
     }
 #endif
@@ -3318,15 +4704,15 @@ bool UJUSYNCSubsystem::RequestFileListWithSizesAndRanks(int32 TargetRank, int32 
 
 bool UJUSYNCSubsystem::RequestFile(const FString& Filename, int32 TargetRank, int32 TimeoutMs, TArray<uint8>& OutData)
 {
-    // âœ… FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
+    // FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
     
     if (Filename.IsEmpty())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request file - filename is empty"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request file - filename is empty"));
         return false;
     }
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== REQUESTING FILE FROM BROKER ==="));
+    UE_LOG(LogJUSYNC, Log, TEXT("Requesting file from broker"));
     UE_LOG(LogJUSYNC, Log, TEXT("Filename: %s"), *Filename);
     UE_LOG(LogJUSYNC, Log, TEXT("Target Rank: %d"), TargetRank);
     UE_LOG(LogJUSYNC, Log, TEXT("Timeout: %d ms"), TimeoutMs);
@@ -3334,13 +4720,13 @@ bool UJUSYNCSubsystem::RequestFile(const FString& Filename, int32 TargetRank, in
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request file - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request file - middleware not initialized"));
         return false;
     }
     
     if (!IsBrokerConnected())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request file - not connected to broker"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request file - not connected to broker"));
         return false;
     }
     
@@ -3359,7 +4745,7 @@ bool UJUSYNCSubsystem::RequestFile(const FString& Filename, int32 TargetRank, in
     }
     catch (...)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Exception caught in RequestFile_C"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Exception caught in RequestFile_C"));
         if (FileData)
         {
             FreeBuffer_C(FileData);
@@ -3376,7 +4762,7 @@ bool UJUSYNCSubsystem::RequestFile(const FString& Filename, int32 TargetRank, in
         const size_t MAX_REASONABLE_FILE_SIZE = 100ULL * 1024 * 1024 * 1024; // 100GB
         if (FileSize > MAX_REASONABLE_FILE_SIZE)
         {
-            UE_LOG(LogJUSYNC, Error, TEXT("âŒ File size suspiciously large: %llu bytes (max: %llu)"), FileSize, MAX_REASONABLE_FILE_SIZE);
+            UE_LOG(LogJUSYNC, Error, TEXT("File size suspiciously large: %llu bytes (max: %llu)"), FileSize, MAX_REASONABLE_FILE_SIZE);
             FreeBuffer_C(FileData);
             return false;
         }
@@ -3387,7 +4773,7 @@ bool UJUSYNCSubsystem::RequestFile(const FString& Filename, int32 TargetRank, in
         // Safety check: ensure allocation succeeded
         if (OutData.Num() != static_cast<int32>(FileSize))
         {
-            UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to allocate buffer for file (requested: %llu, got: %d)"), FileSize, OutData.Num());
+            UE_LOG(LogJUSYNC, Error, TEXT("Failed to allocate buffer for file (requested: %llu, got: %d)"), FileSize, OutData.Num());
             FreeBuffer_C(FileData);
             return false;
         }
@@ -3396,7 +4782,7 @@ bool UJUSYNCSubsystem::RequestFile(const FString& Filename, int32 TargetRank, in
         uint8* DestPtr = OutData.GetData();
         if (!DestPtr && FileSize > 0)
         {
-            UE_LOG(LogJUSYNC, Error, TEXT("âŒ Destination buffer is null for non-zero file size"));
+            UE_LOG(LogJUSYNC, Error, TEXT("Destination buffer is null for non-zero file size"));
             FreeBuffer_C(FileData);
             return false;
         }
@@ -3407,12 +4793,12 @@ bool UJUSYNCSubsystem::RequestFile(const FString& Filename, int32 TargetRank, in
         FreeBuffer_C(FileData);
         FileData = nullptr; // Prevent accidental reuse
         
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Retrieved file '%s' (%d bytes) from broker"), *Filename, OutData.Num());
+        UE_LOG(LogJUSYNC, Log, TEXT("Retrieved file '%s' (%d bytes) from broker"), *Filename, OutData.Num());
         return true;
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to request file (Result: %d)"), Result);
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to request file (Result: %d)"), Result);
         if (FileData)
         {
             FreeBuffer_C(FileData);
@@ -3423,34 +4809,105 @@ bool UJUSYNCSubsystem::RequestFile(const FString& Filename, int32 TargetRank, in
     return false;
 }
 
+bool UJUSYNCSubsystem::RequestFileSized(const FString& Filename, int32 TargetRank, int32 TimeoutMs,
+                                        TArray<uint8>& OutData, uint64 ExpectedFileSize, uint64 AbortHandle)
+{
+    if (Filename.IsEmpty())
+    {
+        return false;
+    }
+
+#ifdef WITH_ANARI_USD_MIDDLEWARE
+    if (bIsInitialized.load() && IsBrokerConnected() && ExpectedFileSize > 0)
+    {
+        // In-situ fast path: the file list carries the exact wire size, so we
+        // can pre-size the destination and let the middleware write the
+        // downloaded bytes straight into it (no new[] in the middleware, no
+        // FMemory::Memcpy on the UE side).
+        const uint64 MAX_REASONABLE_FILE_SIZE = 100ULL * 1024 * 1024 * 1024; // 100GB
+        if (ExpectedFileSize <= MAX_REASONABLE_FILE_SIZE)
+        {
+            FTCHARToUTF8 FilenameConverter(*Filename);
+            const char* FilenameCStr = FilenameConverter.Get();
+
+            OutData.SetNumUninitialized(static_cast<int32>(ExpectedFileSize));
+            if (OutData.Num() == static_cast<int32>(ExpectedFileSize))
+            {
+                size_t Written = 0;
+                // Abortable export: AbortHandle 0 behaves exactly like the old
+                // blocking RequestFileIntoBuffer_C.
+                const int64_t rc = RequestFileIntoBufferAbort_C(
+                    FilenameCStr, TargetRank, TimeoutMs,
+                    OutData.GetData(), static_cast<size_t>(OutData.Num()), &Written,
+                    static_cast<uint64_t>(AbortHandle));
+
+                if (rc > 0)
+                {
+                    OutData.SetNum(static_cast<int32>(Written));
+                    UE_LOG(LogJUSYNC, Log, TEXT("Retrieved file '%s' (%d bytes) from broker (in-situ)"), *Filename, OutData.Num());
+                    return true;
+                }
+                if (rc == -2)
+                {
+                    // File grew beyond the advertised size - fall through to
+                    // the legacy allocating path below.
+                    UE_LOG(LogJUSYNC, Warning, TEXT("In-situ download overflow for '%s'; using legacy path"), *Filename);
+                }
+                else
+                {
+                    // rc <= 0: timeout, transport error, OR a latest-wins cancel
+                    // (ChangeTracker aborted this download because newer data
+                    // arrived). Aborts are routine at high update rates, so keep
+                    // them quiet when the request was abortable.
+                    if (AbortHandle != 0)
+                    {
+                        UE_LOG(LogJUSYNC, Verbose, TEXT("In-situ download of '%s' ended early (aborted/failed)"), *Filename);
+                    }
+                    else
+                    {
+                        UE_LOG(LogJUSYNC, Error, TEXT("In-situ download failed for '%s'"), *Filename);
+                    }
+                    return false;
+                }
+            }
+            else
+            {
+                UE_LOG(LogJUSYNC, Warning, TEXT("In-situ allocation failed for '%s'; using legacy path"), *Filename);
+            }
+        }
+    }
+#endif
+    return RequestFile(Filename, TargetRank, TimeoutMs, OutData);
+}
+
 bool UJUSYNCSubsystem::RequestFilesParallel(const TArray<FString>& Filenames, const TArray<int32>& TargetRanks, int32 TimeoutMs, TArray<FJUSYNCFileData>& OutFiles)
 {
-    // âœ… FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
+    // FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
     
     if (Filenames.Num() == 0)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request files - filename list is empty"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request files - filename list is empty"));
         return false;
     }
     
     if (Filenames.Num() != TargetRanks.Num())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request files - mismatch between filenames count (%d) and target ranks count (%d)"), Filenames.Num(), TargetRanks.Num());
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request files - mismatch between filenames count (%d) and target ranks count (%d)"), Filenames.Num(), TargetRanks.Num());
         return false;
     }
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== REQUESTING %d FILES IN PARALLEL FROM BROKER ==="), Filenames.Num());
+    UE_LOG(LogJUSYNC, Log, TEXT("Requesting %d files in parallel from broker"), Filenames.Num());
     
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request files - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request files - middleware not initialized"));
         return false;
     }
     
     if (!IsBrokerConnected())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request files - not connected to broker"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request files - not connected to broker"));
         return false;
     }
     
@@ -3526,12 +4983,12 @@ bool UJUSYNCSubsystem::RequestFilesParallel(const TArray<FString>& Filenames, co
             FJUSYNCFileData FileData;
             FileData.Filename = UTF8_TO_TCHAR(filename);
             FileData.Data.Append(data, data_size);
-            FileData.FileType = TEXT("usda");
+            FileData.FileType = FPaths::GetExtension(FileData.Filename);
             FileData.SourceRank = -1;
             FileData.Hash = TEXT("");
             CurrentOutFiles->Add(FileData);
             (*CurrentFilesReceived)++;
-            UE_LOG(LogJUSYNC, Log, TEXT("âœ… Parallel download received: %s (%d bytes)"), *FileData.Filename, FileData.Data.Num());
+            UE_LOG(LogJUSYNC, Log, TEXT("Parallel download received: %s (%d bytes)"), *FileData.Filename, FileData.Data.Num());
         }
     };
     
@@ -3541,7 +4998,7 @@ bool UJUSYNCSubsystem::RequestFilesParallel(const TArray<FString>& Filenames, co
         if (CurrentDownloadComplete && CurrentDownloadSuccess) {
             *CurrentDownloadSuccess = true;
             *CurrentDownloadComplete = true;
-            UE_LOG(LogJUSYNC, Log, TEXT("âœ… All parallel downloads completed"));
+            UE_LOG(LogJUSYNC, Log, TEXT("All parallel downloads completed"));
         }
     };
     
@@ -3550,7 +5007,7 @@ bool UJUSYNCSubsystem::RequestFilesParallel(const TArray<FString>& Filenames, co
         FScopeLock CallbackLock(&CallbackMutex);
         FString UE_Filename = UTF8_TO_TCHAR(filename);
         FString UE_Error = UTF8_TO_TCHAR(error_message);
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Parallel download error for %s: %s"), *UE_Filename, *UE_Error);
+        UE_LOG(LogJUSYNC, Error, TEXT("Parallel download error for %s: %s"), *UE_Filename, *UE_Error);
         if (CurrentDownloadComplete && CurrentDownloadSuccess) {
             *CurrentDownloadSuccess = false;
             *CurrentDownloadComplete = true;
@@ -3571,7 +5028,7 @@ bool UJUSYNCSubsystem::RequestFilesParallel(const TArray<FString>& Filenames, co
             TimeoutMs
         );
         
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… RequestFilesParallelAsync_C called - downloads running in background"));
+        UE_LOG(LogJUSYNC, Log, TEXT("RequestFilesParallelAsync_C called - downloads running in background"));
         
         // For synchronous compatibility, we still need to wait
         // But for true pipeline, we should return immediately
@@ -3582,18 +5039,18 @@ bool UJUSYNCSubsystem::RequestFilesParallel(const TArray<FString>& Filenames, co
         if (TimeoutMs == 0)
         {
             // Immediate return for pipeline mode
-            UE_LOG(LogJUSYNC, Log, TEXT("âœ… Pipeline mode: returning immediately, callbacks will process files as they arrive"));
+            UE_LOG(LogJUSYNC, Log, TEXT("Pipeline mode: returning immediately, callbacks will process files as they arrive"));
             return true;
         }
     }
     catch (const std::exception& e)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Exception in parallel download: %s"), UTF8_TO_TCHAR(e.what()));
+        UE_LOG(LogJUSYNC, Error, TEXT("Exception in parallel download: %s"), UTF8_TO_TCHAR(e.what()));
         return false;
     }
     catch (...)
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Unknown exception in parallel download"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Unknown exception in parallel download"));
         return false;
     }
     
@@ -3611,12 +5068,12 @@ bool UJUSYNCSubsystem::RequestFilesParallel(const TArray<FString>& Filenames, co
         
         if (bDownloadSuccess && FilesReceived >= FilesExpected)
         {
-            UE_LOG(LogJUSYNC, Log, TEXT("âœ… Successfully downloaded %d files in parallel"), OutFiles.Num());
+            UE_LOG(LogJUSYNC, Log, TEXT("Downloaded %d files in parallel"), OutFiles.Num());
             return true;
         }
         else
         {
-            UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to download files in parallel (received %d/%d files)"), 
+            UE_LOG(LogJUSYNC, Error, TEXT("Failed to download files in parallel (received %d/%d files)"), 
                    FilesReceived.load(), FilesExpected.load());
             return false;
         }
@@ -3629,16 +5086,16 @@ bool UJUSYNCSubsystem::RequestFilesParallel(const TArray<FString>& Filenames, co
     }
     
 #else
-    UE_LOG(LogJUSYNC, Error, TEXT("âŒ Parallel downloads not available - middleware not compiled"));
+    UE_LOG(LogJUSYNC, Error, TEXT("Parallel downloads not available - middleware not compiled"));
     return false;
 #endif
 }
 
 bool UJUSYNCSubsystem::RequestFrame(int32 FrameNumber, int32 TargetRank, int32 TimeoutMs, TArray<FJUSYNCFileData>& OutFiles)
 {
-    // âœ… FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
+    // FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== REQUESTING FRAME FROM BROKER ==="));
+    UE_LOG(LogJUSYNC, Log, TEXT("Requesting frame from broker"));
     UE_LOG(LogJUSYNC, Log, TEXT("Frame Number: %d"), FrameNumber);
     UE_LOG(LogJUSYNC, Log, TEXT("Target Rank: %d"), TargetRank);
     UE_LOG(LogJUSYNC, Log, TEXT("Timeout: %d ms"), TimeoutMs);
@@ -3646,13 +5103,13 @@ bool UJUSYNCSubsystem::RequestFrame(int32 FrameNumber, int32 TargetRank, int32 T
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request frame - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request frame - middleware not initialized"));
         return false;
     }
     
     if (!IsBrokerConnected())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request frame - not connected to broker"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request frame - not connected to broker"));
         return false;
     }
     
@@ -3688,12 +5145,12 @@ bool UJUSYNCSubsystem::RequestFrame(int32 FrameNumber, int32 TargetRank, int32 T
         // Free C memory using middleware function
         FreeFrameFiles_C(CFrameFiles, FileCount);
         
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Retrieved frame %d with %d files from broker"), FrameNumber, OutFiles.Num());
+        UE_LOG(LogJUSYNC, Log, TEXT("Retrieved frame %d with %d files from broker"), FrameNumber, OutFiles.Num());
         return true;
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to request frame (Result: %d)"), Result);
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to request frame (Result: %d)"), Result);
         if (CFrameFiles)
         {
             FreeFrameFiles_C(CFrameFiles, FileCount);
@@ -3705,22 +5162,22 @@ bool UJUSYNCSubsystem::RequestFrame(int32 FrameNumber, int32 TargetRank, int32 T
 
 bool UJUSYNCSubsystem::RequestWorkerStatus(int32 TargetRank, int32 TimeoutMs, TArray<FJUSYNCWorkerStatus>& OutWorkerStatus)
 {
-    // âœ… FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
+    // FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== REQUESTING WORKER STATUS FROM BROKER ==="));
+    UE_LOG(LogJUSYNC, Log, TEXT("Requesting worker status from broker"));
     UE_LOG(LogJUSYNC, Log, TEXT("Target Rank: %d"), TargetRank);
     UE_LOG(LogJUSYNC, Log, TEXT("Timeout: %d ms"), TimeoutMs);
     
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request worker status - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request worker status - middleware not initialized"));
         return false;
     }
     
     if (!IsBrokerConnected())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request worker status - not connected to broker"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request worker status - not connected to broker"));
         return false;
     }
 
@@ -3731,12 +5188,12 @@ bool UJUSYNCSubsystem::RequestWorkerStatus(int32 TargetRank, int32 TimeoutMs, TA
     if (bResult == 1 && g_CapturedWorkers.Num() > 0)
     {
         OutWorkerStatus = MoveTemp(g_CapturedWorkers);
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Successfully retrieved worker list: %d workers"), OutWorkerStatus.Num());
+        UE_LOG(LogJUSYNC, Log, TEXT("Retrieved worker list: %d workers"), OutWorkerStatus.Num());
         return true;
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to retrieve worker list from middleware"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to retrieve worker list from middleware"));
         OutWorkerStatus.Empty();
         return false;
     }
@@ -3746,21 +5203,21 @@ bool UJUSYNCSubsystem::RequestWorkerStatus(int32 TargetRank, int32 TimeoutMs, TA
 
 bool UJUSYNCSubsystem::RequestWorkerCount(int32 TimeoutMs, int32& OutWorkerCount)
 {
-    // âœ… FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
+    // FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== REQUESTING WORKER COUNT FROM BROKER ==="));
+    UE_LOG(LogJUSYNC, Log, TEXT("Requesting worker count from broker"));
     UE_LOG(LogJUSYNC, Log, TEXT("Timeout: %d ms"), TimeoutMs);
     
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request worker count - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request worker count - middleware not initialized"));
         return false;
     }
     
     if (!IsBrokerConnected())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request worker count - not connected to broker"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request worker count - not connected to broker"));
         return false;
     }
     
@@ -3771,11 +5228,11 @@ bool UJUSYNCSubsystem::RequestWorkerCount(int32 TimeoutMs, int32& OutWorkerCount
     if (bResult == 1)
     {
         OutWorkerCount = g_CapturedWorkers.Num();
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Successfully retrieved worker count: %d workers"), OutWorkerCount);
+        UE_LOG(LogJUSYNC, Log, TEXT("Retrieved worker count: %d workers"), OutWorkerCount);
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to retrieve worker count from middleware"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to retrieve worker count from middleware"));
         OutWorkerCount = 0;
     }
 
@@ -3786,21 +5243,21 @@ bool UJUSYNCSubsystem::RequestWorkerCount(int32 TimeoutMs, int32& OutWorkerCount
 
 bool UJUSYNCSubsystem::RequestTotalWorkerCount(int32 TimeoutMs, int32& OutTotalCount)
 {
-    // âœ… FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
+    // FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== REQUESTING TOTAL WORKER COUNT (INCLUDING RANK 0) ==="));
+    UE_LOG(LogJUSYNC, Log, TEXT("Requesting total worker count (including rank 0)"));
     UE_LOG(LogJUSYNC, Log, TEXT("Timeout: %d ms"), TimeoutMs);
     
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request total worker count - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request total worker count - middleware not initialized"));
         return false;
     }
     
     if (!IsBrokerConnected())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request total worker count - not connected to broker"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request total worker count - not connected to broker"));
         return false;
     }
     
@@ -3811,11 +5268,11 @@ bool UJUSYNCSubsystem::RequestTotalWorkerCount(int32 TimeoutMs, int32& OutTotalC
     if (Result == 1)
     {
         OutTotalCount = static_cast<int32>(TotalCount);
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Total worker count (including rank 0): %d"), OutTotalCount);
+        UE_LOG(LogJUSYNC, Log, TEXT("Total worker count (including rank 0): %d"), OutTotalCount);
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to retrieve total worker count"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to retrieve total worker count"));
         OutTotalCount = 0;
     }
     
@@ -3828,21 +5285,21 @@ bool UJUSYNCSubsystem::RequestTotalWorkerCount(int32 TimeoutMs, int32& OutTotalC
 
 bool UJUSYNCSubsystem::RequestWorkerCountExcludingRank0(int32 TimeoutMs, int32& OutWorkerCount)
 {
-    // âœ… FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
+    // FIX: Removed MiddlewareMutex lock - blocking broker call should not hold global mutex
     
-    UE_LOG(LogJUSYNC, Log, TEXT("=== REQUESTING WORKER COUNT (EXCLUDING RANK 0) ==="));
+    UE_LOG(LogJUSYNC, Log, TEXT("Requesting worker count (excluding rank 0)"));
     UE_LOG(LogJUSYNC, Log, TEXT("Timeout: %d ms"), TimeoutMs);
     
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (!bIsInitialized.load())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request worker count - middleware not initialized"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request worker count - middleware not initialized"));
         return false;
     }
     
     if (!IsBrokerConnected())
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Cannot request worker count - not connected to broker"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Cannot request worker count - not connected to broker"));
         return false;
     }
     
@@ -3853,11 +5310,11 @@ bool UJUSYNCSubsystem::RequestWorkerCountExcludingRank0(int32 TimeoutMs, int32& 
     if (Result == 1)
     {
         OutWorkerCount = static_cast<int32>(WorkerCount);
-        UE_LOG(LogJUSYNC, Log, TEXT("âœ… Worker count (excluding rank 0): %d"), OutWorkerCount);
+        UE_LOG(LogJUSYNC, Log, TEXT("Worker count (excluding rank 0): %d"), OutWorkerCount);
     }
     else
     {
-        UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to retrieve worker count"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Failed to retrieve worker count"));
         OutWorkerCount = 0;
     }
     
@@ -3913,12 +5370,12 @@ void UJUSYNCSubsystem::CreateMaterialFromTexture_Async(UTexture2D* Texture, URea
                 if (URealtimeMeshComponent* Component = ComponentPtr.Get())
                 {
                     Component->SetMaterial(0, DynamicMaterial);
-                    UE_LOG(LogJUSYNC, Log, TEXT("âœ… Applied dynamic material to mesh component"));
+                    UE_LOG(LogJUSYNC, Log, TEXT("Applied dynamic material to mesh component"));
                 }
             }
             else
             {
-                UE_LOG(LogJUSYNC, Error, TEXT("âŒ Failed to create dynamic material instance"));
+                UE_LOG(LogJUSYNC, Error, TEXT("Failed to create dynamic material instance"));
             }
         });
     });

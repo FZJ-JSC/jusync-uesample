@@ -4,6 +4,7 @@
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "Engine/Texture2D.h"
 #include "JUSYNCTypes.h"
+#include "JUSYNCBenchmarkTiming.h"
 #include "JUSYNCSubsystem.h"
 #include "TimerManager.h"
 #include "JUSYNCBlueprintLibrary.generated.h"
@@ -283,6 +284,18 @@ public:
         AActor* TargetActor,
         UMaterialInterface* CustomMaterial = nullptr);
 
+    static AActor* SpawnRealtimeMeshAtLocation_WithStreams(const FJUSYNCMeshData& MeshData,
+        const FVector& SpawnLocation,
+        const FRotator& SpawnRotation,
+        UMaterialInterface* CustomMaterial,
+        RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams);
+
+    static AActor* SpawnRealtimeMeshAtLocation_WithCompact(const FJUSYNCCompactMeshData& MeshData,
+        const FVector& SpawnLocation,
+        const FRotator& SpawnRotation,
+        UMaterialInterface* CustomMaterial,
+        RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams);
+
 
     DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnBatchSpawnProgress,
         const TArray<AActor*>&, SpawnedActors, float, Progress);
@@ -421,6 +434,13 @@ public:
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Helpers")
     static UJUSYNCSubsystem* GetJUSYNCSubsystem();
 
+    // Current GPU VRAM used by the process, in bytes (0 if it cannot be queried).
+    static int64 QueryVRAMUsageBytes();
+
+    // Current process CPU usage (0.0-100.0) and active thread count.
+    static float QueryCPUUsagePercent();
+    static int32 QueryActiveThreadCount();
+
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Utilities")
     static FRotator ConvertParaViewToUERotation(const FRotator& ParaViewRotation);
 
@@ -454,6 +474,15 @@ public:
         const FRotator& SpawnRotation, UMaterialInterface* Material,
         bool bUseUniformScaling = false, FVector OuterBoundingBoxSize = FVector::ZeroVector,
         bool bPreserveAspectRatio = true, bool bUseAsyncSpawning = false
+    );
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|RealtimeMesh Spawning|Benchmarked", CallInEditor)
+    static AActor* SpawnRealtimeMeshWithMaterial_Benchmarked(
+        const FJUSYNCMeshData& MeshData, const FVector& SpawnLocation,
+        const FRotator& SpawnRotation, UMaterialInterface* Material,
+        const FJUSYNCBenchmarkConfig& Config,
+        bool bUseUniformScaling = false, FVector OuterBoundingBoxSize = FVector::ZeroVector,
+        bool bPreserveAspectRatio = true, bool bUseAsyncSpawning = true
     );
 
 
@@ -505,8 +534,110 @@ private:
         float BatchDelay
     );
 
+    // ========== BENCHMARKING FUNCTIONS ==========
+
+    // (promoted to public: the spawner actor drives the benchmark session
+    // automatically and calls these statics from C++)
+
+public:
+    /**
+     * Start benchmarking for a specific test
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
+    static void StartBenchmark(const FString& TestName, const FJUSYNCBenchmarkConfig& Config);
+
+    /**
+     * End benchmarking and save results
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
+    static void EndBenchmark();
+
+    /**
+     * Save all benchmark results to CSV
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
+    static void SaveAllBenchmarkResultsToCSV(const FString& OutputDirectory);
+
+    /**
+     * Save all benchmark results to JSON (more readable format)
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
+    static void SaveAllBenchmarkResultsToJSON(const FString& OutputDirectory);
+
+    /**
+     * Clear all benchmark results
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
+    static void ClearBenchmarkResults();
+
+    /**
+     * Get current benchmark results
+     */
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Benchmarking")
+    static TArray<FJUSYNCBenchmarkResult> GetBenchmarkResults();
+
+    /**
+     * Batch spawn with benchmarking (wraps BatchSpawnRealtimeMeshesWithMaterial)
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|RealtimeMesh Spawning|Benchmarked", CallInEditor)
+    static TArray<AActor*> BatchSpawnRealtimeMeshesWithMaterial_Benchmarked(
+        const TArray<FJUSYNCMeshData>& MeshDataArray,
+        const TArray<FVector>& SpawnLocations,
+        const TArray<FRotator>& SpawnRotations,
+        UMaterialInterface* Material,
+        const FJUSYNCBenchmarkConfig& Config,
+        bool bUseUniformScaling = false,
+        FVector OuterBoundingBoxSize = FVector::ZeroVector,
+        bool bPreserveAspectRatio = true,
+        bool bUseAsyncSpawning = false,
+        int32 BatchSize = 5,
+        float BatchDelay = 0.016f
+    );
+
+    /**
+     * Open the interactive FPS measurement window (real frames only, no
+     * synthetic fallback). Open it after the scene is fully spawned; it
+     * closes itself after DurationSeconds.
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
+    static void StartInteractiveWindow(float DurationSeconds = 5.0f);
+
+    /**
+     * Close the interactive FPS measurement window early.
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
+    static void StopInteractiveWindow();
+
+    /**
+     * Measured interactive-window statistics (0 / bValid=false if not measured).
+     */
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Benchmarking")
+    static FJUSYNCInteractiveStats GetInteractiveWindowStats();
+
+    /**
+     * Time-to-frame session statistics (connect start -> first frame / full scene).
+     */
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Benchmarking")
+    static FJUSYNCBenchmarkTTF GetBenchmarkTTF();
+
+    /**
+     * Clear all benchmark timing state (interactive window + TTF session).
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
+    static void ResetBenchmarkTimings();
+
+    /**
+     * Export the middleware's client-side benchmark report (benchmark_client.json)
+     * to FilePath. Contains receive bytes, file counters (raw + dedup) and
+     * connect->first/last-byte timing; cross-checkable against the cluster-side
+     * ANARI-USD benchmark_rank_*.json serving counters.
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
+    static bool ExportClientBenchmarkReport(const FString& FilePath);
+
     // ========== DYNAMIC TIMEOUT & RETRY LOGIC ==========
 
+private:
     /**
      * Request file with dynamic timeout and retry logic
      */
@@ -580,4 +711,39 @@ private:
     };
 
     static FRankPerformanceTracker RankPerformanceTracker;
+
+    // Benchmark data storage
+    static TArray<FJUSYNCBenchmarkResult> BenchmarkResults;
+    static FString CurrentBenchmarkTest;
+    static FJUSYNCBenchmarkConfig CurrentBenchmarkConfig;
+    static bool bIsBenchmarking;
+    static FDateTime BenchmarkSessionStartTime;
+
+    // (promoted to public: record + result builders are driven by the spawner
+    // actor's automatic benchmark session)
+public:
+    // Benchmark helper functions
+    static void RecordBenchmarkResult(const FJUSYNCBenchmarkResult& Result);
+    static FJUSYNCBenchmarkResult CreateBenchmarkResult(const FString& TestName, float TotalTimeMs, int32 TriangleCount, int32 VertexCount, int64 RAMBefore, int64 RAMAfter, int32 ActorCount, int32 ErrorCount, int32 SplitMeshCount);
+    static FJUSYNCBenchmarkResult CreateBenchmarkResultExtended(
+        const FString& TestName,
+        float TotalTimeMs,
+        int32 TriangleCount,
+        int32 VertexCount,
+        int64 RAMBefore,
+        int64 RAMAfter,
+        int64 RAMPeak,
+        int64 RAMDuring,
+        int32 ActorCount,
+        int32 ErrorCount,
+        int32 SplitMeshCount,
+        float CPUUsagePercent,
+        int64 VRAMBefore,
+        int64 VRAMAfter,
+        int64 VRAMPeak,
+        int32 ActiveThreadCount,
+        float GPUUsagePercent,
+        int32 HitchCount = 0,
+        float AvgHitchDurationMs = 0.0f,
+        float MaxHitchDurationMs = 0.0f);
 };

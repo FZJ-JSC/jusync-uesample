@@ -28,7 +28,8 @@ public class JUSYNC : ModuleRules
             "RHI",
             "GameplayTasks",
             "LidarPointCloudRuntime",
-            "ImageWrapper"
+            "ImageWrapper",
+            "Json"
         });
 
         // Setup third-party includes
