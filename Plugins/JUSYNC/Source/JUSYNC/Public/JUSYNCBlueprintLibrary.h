@@ -4,6 +4,7 @@
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "Engine/Texture2D.h"
 #include "JUSYNCTypes.h"
+#include "JUSYNCBenchmarkTiming.h"
 #include "JUSYNCSubsystem.h"
 #include "TimerManager.h"
 #include "JUSYNCBlueprintLibrary.generated.h"
@@ -169,6 +170,19 @@ public:
     static bool LoadUSDFromBuffer(const TArray<uint8>& Buffer, const FString& Filename,
         TArray<FJUSYNCMeshData>& OutMeshData, FString& OutPreview);
 
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|USD", CallInEditor, DisplayName = "Load USD Full (Mesh + Point Cloud)")
+    static bool LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const FString& Filename,
+        TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData, FString& OutPreview);
+
+    /**
+     * Zero-copy variant: bypasses std::vector copy at C API boundary.
+     * Accepts raw TArray<uint8> data pointer directly to UsdProcessor.
+     * Use this for performance-critical paths (large payloads).
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|USD", CallInEditor, DisplayName = "Load USD Full No Copy (Mesh + Point Cloud)")
+    static bool LoadUSDFullFromBufferNoCopy(const TArray<uint8>& Buffer, const FString& Filename,
+        TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData, FString& OutPreview);
+
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|USD", CallInEditor)
     static bool LoadUSDFromDisk(const FString& FilePath,
         TArray<FJUSYNCMeshData>& OutMeshData, FString& OutPreview);
@@ -178,6 +192,13 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|USD")
     static bool ValidateUSDFormat(const TArray<uint8>& Buffer, const FString& Filename);
+
+    // ========== POINT CLOUD PROCESSING ==========
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|PointCloud", CallInEditor, DisplayName = "Load USD Point Cloud From Buffer")
+    static bool LoadUSDPointCloudFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCPointCloudData>& OutPointCloudData);
+
+    // Async point cloud processing delegates
+    DECLARE_DYNAMIC_DELEGATE_ThreeParams(FOnAsyncPointCloudLoaded, const TArray<FJUSYNCPointCloudData>&, PCData, bool, bSuccess, const FString&, ErrorMsg);
 
     // ========== TEXTURE PROCESSING ==========
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Texture", CallInEditor)
@@ -255,11 +276,25 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|RealtimeMesh Spawning", CallInEditor)
     static AActor* SpawnRealtimeMeshAtLocation(const FJUSYNCMeshData& MeshData,
         const FVector& SpawnLocation,
-        const FRotator& SpawnRotation = FRotator::ZeroRotator);
+        const FRotator& SpawnRotation = FRotator::ZeroRotator,
+        UMaterialInterface* CustomMaterial = nullptr);
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|RealtimeMesh Spawning", CallInEditor)
     static AActor* SpawnRealtimeMeshAtActor(const FJUSYNCMeshData& MeshData,
-        AActor* TargetActor);
+        AActor* TargetActor,
+        UMaterialInterface* CustomMaterial = nullptr);
+
+    static AActor* SpawnRealtimeMeshAtLocation_WithStreams(const FJUSYNCMeshData& MeshData,
+        const FVector& SpawnLocation,
+        const FRotator& SpawnRotation,
+        UMaterialInterface* CustomMaterial,
+        RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams);
+
+    static AActor* SpawnRealtimeMeshAtLocation_WithCompact(const FJUSYNCCompactMeshData& MeshData,
+        const FVector& SpawnLocation,
+        const FRotator& SpawnRotation,
+        UMaterialInterface* CustomMaterial,
+        RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams);
 
 
     DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnBatchSpawnProgress,
@@ -280,6 +315,37 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|RealtimeMesh Spawning")
     static TArray<FVector> GetSpawnPointLocations(const FString& TagFilter = TEXT("USDSpawnPoint"));
+
+    // ========== POINT CLOUD SPAWNING ==========
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|PointCloud Spawning", CallInEditor, DisplayName = "Spawn Point Cloud At Location")
+    static AActor* SpawnPointCloudAtLocation(
+        const FJUSYNCPointCloudData& PointCloudData,
+        const FVector& SpawnLocation,
+        const FRotator& SpawnRotation = FRotator::ZeroRotator,
+        const FVector& SpawnScale = FVector(1.0f));
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|PointCloud Spawning", CallInEditor, DisplayName = "Batch Spawn Point Clouds")
+    static TArray<AActor*> BatchSpawnPointClouds(
+        const TArray<FJUSYNCPointCloudData>& PointCloudDataArray,
+        const TArray<FVector>& SpawnLocations);
+
+    // Async point cloud spawn delegate
+    DECLARE_DYNAMIC_DELEGATE_TwoParams(FOnPointCloudSpawnedDyn, AActor*, SpawnedActor, bool, bSuccess);
+    DECLARE_DYNAMIC_DELEGATE_OneParam(FOnPointCloudBatchSpawnedDyn, const TArray<AActor*>&, SpawnedActors);
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|PointCloud Spawning|Async", CallInEditor, DisplayName = "Spawn Point Cloud At Location (Async)")
+    static void SpawnPointCloudAtLocation_Async(
+        const FJUSYNCPointCloudData& PointCloudData,
+        const FVector& SpawnLocation,
+        const FRotator& SpawnRotation,
+        const FVector& SpawnScale,
+        const FOnPointCloudSpawnedDyn& OnSpawned);
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|PointCloud Spawning|Async", CallInEditor, DisplayName = "Batch Spawn Point Clouds (Async)")
+    static void BatchSpawnPointClouds_Async(
+        const TArray<FJUSYNCPointCloudData>& PointCloudDataArray,
+        const TArray<FVector>& SpawnLocations,
+        const FOnPointCloudBatchSpawnedDyn& OnBatchSpawned);
 
 
     // ========== DATA RECEPTION ==========
@@ -334,6 +400,12 @@ public:
     static void FilterFileListByExtensionsWithSizesAndRanks(const TArray<FString>& FileList, const TArray<int64>& FileSizes, const TArray<int32>& FileRanks,
         const TArray<FString>& AllowedExtensions, TArray<FString>& OutFilteredFiles, TArray<int64>& OutFilteredSizes, TArray<int32>& OutFilteredRanks);
 
+    // ========== GEOMETRY CLIP FILTER ==========
+    // Strips all shared files (manifests, materials, camera, textures) and only returns per-rank geometry clips under "clips/"
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Validation", DisplayName = "Extract Geometry Clips Only")
+    static void ExtractGeometryClips(const TArray<FString>& FileList, const TArray<int64>& FileSizes, const TArray<int32>& FileRanks,
+        TArray<FString>& OutFilteredFiles, TArray<int64>& OutFilteredSizes, TArray<int32>& OutFilteredRanks);
+
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Utilities", DisplayName = "Calculate Timeout From File Size")
     static int32 CalculateTimeoutFromFileSize(int64 FileSizeBytes, int32 BaseTimeoutMs = 1000, float BandwidthBytesPerSecond = 1000000.0f);
 
@@ -361,6 +433,13 @@ public:
     // ========== HELPER FUNCTIONS ==========
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Helpers")
     static UJUSYNCSubsystem* GetJUSYNCSubsystem();
+
+    // Current GPU VRAM used by the process, in bytes (0 if it cannot be queried).
+    static int64 QueryVRAMUsageBytes();
+
+    // Current process CPU usage (0.0-100.0) and active thread count.
+    static float QueryCPUUsagePercent();
+    static int32 QueryActiveThreadCount();
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Utilities")
     static FRotator ConvertParaViewToUERotation(const FRotator& ParaViewRotation);
@@ -395,6 +474,15 @@ public:
         const FRotator& SpawnRotation, UMaterialInterface* Material,
         bool bUseUniformScaling = false, FVector OuterBoundingBoxSize = FVector::ZeroVector,
         bool bPreserveAspectRatio = true, bool bUseAsyncSpawning = false
+    );
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|RealtimeMesh Spawning|Benchmarked", CallInEditor)
+    static AActor* SpawnRealtimeMeshWithMaterial_Benchmarked(
+        const FJUSYNCMeshData& MeshData, const FVector& SpawnLocation,
+        const FRotator& SpawnRotation, UMaterialInterface* Material,
+        const FJUSYNCBenchmarkConfig& Config,
+        bool bUseUniformScaling = false, FVector OuterBoundingBoxSize = FVector::ZeroVector,
+        bool bPreserveAspectRatio = true, bool bUseAsyncSpawning = true
     );
 
 
@@ -448,6 +536,10 @@ private:
 
     // ========== BENCHMARKING FUNCTIONS ==========
 
+    // (promoted to public: the spawner actor drives the benchmark session
+    // automatically and calls these statics from C++)
+
+public:
     /**
      * Start benchmarking for a specific test
      */
@@ -502,8 +594,50 @@ private:
         float BatchDelay = 0.016f
     );
 
+    /**
+     * Open the interactive FPS measurement window (real frames only, no
+     * synthetic fallback). Open it after the scene is fully spawned; it
+     * closes itself after DurationSeconds.
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
+    static void StartInteractiveWindow(float DurationSeconds = 5.0f);
+
+    /**
+     * Close the interactive FPS measurement window early.
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
+    static void StopInteractiveWindow();
+
+    /**
+     * Measured interactive-window statistics (0 / bValid=false if not measured).
+     */
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Benchmarking")
+    static FJUSYNCInteractiveStats GetInteractiveWindowStats();
+
+    /**
+     * Time-to-frame session statistics (connect start -> first frame / full scene).
+     */
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Benchmarking")
+    static FJUSYNCBenchmarkTTF GetBenchmarkTTF();
+
+    /**
+     * Clear all benchmark timing state (interactive window + TTF session).
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
+    static void ResetBenchmarkTimings();
+
+    /**
+     * Export the middleware's client-side benchmark report (benchmark_client.json)
+     * to FilePath. Contains receive bytes, file counters (raw + dedup) and
+     * connect->first/last-byte timing; cross-checkable against the cluster-side
+     * ANARI-USD benchmark_rank_*.json serving counters.
+     */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Benchmarking")
+    static bool ExportClientBenchmarkReport(const FString& FilePath);
+
     // ========== DYNAMIC TIMEOUT & RETRY LOGIC ==========
 
+private:
     /**
      * Request file with dynamic timeout and retry logic
      */
@@ -583,7 +717,11 @@ private:
     static FString CurrentBenchmarkTest;
     static FJUSYNCBenchmarkConfig CurrentBenchmarkConfig;
     static bool bIsBenchmarking;
+    static FDateTime BenchmarkSessionStartTime;
 
+    // (promoted to public: record + result builders are driven by the spawner
+    // actor's automatic benchmark session)
+public:
     // Benchmark helper functions
     static void RecordBenchmarkResult(const FJUSYNCBenchmarkResult& Result);
     static FJUSYNCBenchmarkResult CreateBenchmarkResult(const FString& TestName, float TotalTimeMs, int32 TriangleCount, int32 VertexCount, int64 RAMBefore, int64 RAMAfter, int32 ActorCount, int32 ErrorCount, int32 SplitMeshCount);

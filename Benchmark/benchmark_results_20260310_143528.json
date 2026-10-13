@@ -1,0 +1,122 @@
+{
+  "benchmark_run": {
+    "timestamp": "2026-03-10T14:35:28.953Z",
+    "total_tests": 2,
+    "config": {
+      "output_directory": "D:\JSC_Github\jusync-uesample\Benchmark",
+      "append_timestamp": true
+    }
+  },
+  "session_summary": {
+    "total_session_time_ms": 598316,
+    "total_session_time_seconds": 598.32,
+    "total_triangles": 0,
+    "total_vertices": 12488582,
+    "total_actors": 2,
+    "total_errors": 0,
+    "total_split_meshes": 3,
+    "avg_success_rate": 100.0,
+    "avg_fps": 57.2,
+    "avg_frame_time_ms": 17.50,
+    "triangles_per_second": 0,
+    "vertices_per_second": 20873,
+    "session_ram_start_mb": 35285.82,
+    "session_ram_end_mb": 33522.77,
+    "session_ram_delta_mb": -1763.05,
+    "session_ram_peak_mb": 36623.33,
+    "avg_cpu_usage_percent": 33.7,
+    "avg_gpu_usage_percent": 16.4,
+    "max_active_threads": 185,
+    "session_vram_start_gb": 4.26,
+    "session_vram_end_gb": 4.26,
+    "session_vram_peak_gb": 4.26,
+    "session_vram_delta_gb": 0.00,
+    "total_hitch_count": 0,
+    "avg_hitch_duration_ms": 0.0,
+    "max_hitch_duration_ms": 0.0
+  },
+  "results": [
+    {
+      "test_name": "3mpoints",
+      "timestamp": "2026-03-10T14:33:53.280Z",
+      "timing": {
+        "total_time_ms": 985.98,
+        "total_time_seconds": 0.9860
+      },
+      "complexity": {
+        "triangle_count": 0,
+        "vertex_count": 6250048,
+        "triangles_per_second": 0,
+        "vertices_per_second": 6338898
+      },
+      "memory": {
+        "ram_before_mb": 35285.82,
+        "ram_after_mb": 35318.55,
+        "ram_peak_mb": 36623.33,
+        "ram_during_mb": 35318.55,
+        "ram_delta_mb": 32.73
+      },
+      "performance": {
+        "fps": 58.8,
+        "frame_time_ms": 17.01
+      },
+      "cpu": {
+        "usage_percent": 5.0,
+        "active_threads": 184
+      },
+      "gpu_usage_percent": 15.4,
+      "operational": {
+        "actor_count": 1,
+        "error_count": 0,
+        "success_rate": 100.0,
+        "split_mesh_count": 1
+      },
+      "hitch_detection": {
+        "hitch_count": 0,
+        "avg_hitch_duration_ms": 0.0,
+        "max_hitch_duration_ms": 0.0
+      }
+    },
+    {
+      "test_name": "3mpoints",
+      "timestamp": "2026-03-10T14:34:49.336Z",
+      "timing": {
+        "total_time_ms": 930.63,
+        "total_time_seconds": 0.9306
+      },
+      "complexity": {
+        "triangle_count": 0,
+        "vertex_count": 6238534,
+        "triangles_per_second": 0,
+        "vertices_per_second": 6703585
+      },
+      "memory": {
+        "ram_before_mb": 33506.18,
+        "ram_after_mb": 33522.77,
+        "ram_peak_mb": 36623.33,
+        "ram_during_mb": 33522.77,
+        "ram_delta_mb": 16.59
+      },
+      "performance": {
+        "fps": 55.6,
+        "frame_time_ms": 18.00
+      },
+      "cpu": {
+        "usage_percent": 62.3,
+        "active_threads": 185
+      },
+      "gpu_usage_percent": 17.3,
+      "operational": {
+        "actor_count": 1,
+        "error_count": 0,
+        "success_rate": 100.0,
+        "split_mesh_count": 2
+      },
+      "hitch_detection": {
+        "hitch_count": 0,
+        "avg_hitch_duration_ms": 0.0,
+        "max_hitch_duration_ms": 0.0
+      }
+    }
+  ]
+}

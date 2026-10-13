@@ -1,5 +1,9 @@
 #pragma once
 
+// Performance optimization flags
+// Define DISABLE_DEBUG_LOGGING to remove debug logging overhead in production
+// #define DISABLE_DEBUG_LOGGING  // Uncomment for production builds
+
 // Check if we're compiling with Unreal Engine
 #if defined(_MSC_VER) && defined(__UNREAL__)
 // Unreal Engine environment
@@ -7,11 +11,19 @@
 #include "HAL/PlatformMemory.h"
 #include "Misc/ScopeLock.h"
 
-#define MIDDLEWARE_LOG_INFO(format, ...) UE_LOG(LogTemp, Display, TEXT(format), ##__VA_ARGS__)
 #define MIDDLEWARE_LOG_WARNING(format, ...) UE_LOG(LogTemp, Warning, TEXT(format), ##__VA_ARGS__)
 #define MIDDLEWARE_LOG_ERROR(format, ...) UE_LOG(LogTemp, Error, TEXT(format), ##__VA_ARGS__)
-#define MIDDLEWARE_LOG_DEBUG(format, ...) UE_LOG(LogTemp, Verbose, TEXT(format), ##__VA_ARGS__)
-#define MIDDLEWARE_LOG_VERBOSE(format, ...) UE_LOG(LogTemp, VeryVerbose, TEXT(format), ##__VA_ARGS__)
+
+#ifdef DISABLE_DEBUG_LOGGING
+    // Production: strip INFO/DEBUG/VERBOSE, keep WARNING/ERROR
+    #define MIDDLEWARE_LOG_INFO(format, ...)
+    #define MIDDLEWARE_LOG_DEBUG(format, ...)
+    #define MIDDLEWARE_LOG_VERBOSE(format, ...)
+#else
+    #define MIDDLEWARE_LOG_INFO(format, ...) UE_LOG(LogTemp, Display, TEXT(format), ##__VA_ARGS__)
+    #define MIDDLEWARE_LOG_DEBUG(format, ...) UE_LOG(LogTemp, Verbose, TEXT(format), ##__VA_ARGS__)
+    #define MIDDLEWARE_LOG_VERBOSE(format, ...) UE_LOG(LogTemp, VeryVerbose, TEXT(format), ##__VA_ARGS__)
+#endif
 
 // String conversion helpers
 #define TO_MIDDLEWARE_STRING(str) FString(UTF8_TO_TCHAR(str.c_str()))
@@ -49,11 +61,48 @@
 #include <cstdio>
 #include <limits>
 
-#define MIDDLEWARE_LOG_INFO(format, ...) printf("[INFO] " format "\n", ##__VA_ARGS__)
+// On Windows, use OutputDebugString so logs appear in Unreal Engine
+#ifdef _WIN32
+// Declare OutputDebugStringA without including windows.h to avoid conflicts
+extern "C" __declspec(dllimport) void __stdcall OutputDebugStringA(const char* lpOutputString);
+
+#define MIDDLEWARE_LOG_TO_OUTPUT(format, ...) do { \
+    char buf[1024]; \
+    snprintf(buf, sizeof(buf), format, ##__VA_ARGS__); \
+    OutputDebugStringA(buf); \
+    printf("%s", buf); \
+} while(0)
+
+#define MIDDLEWARE_LOG_WARNING(format, ...) MIDDLEWARE_LOG_TO_OUTPUT("[WARNING] " format "\n", ##__VA_ARGS__)
+#define MIDDLEWARE_LOG_ERROR(format, ...) MIDDLEWARE_LOG_TO_OUTPUT("[ERROR] " format "\n", ##__VA_ARGS__)
+
+#ifdef DISABLE_DEBUG_LOGGING
+    // Production: strip INFO/DEBUG/VERBOSE, keep WARNING/ERROR
+    #define MIDDLEWARE_LOG_INFO(format, ...)
+    #define MIDDLEWARE_LOG_DEBUG(format, ...)
+    #define MIDDLEWARE_LOG_VERBOSE(format, ...)
+#else
+    #define MIDDLEWARE_LOG_INFO(format, ...) MIDDLEWARE_LOG_TO_OUTPUT("[INFO] " format "\n", ##__VA_ARGS__)
+    #define MIDDLEWARE_LOG_DEBUG(format, ...) MIDDLEWARE_LOG_TO_OUTPUT("[DEBUG] " format "\n", ##__VA_ARGS__)
+    #define MIDDLEWARE_LOG_VERBOSE(format, ...) MIDDLEWARE_LOG_TO_OUTPUT("[VERBOSE] " format "\n", ##__VA_ARGS__)
+#endif
+
+#else
+// Non-Windows standard environment
 #define MIDDLEWARE_LOG_WARNING(format, ...) fprintf(stderr, "[WARNING] " format "\n", ##__VA_ARGS__)
 #define MIDDLEWARE_LOG_ERROR(format, ...) fprintf(stderr, "[ERROR] " format "\n", ##__VA_ARGS__)
-#define MIDDLEWARE_LOG_DEBUG(format, ...) printf("[DEBUG] " format "\n", ##__VA_ARGS__)
-#define MIDDLEWARE_LOG_VERBOSE(format, ...) printf("[VERBOSE] " format "\n", ##__VA_ARGS__)
+
+#ifdef DISABLE_DEBUG_LOGGING
+    // Production: strip INFO/DEBUG/VERBOSE, keep WARNING/ERROR
+    #define MIDDLEWARE_LOG_INFO(format, ...)
+    #define MIDDLEWARE_LOG_DEBUG(format, ...)
+    #define MIDDLEWARE_LOG_VERBOSE(format, ...)
+#else
+    #define MIDDLEWARE_LOG_INFO(format, ...) printf("[INFO] " format "\n", ##__VA_ARGS__)
+    #define MIDDLEWARE_LOG_DEBUG(format, ...) printf("[DEBUG] " format "\n", ##__VA_ARGS__)
+    #define MIDDLEWARE_LOG_VERBOSE(format, ...) printf("[VERBOSE] " format "\n", ##__VA_ARGS__)
+#endif
+#endif
 
 // String conversion helpers (no-ops in standard C++)
 #define TO_MIDDLEWARE_STRING(str) str

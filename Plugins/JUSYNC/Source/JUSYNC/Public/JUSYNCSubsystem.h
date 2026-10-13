@@ -20,6 +20,10 @@
 
 // Forward declaration to avoid circular dependency
 class UJUSYNCBlueprintLibrary;
+class FJUSYNCPointCloudSpawner;
+
+// Complete type needed by the generated ctor's TUniquePtr cleanup
+#include "JUSYNCMeshMorpher.h"
 
 #include "JUSYNCSubsystem.generated.h"
 
@@ -36,6 +40,50 @@ public:
     virtual void Initialize(FSubsystemCollectionBase& Collection) override;
     virtual void Deinitialize() override;
     virtual bool ShouldCreateSubsystem(UObject* Outer) const override;
+
+    // Async point cloud spawner with actor pooling
+    FJUSYNCPointCloudSpawner* GetPointCloudSpawner() const { return PCSpawner.Get(); }
+
+    // Extract cached gradient from middleware and apply to spawner LUT
+    void ApplyCachedGradientToSpawner();
+
+    // ========== LiDAR point cloud rendering tuning ==========
+    // These mirror the r.Lidar* console variables. Change at runtime (Blueprint/console/
+    // debugger) and call ApplyLidarPerformanceCvars() to push them into the renderer -
+    // no recompile needed for A/B testing. Defaults are applied in Initialize().
+
+    /** r.LidarPointBudget: points drawn on screen at once. 0 = let the target-FPS cvar decide. */
+    UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "JUSYNC|LiDAR", meta = (ClampMin = "0"))
+    int32 LidarPointBudget = 2500000;
+
+    /** r.LidarIncrementalBudget: grow the budget past LidarPointBudget while the camera is still. */
+    UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "JUSYNC|LiDAR")
+    bool bLidarIncrementalBudget = true;
+
+    /** r.LidarScreenCenterImportance: spend the budget on what the camera looks at first. */
+    UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "JUSYNC|LiDAR", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float LidarScreenCenterImportance = 0.5f;
+
+    /** r.LidarBaseLODImportance: keep the coarsest LOD of far assets visible (prevents holes). */
+    UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "JUSYNC|LiDAR", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float LidarBaseLODImportance = 0.5f;
+
+    /** Pushes the four Lidar* properties above into their console variables. */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|LiDAR")
+    void ApplyLidarPerformanceCvars() const;
+
+    // ========== Dataset mesh interaction ==========
+
+    /**
+     * Creates complex (full-mesh) collision for spawned dataset meshes so VR
+     * raycasts / line traces hit them instead of passing through. Applies to
+     * meshes created after this is set (default: enabled).
+     */
+    UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "JUSYNC|Mesh")
+    bool bEnableSpawnedMeshCollision = true;
+
+    /** Enables component + RealtimeMesh collision on a spawned mesh; call after its sections exist. */
+    void EnableSpawnedMeshCollision(URealtimeMeshComponent* RealtimeMeshComponent, URealtimeMeshSimple* RealtimeMesh) const;
 
     // Core Connection Management
     UFUNCTION(BlueprintCallable, Category = "JUSYNC")
@@ -70,12 +118,37 @@ public:
     UPROPERTY(BlueprintAssignable, Category = "JUSYNC Events")
     FJUSYNCError OnError;
 
+    UPROPERTY(BlueprintAssignable, Category = "JUSYNC Events")
+    FJUSYNCPointCloudReceived OnPointCloudReceived;
+
+    // Live update notification from broker
+    UPROPERTY(BlueprintAssignable, Category = "JUSYNC Events")
+    FJUSYNCNotificationReceived OnNotificationReceived;
+
+    // Typed scene / property update events from broker
+    UPROPERTY(BlueprintAssignable, Category = "JUSYNC Events")
+    FJUSYNCSceneUpdateReceived OnSceneUpdateReceived;
+
+    // Protocol diagnostics / live-update health events
+    UPROPERTY(BlueprintAssignable, Category = "JUSYNC Events")
+    FJUSYNCProtocolDiagnosticsReceived OnProtocolDiagnosticsReceived;
+
     // USD Processing (Legacy - use JUSYNCBlueprintLibrary versions for preview support)
     UFUNCTION(BlueprintCallable, Category = "JUSYNC USD|Legacy", DisplayName = "Load USD From Buffer (Legacy)")
     bool LoadUSDFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCMeshData>& OutMeshData);
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC USD|Legacy", DisplayName = "Load USD From Disk (Legacy)")
     bool LoadUSDFromDisk(const FString& FilePath, TArray<FJUSYNCMeshData>& OutMeshData);
+
+    bool LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData);
+
+    /**
+     * Zero-copy variant: bypasses std::vector copy at C API boundary.
+     * Uses LoadUSDFullFromPointer_C internally.
+     */
+    bool LoadUSDFullFromBufferNoCopy(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCMeshData>& OutMeshData, TArray<FJUSYNCPointCloudData>& OutPointCloudData);
+
+    bool LoadUSDFullCompactFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCCompactMeshRef>& OutMeshes, TArray<FJUSYNCPointCloudRef>& OutPointCloudData);
 
     // Texture Processing
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Texture")
@@ -102,6 +175,37 @@ public:
     bool CreateRealtimeMeshFromJUSYNC(
         const FJUSYNCMeshData& MeshData,
         URealtimeMeshComponent* RealtimeMeshComponent
+    );
+
+    bool CreateRealtimeMeshFromJUSYNC_WithStreams(
+        const FJUSYNCMeshData& MeshData,
+        URealtimeMeshComponent* RealtimeMeshComponent,
+        RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams
+    );
+
+    /**
+     * In-place RealtimeMesh update. If the component already owns a
+     * URealtimeMeshSimple, the existing USDGroup section group is updated instead
+     * of destroying/recreating the actor. If no mesh exists yet, this creates it.
+     */
+    bool UpdateRealtimeMeshFromJUSYNC(
+        const FJUSYNCMeshData& MeshData,
+        URealtimeMeshComponent* RealtimeMeshComponent,
+        UMaterialInterface* MaterialToApply,
+        RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams = nullptr
+    );
+
+    bool UpdateRealtimeMeshFromJUSYNC_WithCompact(
+        const FJUSYNCCompactMeshData& MeshData,
+        URealtimeMeshComponent* RealtimeMeshComponent,
+        UMaterialInterface* MaterialToApply,
+        RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams = nullptr
+    );
+
+    bool CreateRealtimeMeshFromJUSYNC_WithCompact(
+        const FJUSYNCCompactMeshData& MeshData,
+        URealtimeMeshComponent* RealtimeMeshComponent,
+        RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams = nullptr
     );
 
 
@@ -144,6 +248,48 @@ public:
     // Conversion utilities for RealtimeMesh
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Mesh")
     FJUSYNCRealtimeMeshData ConvertToRealtimeMeshFormat(const FJUSYNCMeshData& StandardMesh);
+
+    // Point Cloud Processing
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC PointCloud", DisplayName = "Load Point Cloud From USD Buffer")
+    bool LoadPointCloudFromBuffer(const TArray<uint8>& Buffer, const FString& Filename, TArray<FJUSYNCPointCloudData>& OutPointCloudData);
+
+    // Async point cloud loading
+    DECLARE_DELEGATE_ThreeParams(FOnPointCloudLoaded, const TArray<FJUSYNCPointCloudData>&, bool, const FString&);
+    void LoadPointCloudFromBuffer_Async(const TArray<uint8>& Buffer, const FString& Filename, FOnPointCloudLoaded OnLoaded);
+
+    // Spawn point cloud as LiDAR actor
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC PointCloud", DisplayName = "Spawn Lidar Point Cloud At Location")
+    AActor* SpawnLidarPointCloudAtLocation(
+        const FJUSYNCPointCloudData& PointCloudData,
+        FVector Location,
+        FRotator Rotation = FRotator::ZeroRotator,
+        FVector Scale3D = FVector(1.0f)
+    );
+
+    // Async point cloud spawning
+    DECLARE_DELEGATE_TwoParams(FOnPointCloudSpawned, AActor*, bool);
+    void SpawnLidarPointCloudAtLocation_Async(
+        const FJUSYNCPointCloudData& PointCloudData,
+        FVector Location,
+        FRotator Rotation,
+        FVector Scale3D,
+        FOnPointCloudSpawned OnSpawned
+    );
+
+    // Batch spawn point clouds
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC PointCloud", DisplayName = "Batch Spawn Point Clouds At Locations")
+    TArray<AActor*> BatchSpawnPointCloudsAtLocations(
+        const TArray<FJUSYNCPointCloudData>& PointCloudDataArray,
+        const TArray<FVector>& Locations
+    );
+
+    // Async batch spawn point clouds
+    DECLARE_DELEGATE_OneParam(FOnPointCloudBatchSpawned, const TArray<AActor*>&);
+    void BatchSpawnPointCloudsAtLocations_Async(
+        const TArray<FJUSYNCPointCloudData>& PointCloudDataArray,
+        const TArray<FVector>& Locations,
+        FOnPointCloudBatchSpawned OnBatchSpawned
+    );
 
     // Texture Integration
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Texture")
@@ -198,11 +344,18 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Broker", DisplayName = "Request File List With Sizes (Sync)")
     bool RequestFileListWithSizes(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes);
 
-    UFUNCTION(BlueprintCallable, Category = "JUSYNC Broker", DisplayName = "Request File List With Sizes And Ranks (Sync)")
-    bool RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks);
+    bool RequestFileListWithSizesAndRanks(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks, TArray<uint64>* OutHashLo = nullptr, TArray<uint64>* OutHashHi = nullptr);
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Broker", DisplayName = "Request File (Sync)")
     bool RequestFile(const FString& Filename, int32 TargetRank, int32 TimeoutMs, TArray<uint8>& OutData);
+    // In-situ variant: when ExpectedFileSize > 0 (the wire size from the file
+    // list) the file is downloaded directly into OutData with no middleware
+    // intermediate allocation/copy; otherwise falls back to the legacy path.
+    // AbortHandle: token from JusyncAbortCreate_C(); lets the game thread
+    // cancel this transfer mid-stream when a newer update supersedes it
+    // (0 = plain blocking download).
+    bool RequestFileSized(const FString& Filename, int32 TargetRank, int32 TimeoutMs,
+                          TArray<uint8>& OutData, uint64 ExpectedFileSize, uint64 AbortHandle = 0);
 
     // Parallel download functions
     UFUNCTION(BlueprintCallable, Category = "JUSYNC Broker", DisplayName = "Request Files Parallel (Sync)")
@@ -330,6 +483,12 @@ private:
 #endif
 
     mutable FCriticalSection MiddlewareMutex;
+
+    // Serializes USD parsing. tinyusdz is NOT thread-safe, so parses must run one-at-a-time.
+    // Deliberately SEPARATE from MiddlewareMutex: a single parse (up to ~500MB) runs on a
+    // background thread, and holding the general MiddlewareMutex for its whole duration would
+    // stall any game-thread state op (init/connect/worker-list) that also takes it.
+    mutable FCriticalSection ParseMutex;
     std::atomic<bool> bIsInitialized{ false };
 
     // Material caching
@@ -394,6 +553,12 @@ private:
     // Display management
     bool bMetricsDisplayVisible{ false };
     TWeakObjectPtr<class UUserWidget> MetricsDisplayWidget;
+
+    // Async point cloud spawner with actor pooling
+    TUniquePtr<class FJUSYNCPointCloudSpawner> PCSpawner;
+
+    /** GPU time-morphing for streamed mesh updates (see FJUSYNCMeshMorpher). */
+    TUniquePtr<class FJUSYNCMeshMorpher> MeshMorpher;
 
     void CreateMetricsDisplay();
     void DestroyMetricsDisplay();

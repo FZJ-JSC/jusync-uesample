@@ -1,0 +1,6 @@
+[submodule "Plugins/RealtimeMeshComponent"]
+	path = Plugins/RealtimeMeshComponent
+	url = https://github.com/TriAxis-Games/RealtimeMeshComponent.git
+[submodule "Plugins/NodeToCode"]
+	path = Plugins/NodeToCode
+	url = https://github.com/protospatial/NodeToCode.git

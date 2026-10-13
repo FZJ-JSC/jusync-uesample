@@ -10,6 +10,7 @@ public class JUSYNC : ModuleRules
         CppStandard = CppStandardVersion.Cpp20;
         bEnableExceptions = true;
         bUseRTTI = false;
+        bUseUnity = false;
 
         PublicDependencyModuleNames.AddRange(new string[]
         {
@@ -25,7 +26,10 @@ public class JUSYNC : ModuleRules
             "SlateCore",
             "RenderCore",
             "RHI",
-            "GameplayTasks"
+            "GameplayTasks",
+            "LidarPointCloudRuntime",
+            "ImageWrapper",
+            "Json"
         });
 
         // Setup third-party includes

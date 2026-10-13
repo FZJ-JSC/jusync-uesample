@@ -1,6 +1,14 @@
-﻿#include "JUSYNCModule.h"
+#include "JUSYNCModule.h"
+#include "Containers/Ticker.h"
 #include "Engine/Engine.h"
+#include "Engine/World.h"
+#include "GameFramework/Actor.h"
 #include "HAL/PlatformFileManager.h"
+#include "HAL/IConsoleManager.h"
+#include "JUSYNCFileSpawnerActor.h"
+#include "Misc/App.h"
+#include "Misc/CommandLine.h"
+#include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "HAL/FileManager.h"
 
@@ -13,89 +21,98 @@
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
 #include "AnariUsdMiddleware.h"
+#if WITH_ANARI_USD_MIDDLEWARE
+#include "AnariUsdMiddleware_C.h"
+#endif
 #endif
 
 #define LOCTEXT_NAMESPACE "FJUSYNCModule"
 
-
 DEFINE_LOG_CATEGORY(LogJUSYNC)
+
+#if WITH_ANARI_USD_MIDDLEWARE
+// jusync.diag console command object (registered in RegisterModuleSystems).
+static IConsoleObject* GJusyncDiagCmd = nullptr;
+
+// Shared table printer (console command + headless harness).
+static void JusyncLogDiagTable(int32 Rows)
+{
+    TArray<char> Buf;
+    Buf.SetNumUninitialized(128 * 1024);
+    const int32 Written = JusyncDiagDump_C(Buf.GetData(), Buf.Num(), Rows);
+    if (Written <= 0)
+    {
+        UE_LOG(LogJUSYNC, Display, TEXT("[jusync.diag] no traces recorded yet"));
+        return;
+    }
+    Buf[Written] = '\0';
+    const FString Table(UTF8_TO_TCHAR(Buf.GetData()));
+    TArray<FString> Lines;
+    Table.ParseIntoArrayLines(Lines, /*bCullEmpty=*/false);
+    UE_LOG(LogJUSYNC, Display,
+        TEXT("===== JUSYNC streaming stage latency (ms, -1 = stage not reached) ====="));
+    for (const FString& Line : Lines)
+    {
+        UE_LOG(LogJUSYNC, Display, TEXT("%s"), *Line);
+    }
+}
+#endif
 
 
 void FJUSYNCModule::StartupModule() {
-    UE_LOG(LogJUSYNC, Log, TEXT("=== JUSYNC MODULE STARTUP BEGIN ==="));
-
     try {
         DetectAndLogPlatform();
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
-        UE_LOG(LogJUSYNC, Log, TEXT("✅ Compiled WITH middleware support"));
+        UE_LOG(LogJUSYNC, Log, TEXT("Compiled with middleware support"));
 
-        if (InitializePlatformSpecific()) {
-            UE_LOG(LogJUSYNC, Log, TEXT("✅ Platform-specific initialization successful"));
-            LogMiddlewareCapabilities();
+        if (!InitializePlatformSpecific()) {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Platform-specific initialization failed - running in limited mode"));
         } else {
-            UE_LOG(LogJUSYNC, Warning, TEXT("❌ Platform-specific initialization failed"));
-            UE_LOG(LogJUSYNC, Warning, TEXT("❌ Plugin will run in LIMITED MODE"));
+            LogMiddlewareCapabilities();
         }
 #else
-        UE_LOG(LogJUSYNC, Warning, TEXT("⚠️ Compiled WITHOUT middleware support"));
-        UE_LOG(LogJUSYNC, Warning, TEXT("⚠️ Check Build.cs - middleware libraries not found during compilation"));
-        UE_LOG(LogJUSYNC, Warning, TEXT("⚠️ Only basic JUSYNC functionality will be available"));
+        UE_LOG(LogJUSYNC, Warning, TEXT("Compiled WITHOUT middleware support (check Build.cs: middleware libraries not found). "
+                                        "Only basic JUSYNC functionality will be available."));
 #endif
 
         RegisterModuleSystems();
-
-        UE_LOG(LogJUSYNC, Log, TEXT("=== JUSYNC MODULE STARTUP COMPLETE ==="));
     } catch (const std::exception&) {
-        UE_LOG(LogJUSYNC, Error, TEXT("❌ JUSYNC: Exception during startup"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Exception during startup"));
     } catch (...) {
-        UE_LOG(LogJUSYNC, Error, TEXT("❌ JUSYNC: Unknown exception during startup"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Unknown exception during startup"));
     }
 }
 
 void FJUSYNCModule::ShutdownModule() {
-    UE_LOG(LogJUSYNC, Log, TEXT("=== JUSYNC MODULE SHUTDOWN BEGIN ==="));
-
     try {
         CleanupPlatformSpecific();
         UnregisterModuleSystems();
-
-        UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC Module Shutdown Complete"));
-        UE_LOG(LogJUSYNC, Log, TEXT("JUSYNC: RealtimeMeshComponent integration cleaned up"));
     } catch (const std::exception&) {
-        UE_LOG(LogJUSYNC, Error, TEXT("❌ JUSYNC: Exception during shutdown"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Exception during shutdown"));
     } catch (...) {
-        UE_LOG(LogJUSYNC, Error, TEXT("❌ JUSYNC: Unknown exception during shutdown"));
+        UE_LOG(LogJUSYNC, Error, TEXT("Unknown exception during shutdown"));
     }
-
-    UE_LOG(LogJUSYNC, Log, TEXT("=== JUSYNC MODULE SHUTDOWN COMPLETE ==="));
 }
 
 void FJUSYNCModule::DetectAndLogPlatform() {
-    UE_LOG(LogJUSYNC, Log, TEXT("=== PLATFORM DETECTION ==="));
-
 #if PLATFORM_WINDOWS
-    UE_LOG(LogJUSYNC, Log, TEXT("Platform: Windows (x64)"));
-    UE_LOG(LogJUSYNC, Log, TEXT("Expected middleware libraries: .dll files"));
+    UE_LOG(LogJUSYNC, Log, TEXT("Platform: Windows (x64), middleware libraries: .dll"));
 #elif PLATFORM_LINUX
-    UE_LOG(LogJUSYNC, Log, TEXT("Platform: Linux"));
-    UE_LOG(LogJUSYNC, Log, TEXT("Expected middleware libraries: .so files"));
+    UE_LOG(LogJUSYNC, Log, TEXT("Platform: Linux, middleware libraries: .so"));
 #else
-    UE_LOG(LogJUSYNC, Warning, TEXT("Platform: Unknown/Unsupported"));
-    UE_LOG(LogJUSYNC, Warning, TEXT("⚠️ This platform may not be fully supported"));
+    UE_LOG(LogJUSYNC, Warning, TEXT("Platform: unknown/unsupported"));
 #endif
 
-    UE_LOG(LogJUSYNC, Log, TEXT("Unreal Engine Version: %s"), ENGINE_VERSION_STRING);
 #if UE_BUILD_SHIPPING
-    UE_LOG(LogJUSYNC, Log, TEXT("Build Configuration: Shipping"))
+    const TCHAR* BuildConfigName = TEXT("Shipping");
 #else
-    UE_LOG(LogJUSYNC, Log, TEXT("Build Configuration: Development"))
+    const TCHAR* BuildConfigName = TEXT("Development");
 #endif
+    UE_LOG(LogJUSYNC, Log, TEXT("Engine: %s (%s)"), ENGINE_VERSION_STRING, BuildConfigName);
 }
 
 bool FJUSYNCModule::InitializePlatformSpecific() {
-    UE_LOG(LogJUSYNC, Log, TEXT("=== PLATFORM-SPECIFIC INITIALIZATION ==="));
-
 #ifdef WITH_ANARI_USD_MIDDLEWARE
 
 #if PLATFORM_WINDOWS
@@ -103,151 +120,107 @@ bool FJUSYNCModule::InitializePlatformSpecific() {
 #elif PLATFORM_LINUX
     return InitializeLinux();
 #else
-    UE_LOG(LogJUSYNC, Error, TEXT("❌ Unsupported platform for middleware"));
+    UE_LOG(LogJUSYNC, Error, TEXT("Unsupported platform for middleware"));
     return false;
 #endif
 
 #else
-    UE_LOG(LogJUSYNC, Warning, TEXT("⚠️ Middleware support not compiled - skipping platform initialization"));
+    UE_LOG(LogJUSYNC, Warning, TEXT("Middleware support not compiled - skipping platform initialization"));
     return true;  // Not an error, just limited functionality
 #endif
 }
 
 #if PLATFORM_WINDOWS
 bool FJUSYNCModule::InitializeWindows() {
-    UE_LOG(LogJUSYNC, Log, TEXT("Initializing Windows platform..."));
-
-    // Get plugin directory paths
     FString PluginDir = FPaths::ProjectPluginsDir();
     FString DLLPath = FPaths::Combine(PluginDir, TEXT("JUSYNC/Source/ThirdParty/AnariUsdMiddleware/Lib/Win64"));
     FString AbsoluteDLLPath = IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(*DLLPath);
 
-    UE_LOG(LogJUSYNC, Log, TEXT("Windows DLL Directory: %s"), *AbsoluteDLLPath);
+    UE_LOG(LogJUSYNC, Log, TEXT("Windows DLL directory: %s"), *AbsoluteDLLPath);
 
-    // Check if directory exists
     if (!IFileManager::Get().DirectoryExists(*AbsoluteDLLPath)) {
-        UE_LOG(LogJUSYNC, Error, TEXT("❌ Windows DLL directory does not exist: %s"), *AbsoluteDLLPath);
+        UE_LOG(LogJUSYNC, Error, TEXT("Windows DLL directory does not exist: %s"), *AbsoluteDLLPath);
         return false;
     }
 
-    // List of required Windows DLLs
-    TArray<FString> RequiredDLLs = {TEXT("anari_usd_middleware.dll")};
-
-    bool bAllLibrariesFound = ValidateLibraries(AbsoluteDLLPath, RequiredDLLs, TEXT("dll"));
+    const TArray<FString> RequiredDLLs = {TEXT("anari_usd_middleware.dll")};
+    const bool bAllLibrariesFound = ValidateLibraries(AbsoluteDLLPath, RequiredDLLs, TEXT("dll"));
 
     if (bAllLibrariesFound) {
         CheckVCRedistributablesInstalled();
 
-        // Add DLL directory to search path
         FPlatformProcess::AddDllDirectory(*AbsoluteDLLPath);
         UE_LOG(LogJUSYNC, Log, TEXT("Added DLL directory to search path: %s"), *AbsoluteDLLPath);
-
-        UE_LOG(LogJUSYNC, Log, TEXT("✅ Windows platform initialization complete"));
     }
 
     return bAllLibrariesFound;
 }
 
 void FJUSYNCModule::CheckVCRedistributablesInstalled() {
-    UE_LOG(LogJUSYNC, Log, TEXT("Checking Visual C++ Redistributables..."));
-
-    // Check for common VC++ runtime DLLs
-    TArray<FString> VCRuntimeDLLs = {TEXT("msvcp140.dll"), TEXT("vcruntime140.dll"), TEXT("vcruntime140_1.dll")};
+    const TArray<FString> VCRuntimeDLLs = {TEXT("msvcp140.dll"), TEXT("vcruntime140.dll"), TEXT("vcruntime140_1.dll")};
 
     for (const FString& RuntimeDLL : VCRuntimeDLLs) {
-        HMODULE hModule = GetModuleHandle(*RuntimeDLL);
-        if (hModule) {
-            UE_LOG(LogJUSYNC, Log, TEXT("✅ Found VC++ Runtime: %s"), *RuntimeDLL);
-        } else {
-            UE_LOG(LogJUSYNC, Warning, TEXT("⚠️ Missing VC++ Runtime: %s"), *RuntimeDLL);
+        if (!GetModuleHandle(*RuntimeDLL)) {
+            UE_LOG(LogJUSYNC, Warning, TEXT("Missing VC++ runtime: %s"), *RuntimeDLL);
         }
     }
-
-    UE_LOG(LogJUSYNC, Log, TEXT("✅ VC++ Redistributable check complete"));
 }
 #endif
 
 #if PLATFORM_LINUX
 bool FJUSYNCModule::InitializeLinux() {
-    UE_LOG(LogJUSYNC, Log, TEXT("Initializing Linux platform..."));
-
-    // Get plugin directory paths
     FString PluginDir = FPaths::ProjectPluginsDir();
     FString LibPath = FPaths::Combine(PluginDir, TEXT("JUSYNC/Source/ThirdParty/AnariUsdMiddleware/Lib/Linux"));
     FString AbsoluteLibPath = IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(*LibPath);
 
-    UE_LOG(LogJUSYNC, Log, TEXT("Linux Library Directory: %s"), *AbsoluteLibPath);
+    UE_LOG(LogJUSYNC, Log, TEXT("Linux library directory: %s"), *AbsoluteLibPath);
 
-    // Check if directory exists
     if (!IFileManager::Get().DirectoryExists(*AbsoluteLibPath)) {
-        UE_LOG(LogJUSYNC, Error, TEXT("❌ Linux library directory does not exist: %s"), *AbsoluteLibPath);
+        UE_LOG(LogJUSYNC, Error, TEXT("Linux library directory does not exist: %s"), *AbsoluteLibPath);
         return false;
     }
 
-    // List of required Linux shared libraries
-    TArray<FString> RequiredLibs = {
+    const TArray<FString> RequiredLibs = {
         TEXT("libanari_usd_middleware.so")
-        // Add other Linux-specific libraries as needed
     };
 
-    bool bAllLibrariesFound = ValidateLibraries(AbsoluteLibPath, RequiredLibs, TEXT("so"));
+    const bool bAllLibrariesFound = ValidateLibraries(AbsoluteLibPath, RequiredLibs, TEXT("so"));
 
     if (bAllLibrariesFound) {
-        // Add library directory to LD_LIBRARY_PATH equivalent
         FPlatformProcess::AddDllDirectory(*AbsoluteLibPath);
         UE_LOG(LogJUSYNC, Log, TEXT("Added library directory to search path: %s"), *AbsoluteLibPath);
-
-        CheckLinuxDependencies();
-
-        UE_LOG(LogJUSYNC, Log, TEXT("✅ Linux platform initialization complete"));
     }
 
     return bAllLibrariesFound;
-}
-
-void FJUSYNCModule::CheckLinuxDependencies() {
-    UE_LOG(LogJUSYNC, Log, TEXT("Checking Linux system dependencies..."));
-    UE_LOG(LogJUSYNC, Log, TEXT("✅ Static linking - no external system dependencies required"));
-    UE_LOG(LogJUSYNC, Log, TEXT("✅ Linux dependencies check complete"));
 }
 #endif
 
 bool FJUSYNCModule::ValidateLibraries(
     const FString& LibraryPath, const TArray<FString>& RequiredLibraries, const FString& Extension
 ) {
-    UE_LOG(LogJUSYNC, Log, TEXT("Validating %d %s libraries..."), RequiredLibraries.Num(), *Extension.ToUpper());
-
     bool bAllLibrariesFound = true;
     int32 ValidatedCount = 0;
 
     for (const FString& LibraryName : RequiredLibraries) {
-        FString FullLibraryPath = FPaths::Combine(LibraryPath, LibraryName);
+        const FString FullLibraryPath = FPaths::Combine(LibraryPath, LibraryName);
 
         if (IFileManager::Get().FileExists(*FullLibraryPath)) {
-            UE_LOG(LogJUSYNC, Log, TEXT("✅ Found library: %s"), *LibraryName);
-
-            // Try to load the library to verify it's valid
             if (AttemptLibraryLoad(FullLibraryPath, LibraryName)) {
-                ValidatedCount++;
-                UE_LOG(LogJUSYNC, Log, TEXT("✅ Successfully validated: %s"), *LibraryName);
+                ++ValidatedCount;
             } else {
-                UE_LOG(LogJUSYNC, Error, TEXT("❌ Failed to load: %s"), *LibraryName);
+                UE_LOG(LogJUSYNC, Error, TEXT("Failed to load: %s"), *LibraryName);
                 bAllLibrariesFound = false;
             }
         } else {
-            UE_LOG(LogJUSYNC, Error, TEXT("❌ Missing library: %s"), *FullLibraryPath);
+            UE_LOG(LogJUSYNC, Error, TEXT("Missing library: %s"), *FullLibraryPath);
             bAllLibrariesFound = false;
         }
     }
 
-    if (bAllLibrariesFound) {
-        UE_LOG(LogJUSYNC, Log, TEXT("✅ All %d middleware libraries validated successfully"), ValidatedCount);
-    } else {
-        UE_LOG(
-            LogJUSYNC, Error, TEXT("❌ Library validation failed - %d/%d libraries found"), ValidatedCount,
-            RequiredLibraries.Num()
-        );
-        UE_LOG(LogJUSYNC, Warning, TEXT("❌ Plugin will run in LIMITED MODE"));
+    if (!bAllLibrariesFound) {
+        UE_LOG(LogJUSYNC, Error, TEXT("Library validation failed: %d/%d libraries found. "
+                                      "Plugin will run in limited mode."),
+            ValidatedCount, RequiredLibraries.Num());
     }
 
     return bAllLibrariesFound;
@@ -259,45 +232,194 @@ bool FJUSYNCModule::AttemptLibraryLoad(const FString& FullPath, const FString& L
 
 
 void FJUSYNCModule::LogMiddlewareCapabilities() {
-    UE_LOG(LogJUSYNC, Log, TEXT("=== MIDDLEWARE CAPABILITIES ==="));
-    UE_LOG(LogJUSYNC, Log, TEXT("✅ ZeroMQ communication ready"));
-    UE_LOG(LogJUSYNC, Log, TEXT("✅ USD processing with TinyUSDZ ready"));
-    UE_LOG(LogJUSYNC, Log, TEXT("✅ Hash verification with OpenSSL ready"));
-    UE_LOG(LogJUSYNC, Log, TEXT("✅ Texture processing with STB ready"));
-    UE_LOG(LogJUSYNC, Log, TEXT("✅ RealtimeMeshComponent integration ready"));
-    UE_LOG(LogJUSYNC, Log, TEXT("✅ Cross-platform file handling ready"));
+    UE_LOG(LogJUSYNC, Log, TEXT("Middleware ready: ZeroMQ, USD (TinyUSDZ), hash verification (OpenSSL), "
+                                "textures (STB), RealtimeMeshComponent integration"));
 }
 
 void FJUSYNCModule::RegisterModuleSystems() {
-    UE_LOG(LogJUSYNC, Log, TEXT("Registering JUSYNC module systems..."));
+#if WITH_ANARI_USD_MIDDLEWARE
+    // jusync.diag [N|clear] — per-file streaming stage-latency journal dump (Phase 0).
+    if (!GJusyncDiagCmd)
+    {
+        GJusyncDiagCmd = IConsoleManager::Get().RegisterConsoleCommand(
+            TEXT("jusync.diag"),
+            TEXT("Print JUSYNC streaming stage latency table (ms). Usage: jusync.diag [N|clear], default N=20"),
+            FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args) {
+                if (Args.Num() > 0 && Args[0].Equals(TEXT("clear"), ESearchCase::IgnoreCase))
+                {
+                    JusyncDiagClear_C();
+                    UE_LOG(LogJUSYNC, Log, TEXT("[jusync.diag] journal cleared"));
+                    return;
+                }
+                const int32 N = (Args.Num() > 0)
+                    ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 200)
+                    : 20;
+                JusyncLogDiagTable(N);
+            }),
+            ECVF_Default); // user-typable diag command (UE 5.7 removed ECVF_CodeOnly, which would have hidden it anyway)
+    }
 
-    // Register any global systems, callbacks, or subsystems here
-    // This is where you'd hook into Unreal's system if needed
-
-    UE_LOG(LogJUSYNC, Log, TEXT("✅ Module systems registered"));
+    // Cmdline-driven headless perf harness; inert unless -JusyncAuto* flags present
+    // (its ticker is tied to the process lifetime of the headless run).
+    MaybeStartHeadlessHarness();
+#endif
 }
 
 void FJUSYNCModule::UnregisterModuleSystems() {
-    UE_LOG(LogJUSYNC, Log, TEXT("Unregistering JUSYNC module systems..."));
-
-    // Cleanup any global systems, callbacks, or subsystems here
-
-    UE_LOG(LogJUSYNC, Log, TEXT("✅ Module systems unregistered"));
+#if WITH_ANARI_USD_MIDDLEWARE
+    if (GJusyncDiagCmd)
+    {
+        IConsoleManager::Get().UnregisterConsoleObject(GJusyncDiagCmd);
+        GJusyncDiagCmd = nullptr;
+    }
+#endif
 }
 
-void FJUSYNCModule::CleanupPlatformSpecific() {
-    UE_LOG(LogJUSYNC, Log, TEXT("Performing platform-specific cleanup..."));
+#if WITH_ANARI_USD_MIDDLEWARE
+// ---------------------------------------------------------------------------
+// Headless streaming perf harness (cmdline-only; inert in normal runs).
+//
+//   -JusyncAutoSpawner          spawn a JUSYNCFileSpawnerActor once the game
+//                               world begins play and start its pipeline
+//   -JusyncAutoDiag=SEC[,COUNT] dump the jusync.diag table every SEC seconds
+//                               (COUNT times, default: until quit)
+//   -JusyncAutoDiagRows=N       rows per dump (default 40)
+//   -JusyncAutoQuit=SEC         force-exit SEC seconds after module startup
+//
+// Intended for: UnrealEditor-Cmd.exe <uproject> <map> -game -nullrhi ...
+// ---------------------------------------------------------------------------
+namespace
+{
+    struct FJusyncHarnessState
+    {
+        double StartTime = 0.0;
+        double DiagInterval = 0.0;
+        double NextDiagAt = 0.0;
+        int32 DiagRemaining = 0;
+        int32 DiagRows = 40;
+        double QuitAt = 0.0;
+        bool bAutoSpawner = false;
+        bool bSpawnerStarted = false;
+        float PointSizeOverride = -1.f;
+        float PointBiasOverride = -1.f;
+        FTSTicker::FDelegateHandle TickerHandle;
+    };
+    FJusyncHarnessState GHarness;
 
-    // Free any loaded library handles
-    for (auto& Pair : LoadedLibraryHandles) {
-        if (Pair.Value) {
-            FPlatformProcess::FreeDllHandle(Pair.Value);
-            UE_LOG(LogJUSYNC, Log, TEXT("Freed library handle: %s"), *Pair.Key);
+    bool JusyncHarnessTick(float /*DeltaTime*/)
+    {
+        const double Elapsed = FPlatformTime::Seconds() - GHarness.StartTime;
+
+        if (GHarness.bAutoSpawner && !GHarness.bSpawnerStarted && GEngine)
+        {
+            for (const FWorldContext& Context : GEngine->GetWorldContexts())
+            {
+                UWorld* World = Context.World();
+                if (!World
+                    || (Context.WorldType != EWorldType::Game && Context.WorldType != EWorldType::PIE)
+                    || !World->HasBegunPlay())
+                {
+                    continue;
+                }
+
+                FActorSpawnParameters Params;
+                Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+                if (AJUSYNCFileSpawnerActor* Spawner = World->SpawnActor<AJUSYNCFileSpawnerActor>(
+                        FVector::ZeroVector, FRotator::ZeroRotator, Params))
+                {
+                    Spawner->bEnablePerfLogging = true; // the harness is the perf instrument
+                    if (GHarness.PointSizeOverride >= 0.f)
+                    {
+                        Spawner->PointCloudSize = GHarness.PointSizeOverride;
+                    }
+                    if (GHarness.PointBiasOverride >= 0.f)
+                    {
+                        Spawner->PointSizeBias = GHarness.PointBiasOverride;
+                    }
+                    Spawner->StartSpawning();
+                    GHarness.bSpawnerStarted = true;
+                    UE_LOG(LogJUSYNC, Display, TEXT("[jusync.harness] auto-spawner started streaming (world '%s', t=%.1fs)"),
+                        *World->GetMapName(), Elapsed);
+                }
+                break;
+            }
         }
-    }
-    LoadedLibraryHandles.Empty();
 
-    UE_LOG(LogJUSYNC, Log, TEXT("✅ Platform-specific cleanup complete"));
+        if (GHarness.DiagInterval > 0.0 && GHarness.DiagRemaining > 0 && Elapsed >= GHarness.NextDiagAt)
+        {
+            UE_LOG(LogJUSYNC, Display, TEXT("[jusync.harness] diag dump t=%.1fs"), Elapsed);
+            JusyncLogDiagTable(GHarness.DiagRows);
+            --GHarness.DiagRemaining;
+            GHarness.NextDiagAt += GHarness.DiagInterval;
+        }
+
+        if (GHarness.QuitAt > 0.0 && Elapsed >= GHarness.QuitAt)
+        {
+            UE_LOG(LogJUSYNC, Display, TEXT("[jusync.harness] auto-quit at t=%.1fs"), Elapsed);
+            GHarness.TickerHandle.Reset();
+            FPlatformMisc::RequestExitWithStatus(true, 0);
+            return false;
+        }
+        return true;
+    }
+}
+
+void FJUSYNCModule::MaybeStartHeadlessHarness()
+{
+    FString Spec;
+    if (FParse::Value(FCommandLine::Get(), TEXT("JusyncAutoDiag="), Spec))
+    {
+        FString IntervalStr = Spec;
+        FString CountStr;
+        if (Spec.Split(TEXT(","), &IntervalStr, &CountStr))
+        {
+            GHarness.DiagRemaining = FMath::Max(1, FCString::Atoi(*CountStr));
+        }
+        else
+        {
+            GHarness.DiagRemaining = TNumericLimits<int32>::Max();
+        }
+        GHarness.DiagInterval = FCString::Atof(*IntervalStr);
+    }
+    FString RowsStr;
+    if (FParse::Value(FCommandLine::Get(), TEXT("JusyncAutoDiagRows="), RowsStr))
+    {
+        GHarness.DiagRows = FMath::Clamp(FCString::Atoi(*RowsStr), 1, 200);
+    }
+    FString QuitStr;
+    if (FParse::Value(FCommandLine::Get(), TEXT("JusyncAutoQuit="), QuitStr))
+    {
+        GHarness.QuitAt = FCString::Atof(*QuitStr);
+    }
+    GHarness.bAutoSpawner = FParse::Param(FCommandLine::Get(), TEXT("JusyncAutoSpawner"));
+    FString PSizeStr, PBiasStr;
+    if (FParse::Value(FCommandLine::Get(), TEXT("JusyncPointSize="), PSizeStr))
+    {
+        GHarness.PointSizeOverride = FMath::Max(0.f, FCString::Atof(*PSizeStr));
+    }
+    if (FParse::Value(FCommandLine::Get(), TEXT("JusyncPointBias="), PBiasStr))
+    {
+        GHarness.PointBiasOverride = FMath::Clamp(FCString::Atof(*PBiasStr), 0.f, 0.15f);
+    }
+
+    if (GHarness.DiagInterval <= 0.0 && GHarness.QuitAt <= 0.0 && !GHarness.bAutoSpawner)
+    {
+        return; // nothing requested
+    }
+
+    GHarness.StartTime = FPlatformTime::Seconds();
+    GHarness.NextDiagAt = GHarness.DiagInterval;
+    UE_LOG(LogJUSYNC, Display,
+        TEXT("[jusync.harness] armed: autoSpawner=%d diagEvery=%.1fs count=%d rows=%d quitAt=%.1fs"),
+        GHarness.bAutoSpawner ? 1 : 0, GHarness.DiagInterval, GHarness.DiagRemaining,
+        GHarness.DiagRows, GHarness.QuitAt);
+    GHarness.TickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+        FTickerDelegate::CreateStatic(&JusyncHarnessTick));
+}
+#endif
+
+void FJUSYNCModule::CleanupPlatformSpecific() {
+    // Nothing to free: libraries are resolved via the process DLL path.
 }
 
 #undef LOCTEXT_NAMESPACE

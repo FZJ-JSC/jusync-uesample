@@ -122,6 +122,12 @@ typedef struct {
     const char** uv_set_names;   // Array of UV set name pointers
     size_t uv_sets_count;        // Number of UV sets
 
+    // In-situ fill target (FillUSDFull_C only): per-vertex RGBA bytes (0-255).
+    // When non-NULL, FillUSDFull_C writes vertex colors here instead of the
+    // float vertex_colors array. Ignored by the legacy ConvertMeshDataToCFormat
+    // allocation path (which always leaves it NULL).
+    unsigned char* vertex_colors8;
+
 } CMeshData;
 
 /**
@@ -137,6 +143,41 @@ typedef struct {
     size_t data_size;           // Size of pixel data in bytes
 } CTextureData;
 
+/**
+ * Point cloud data structure for C interface
+ * Contains per-point positions, colors (baked from gradient texture), and optional attributes
+ * Compatible with Unreal Engine LiDAR Point Cloud plugin
+ *
+ * Memory Layout:
+ * - All arrays are flat and suitable for direct conversion to FLidarPointCloudPoint
+ * - Positions as [x1,y1,z1, x2,y2,z2, ...]
+ * - Colors as [r1,g1,b1,a1, r2,g2,b2,a2, ...] in range [0.0, 1.0]
+ */
+typedef struct {
+    char element_name[256];      // USD primitive name (null-terminated)
+    char type_name[128];         // Always "GeomPoints"
+
+    float* positions;            // Flat xyz array, points_count * 3 floats
+    size_t points_count;         // Number of points (not floats)
+
+    float* normals;              // Flat xyz or NULL, points_count * 3
+    float* colors;               // Flat rgba or NULL, points_count * 4, values [0.0, 1.0]
+    float* widths;               // Flat float or NULL, one per point
+    int has_normals;             // 1 if normals array is valid
+    int has_colors;              // 1 if colors array is valid
+    int has_widths;              // 1 if widths array is valid
+
+    // Bounding box
+    float bounding_box_min[3];
+    float bounding_box_max[3];
+
+    // In-situ fill target (FillUSDFull_C only): per-point RGBA bytes (0-255).
+    // When non-NULL, FillUSDFull_C writes colors here instead of the float
+    // colors array. Ignored by the legacy allocation path (leaves it NULL).
+    unsigned char* colors8;
+
+} CPointCloudData;
+
 // ============================================================================
 // CALLBACK FUNCTION TYPES
 // ============================================================================
@@ -151,6 +192,19 @@ typedef struct {
  * @param file_data Pointer to received file data (valid only during callback)
  */
 typedef void (*FileReceivedCallback_C)(const CFileData* file_data);
+
+/**
+ * Zero-copy file reception callback.
+ *
+ * The data pointer is valid only for the duration of the callback. Callers
+ * that need to retain the payload must copy it inside the callback.
+ */
+typedef void (*FileReceivedSpanCallback_C)(
+    const char* filename,
+    const unsigned char* data,
+    size_t data_size,
+    const char* hash,
+    const char* file_type);
 
 /**
  * Callback function type for message reception notifications
@@ -250,8 +304,239 @@ ANARI_USD_MIDDLEWARE_C_API int LoadUSDBuffer_C(const unsigned char* buffer,
  * @return 1 on success, 0 on failure
  */
 ANARI_USD_MIDDLEWARE_C_API int LoadUSDFromDisk_C(const char* filepath,
-                                                  CMeshData** out_meshes,
-                                                  size_t* out_count);
+                                                   CMeshData** out_meshes,
+                                                   size_t* out_count);
+
+/**
+ * Load USD data from buffer and extract BOTH meshes + point clouds in a single-pass parse.
+ * Calls UsdProcessor::LoadUSDBuffer once with both mesh and point cloud output,
+ * eliminating the double-parse bottleneck of calling LoadUSDBuffer_C + ProcessPointCloudFromUSD_C.
+ *
+ * @param buffer Raw USD buffer data
+ * @param buffer_size Size of buffer in bytes
+ * @param filename Original filename for format detection
+ * @param out_meshes Output: allocated array of CMeshData (NULL if no meshes)
+ * @param out_mesh_count Output: number of meshes extracted
+ * @param out_clouds Output: allocated array of CPointCloudData (NULL if no point clouds)
+ * @param out_cloud_count Output: number of point clouds extracted
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int LoadUSDFull_C(
+    const unsigned char* buffer,
+    size_t buffer_size,
+    const char* filename,
+    CMeshData** out_meshes,
+    size_t* out_mesh_count,
+    CPointCloudData** out_clouds,
+    size_t* out_cloud_count);
+
+/**
+ * Zero-copy variant: avoids copies at the C API boundary and, when the USD
+ * content contains none of the known preprocessing quirks (`0: None`,
+ * `asset:images/`, `texCoord2f`), parses the caller's buffer in place with
+ * ZERO copies. Accepts raw pointer + size directly (e.g. from TArray<uint8>).
+ * Internally delegates to UsdProcessor::LoadUSDBufferFromRaw.
+ *
+ * @param buffer Raw USD buffer data (must stay alive during call)
+ * @param buffer_size Size of buffer in bytes
+ * @param filename Original filename for format detection
+ * @param out_meshes Output: allocated array of CMeshData (NULL if no meshes)
+ * @param out_mesh_count Output: number of meshes extracted
+ * @param out_clouds Output: allocated array of CPointCloudData (NULL if no point clouds)
+ * @param out_cloud_count Output: number of point clouds extracted
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int LoadUSDFullFromPointer_C(
+    const unsigned char* buffer,
+    size_t buffer_size,
+    const char* filename,
+    CMeshData** out_meshes,
+    size_t* out_mesh_count,
+    CPointCloudData** out_clouds,
+    size_t* out_cloud_count);
+
+// ============================================================================
+// IN-SITU (TWO-PHASE) PARSE API
+//
+// QueryUSDFullLayout_C parses the USD once and reports per-mesh/per-cloud
+// element counts without allocating any geometry buffers. The caller then
+// allocates its own final arrays (e.g. Unreal TArrays) and passes fill
+// structs pointing at them; FillUSDFull_C writes the geometry straight into
+// those buffers — no intermediate C-side allocation, no C->UE conversion
+// copy.
+//
+// The fill structs match the caller's final container layouts (Unreal 5):
+//  - points/normals/positions : double[3] per element (FVector = TVector<double>)
+//  - uvs                      : double[2] per element (FVector2D)
+//  - indices                  : int32
+//  - colors8                  : uint8[4] per element (FColor)
+//  - widths                   : float
+// Float->double promotion is exact, so results are bit-identical to the
+// legacy per-element conversion.
+//
+// Fill conventions (identical to the legacy CMeshData + UE conversion path):
+//  - mesh positions/normals: written in UE space (x, -y, z); UE must still
+//    re-normalize normals exactly as before
+//  - mesh indices: uint32 source values cast to int32 (legacy behavior)
+//  - mesh UVs: float source pairs promoted to double[2]
+//  - mesh colors: per-vertex RGBA bytes with clamp(c*255) rounding
+//  - point cloud positions: written in UE space (x, z, -y)
+//  - point cloud colors: per-point RGBA bytes with unclamped (uint8)(c*255)
+//    (matching the legacy UE conversion)
+//  - point cloud widths: raw floats (scalarAttributes.x fallback included)
+//  - point cloud bounding boxes: written to the fill struct in USD space,
+//    origin-inclusive (legacy quirk); the caller transforms to UE space
+//
+// The caller must NOT call FreeMeshData_C/FreePointCloudData_C on the
+// fill buffers (it owns them); FreeParsedUSD_C releases the parse handle.
+// ============================================================================
+
+/** Per-mesh element counts reported by QueryUSDFullLayout_C. */
+typedef struct {
+    char element_name[256];
+    char type_name[128];
+    size_t points_count;        // number of vertices
+    size_t indices_count;       // number of triangle indices (triangulated)
+    size_t normals_count;       // number of normals (0 if absent)
+    size_t uvs_count;           // number of UV pairs (0 if absent)
+    size_t vertex_colors_count; // number of per-vertex colors (0 if absent)
+} CMeshLayout;
+
+/** Per-point-cloud element counts reported by QueryUSDFullLayout_C. */
+typedef struct {
+    char element_name[256];
+    size_t point_count;
+    int has_colors;
+    int has_normals;
+    int has_widths;
+} CPointCloudLayout;
+
+/** In-situ mesh fill target (FillUSDFull_C only). */
+typedef struct {
+    double* points;            // 3 doubles per vertex
+    int32_t* indices;          // 1 int32 per index
+    double* normals;           // 3 doubles per normal (nullable)
+    double* uvs;               // 2 doubles per UV pair (nullable)
+    unsigned char* vertex_colors8; // 4 bytes per vertex (nullable)
+} CMeshDataFill;
+
+/**
+ * Compact in-situ mesh fill target (FillUSDFullCompact_C only).
+ *
+ * This writes the same transformed geometry as CMeshDataFill, but keeps
+ * positions/normals/UVs as 32-bit floats to avoid the UE double-precision
+ * intermediate when the caller can consume compact mesh buffers directly.
+ */
+typedef struct {
+    float* points;             // 3 floats per vertex
+    int32_t* indices;          // 1 int32 per index
+    float* normals;            // 3 floats per normal (nullable)
+    float* uvs;                // 2 floats per UV pair (nullable)
+    unsigned char* vertex_colors8; // 4 bytes per vertex (nullable)
+} CMeshDataFillCompact;
+
+/**
+ * Packed point layout used by the optional direct LiDAR fill path.
+ *
+ * This intentionally mirrors the UE FLidarPointCloudPoint layout:
+ *   float location[3];
+ *   unsigned char color[4];
+ *   unsigned char normal[3]; // 127,127,127 == invalid/reset normal
+ *   unsigned char flags;     // bit 0 == bVisible
+ */
+#pragma pack(push, 1)
+typedef struct {
+    float location[3];
+    unsigned char color[4];
+    unsigned char normal[3];
+    unsigned char flags;
+} CPointCloudLidarPoint_v1;
+#pragma pack(pop)
+
+/** In-situ point-cloud fill target (FillUSDFull_C only). */
+typedef struct {
+    double* positions;         // 3 doubles per point
+    unsigned char* colors8;    // 4 bytes per point (nullable)
+    float* widths;             // 1 float per point (nullable)
+    // Filled by FillUSDFull_C (USD-space, origin-inclusive):
+    float bounding_box_min[3];
+    float bounding_box_max[3];
+
+    // Optional direct LiDAR point fill.
+    // If lidar_point_version == 1, lidar_points must point at point_count
+    // CPointCloudLidarPoint_v1 elements and lidar_point_stride must equal
+    // sizeof(CPointCloudLidarPoint_v1). When set, FillUSDFull_C writes
+    // location/color directly into this buffer.
+    void* lidar_points;
+    int32_t lidar_point_stride;
+    uint32_t lidar_point_version;
+} CPointCloudDataFill;
+
+/**
+ * Parse a USD buffer and report the geometry layout (no buffer allocation).
+ *
+ * @param buffer Raw USD buffer (zstd frames accepted, as elsewhere)
+ * @param buffer_size Size in bytes
+ * @param filename Original filename for format detection
+ * @param out_handle Opaque handle to the parsed data (FreeParsedUSD_C)
+ * @param out_mesh_layouts Output: array of CMeshLayout (FreeUSDFullLayouts_C)
+ * @param out_mesh_count Output: number of meshes
+ * @param out_cloud_layouts Output: array of CPointCloudLayout
+ * @param out_cloud_count Output: number of point clouds
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int QueryUSDFullLayout_C(
+    const unsigned char* buffer,
+    size_t buffer_size,
+    const char* filename,
+    void** out_handle,
+    CMeshLayout** out_mesh_layouts,
+    size_t* out_mesh_count,
+    CPointCloudLayout** out_cloud_layouts,
+    size_t* out_cloud_count);
+
+/**
+ * Write parsed geometry into caller-provided buffers.
+ *
+ * @param handle Handle from QueryUSDFullLayout_C
+ * @param meshes Caller array; each element's pointers must point at
+ *               caller-allocated arrays of the QueryUSDFullLayout_C sizes
+ * @param mesh_count Number of meshes (<= queried count)
+ * @param clouds Caller array; each element's pointers must point at
+ *               caller-allocated arrays of the QueryUSDFullLayout_C sizes
+ * @param cloud_count Number of point clouds (<= queried count)
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int FillUSDFull_C(
+    void* handle,
+    CMeshDataFill* meshes,
+    size_t mesh_count,
+    CPointCloudDataFill* clouds,
+    size_t cloud_count);
+
+/**
+ * Write parsed geometry into caller-provided compact buffers.
+ *
+ * Mesh fills use 32-bit float positions/normals/UVs. Point-cloud fills use the
+ * same CPointCloudDataFill contract as FillUSDFull_C, including the optional
+ * direct LiDAR point path.
+ */
+ANARI_USD_MIDDLEWARE_C_API int FillUSDFullCompact_C(
+    void* handle,
+    CMeshDataFillCompact* meshes,
+    size_t mesh_count,
+    CPointCloudDataFill* clouds,
+    size_t cloud_count);
+
+/** Release a handle from QueryUSDFullLayout_C. */
+ANARI_USD_MIDDLEWARE_C_API void FreeParsedUSD_C(void* handle);
+
+/** Free the layout arrays from QueryUSDFullLayout_C. */
+ANARI_USD_MIDDLEWARE_C_API void FreeUSDFullLayouts_C(
+    CMeshLayout* mesh_layouts,
+    size_t mesh_count,
+    CPointCloudLayout* cloud_layouts,
+    size_t cloud_count);
 
 // ============================================================================
 // USD PROCESSING FUNCTIONS WITH COLLISION SUPPORT
@@ -487,6 +772,14 @@ ANARI_USD_MIDDLEWARE_C_API void FreeFrameFiles_C(CFileData* files, size_t count)
 ANARI_USD_MIDDLEWARE_C_API void RegisterUpdateCallback_C(FileReceivedCallback_C callback);
 
 /**
+ * Register a zero-copy file reception callback.
+ *
+ * If both this and RegisterUpdateCallback_C are set, this span callback is
+ * preferred and the legacy CFileData callback is not invoked.
+ */
+ANARI_USD_MIDDLEWARE_C_API void RegisterUpdateCallbackSpan_C(FileReceivedSpanCallback_C callback);
+
+/**
  * Register callback function for message reception notifications
  * Only one message callback can be registered at a time
  * Subsequent calls will replace the previous callback
@@ -497,6 +790,118 @@ ANARI_USD_MIDDLEWARE_C_API void RegisterUpdateCallback_C(FileReceivedCallback_C 
  * @param callback Function pointer to call when messages are received (NULL to unregister)
  */
 ANARI_USD_MIDDLEWARE_C_API void RegisterMessageCallback_C(MessageReceivedCallback_C callback);
+
+// ============================================================================
+// NOTIFICATION CALLBACK (LIVE UPDATE SUPPORT)
+// ============================================================================
+
+/**
+ * Notification types for live update callbacks
+ */
+typedef enum {
+    CNotificationType_FileUpdate = 300,     // A file has been updated on the broker
+    CNotificationType_CommitComplete = 301  // A scene commit is complete
+} CNotificationType;
+
+/**
+ * Callback function type for broker notifications (file updates, commit complete)
+ * Called from the ZMQ dispatcher thread - keep processing minimal
+ *
+ * @param message_type CNotificationType_FileUpdate, _CommitComplete, or _FileUpdateV2
+ * @param source_rank  Rank that sent the notification
+ * @param filename     Name of the file that was updated (NULL-terminated UTF-8)
+ * @param file_size    Current file size in bytes
+ * @param timestamp    Unix timestamp of the update
+ * @param hashLo       hash128[0] of new data
+ * @param hashHi       hash128[1] of new data
+ * @param hashPrevLo   hashPrev128[0] of old data (0 if no old data)
+ * @param hashPrevHi   hashPrev128[1] of old data (0 if no old data)
+ * @param hasOldData   true if hashPrev128 is valid
+ */
+typedef void (*NotificationCallback_C)(uint32_t message_type,
+                                         int32_t source_rank,
+                                         const char* filename,
+                                         uint64_t file_size,
+                                         uint64_t timestamp,
+                                         uint64_t hashLo,
+                                         uint64_t hashHi,
+                                         uint64_t hashPrevLo,
+                                         uint64_t hashPrevHi,
+                                         bool hasOldData);
+
+/**
+ * Register callback for broker push notifications (NOTIFY_FILE_UPDATE, NOTIFY_COMMIT_COMPLETE)
+ * Only one notification callback can be registered at a time.
+ *
+ * @param callback Function pointer to call on notifications (NULL to unregister)
+ */
+ANARI_USD_MIDDLEWARE_C_API void RegisterNotificationCallback_C(NotificationCallback_C callback);
+
+// ============================================================================
+// SCENE / PROPERTY UPDATE CALLBACKS (TYPED LIVE UPDATES)
+// ============================================================================
+
+typedef enum {
+    CSceneChange_None = 0,
+    CSceneChange_Created = 1,
+    CSceneChange_Removed = 2,
+    CSceneChange_Visibility = 3,
+    CSceneChange_Transform = 4,
+    CSceneChange_Material = 5,
+    CSceneChange_Attribute = 6,
+    CSceneChange_Commit = 7,
+    CSceneChange_Property = 8
+} CSceneChangeType;
+
+typedef enum {
+    CPropertyValue_None = 0,
+    CPropertyValue_Int = 1,
+    CPropertyValue_Bool = 2,
+    CPropertyValue_Float = 3,
+    CPropertyValue_Float2 = 4,
+    CPropertyValue_Float3 = 5,
+    CPropertyValue_Float4 = 6,
+    CPropertyValue_String = 7,
+    CPropertyValue_Path = 8,
+    CPropertyValue_ArrayRef = 9
+} CPropertyValueType;
+
+/**
+ * Callback for typed scene / property updates.
+ *
+ * message_type is 303 (NOTIFY_SCENE_UPDATE) or 304 (NOTIFY_PROPERTY_UPDATE).
+ * The callback is invoked from the ZMQ dispatcher thread. Keep processing minimal.
+ */
+typedef void (*SceneUpdateCallback_C)(
+    uint32_t message_type,
+    int32_t source_rank,
+    uint64_t timestamp,
+    uint64_t commit_id,
+    uint64_t revision,
+    const char* prim_path,
+    const char* property_name,
+    int32_t change_type,
+    int32_t value_type,
+    int64_t int_value,
+    float float_value,
+    const float* vec4,
+    const char* string_value,
+    uint32_t payload_size);
+
+ANARI_USD_MIDDLEWARE_C_API void RegisterSceneUpdateCallback_C(SceneUpdateCallback_C callback);
+
+/**
+ * Callback for protocol diagnostics / debug events.
+ */
+typedef void (*ProtocolDiagnosticsCallback_C)(
+    const char* event,
+    const char* message,
+    uint64_t value0,
+    uint64_t value1);
+
+ANARI_USD_MIDDLEWARE_C_API void RegisterProtocolDiagnosticsCallback_C(ProtocolDiagnosticsCallback_C callback);
+
+ANARI_USD_MIDDLEWARE_C_API uint32_t GetProtocolVersion_C(void);
 
 // ============================================================================
 // UTILITY AND DEBUG FUNCTIONS
@@ -530,21 +935,6 @@ ANARI_USD_MIDDLEWARE_C_API int ValidateUSDFormat_C(const unsigned char* buffer,
  * @return Pointer to extension list string (static, always valid)
  */
 ANARI_USD_MIDDLEWARE_C_API const char* GetSupportedUSDExtensions_C(void);
-
-/**
- * Reset processing statistics
- * Clears all internal counters and statistics
- * Useful for performance monitoring and testing
- */
-ANARI_USD_MIDDLEWARE_C_API void ResetProcessingStats_C(void);
-
-/**
- * Get processing statistics as formatted string
- * Returns detailed information about processed files, meshes, errors, etc.
- *
- * @return Pointer to statistics string (valid until next call)
- */
-ANARI_USD_MIDDLEWARE_C_API const char* GetProcessingStats_C(void);
 
 // ============================================================================
 // BROKER CONNECTION AND FILE REQUEST FUNCTIONS
@@ -622,6 +1012,8 @@ ANARI_USD_MIDDLEWARE_C_API int RequestFileListWithSizesAndRanks_C(
     char*** out_names,
     uint64_t** out_sizes,
     int32_t** out_ranks,
+    uint64_t** out_hash_lo,
+    uint64_t** out_hash_hi,
     size_t* out_count,
     int timeout_ms);
 
@@ -659,6 +1051,8 @@ ANARI_USD_MIDDLEWARE_C_API void FreeFileListWithSizesAndRanks_C(
     char** names,
     uint64_t* sizes,
     int32_t* ranks,
+    uint64_t* hash_lo,
+    uint64_t* hash_hi,
     size_t count);
 
 /**
@@ -676,6 +1070,99 @@ ANARI_USD_MIDDLEWARE_C_API int RequestFile_C(
     int32_t target_rank,
     unsigned char** out_data,
     size_t* out_size,
+    int timeout_ms);
+
+/**
+ * Request a specific file and write it directly into a caller-provided
+ * buffer (in-situ: no intermediate allocation or copy in the middleware).
+ *
+ * @param filename Name of file to request
+ * @param target_rank Target worker rank
+ * @param timeout_ms Timeout in milliseconds
+ * @param out_buffer Caller buffer to receive the raw file bytes
+ * @param out_capacity Size of out_buffer in bytes
+ * @param out_size On success, receives the file size in bytes
+ * @return number of bytes written on success (>0), -1 on failure/timeout,
+ *         -2 if the file is larger than out_capacity
+ */
+ANARI_USD_MIDDLEWARE_C_API int64_t RequestFileIntoBuffer_C(
+    const char* filename,
+    int32_t target_rank,
+    int timeout_ms,
+    unsigned char* out_buffer,
+    size_t out_capacity,
+    size_t* out_size);
+
+/**
+ * Abortable variant of RequestFileIntoBuffer_C (P2 latest-wins).
+ *
+ * Pass an abort_handle from JusyncAbortCreate_C() (0 = plain blocking
+ * download). If JusyncAbortTrigger_C(handle) is called from another thread
+ * while this download is in flight, it wakes within one frame delivery and
+ * returns -1 (failure), dropping the broker's remaining frames for the
+ * superseded transfer.
+ */
+ANARI_USD_MIDDLEWARE_C_API int64_t RequestFileIntoBufferAbort_C(
+    const char* filename,
+    int32_t target_rank,
+    int timeout_ms,
+    unsigned char* out_buffer,
+    size_t out_capacity,
+    size_t* out_size,
+    uint64_t abort_handle);
+
+// ---- Abort tokens (P2 latest-wins mid-transfer cancellation) ----
+// Lifetime-safe opaque handles: Trigger after Release is a no-op, and an
+// in-flight download keeps the flag alive via internal refcount.
+
+/** Create a new abort token. Returns a nonzero handle. */
+ANARI_USD_MIDDLEWARE_C_API uint64_t JusyncAbortCreate_C(void);
+
+/** Signal cancellation. Returns 1 if a live token was found, 0 otherwise. */
+ANARI_USD_MIDDLEWARE_C_API int32_t JusyncAbortTrigger_C(uint64_t handle);
+
+/** Drop the registry reference (safe to call after the download returns). */
+ANARI_USD_MIDDLEWARE_C_API void JusyncAbortRelease_C(uint64_t handle);
+
+// ============================================================================
+// ASYNC FILE DOWNLOAD (Non-Blocking)
+// ============================================================================
+
+/**
+ * Callback signature for async file complete notifications.
+ * Called from the dispatcher thread when a file download finishes or fails.
+ * UE5 must marshal to game thread before using the data.
+ *
+ * @param filename Name of the downloaded file
+ * @param data Pointer to file data (valid until callback returns, DO NOT store)
+ * @param data_size Size of file data in bytes
+ * @param success 1 if download succeeded, 0 if failed
+ * @param userData Opaque pointer passed through from AsyncRequestFile_C
+ */
+typedef void (*AsyncFileComplete_C)(
+    const char* filename,
+    const unsigned char* data,
+    size_t data_size,
+    int success,
+    void* userData);
+
+/**
+ * Async (non-blocking) file request that fires immediately and returns a download handle.
+ * When the download completes or fails, the provided completeCallback is invoked from the
+ * dispatcher thread.
+ *
+ * @param filename Name of file to request
+ * @param target_rank Target worker rank
+ * @param completeCallback Callback to invoke when download completes
+ * @param userData Opaque pointer passed to callback
+ * @param timeout_ms Timeout in milliseconds (size-based recommended)
+ * @return Positive download_id on success (for tracking), 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int AsyncRequestFile_C(
+    const char* filename,
+    int32_t target_rank,
+    AsyncFileComplete_C completeCallback,
+    void* userData,
     int timeout_ms);
 
 /**
@@ -722,10 +1209,26 @@ ANARI_USD_MIDDLEWARE_C_API int RequestWorkerCountExcludingRank0_C(
  * @param timeout_ms Timeout in milliseconds
  * @return 1 on success, 0 on failure
  */
-ANARI_USD_MIDDLEWARE_C_API int RequestWorkerListString_C(
-    uint32_t* out_worker_count,
-    unsigned char** out_data,
-    size_t* out_size,
+ ANARI_USD_MIDDLEWARE_C_API int RequestWorkerListString_C(
+     uint32_t* out_worker_count,
+     unsigned char** out_data,
+     size_t* out_size,
+     int timeout_ms);
+
+/**
+ * Callback type for worker list: receives count and parallel arrays
+ */
+typedef void (*WorkerListCallback_C)(uint32_t count, const int32_t* ranks, const char** hostnames, const char** ips);
+
+/**
+ * Request worker list string via callback (avoids C++ ABI issues)
+ *
+ * @param callback Callback to receive worker data
+ * @param timeout_ms Timeout in milliseconds
+ * @return 1 on success, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int RequestWorkerListStringCallback_C(
+    WorkerListCallback_C callback,
     int timeout_ms);
 
 /**
@@ -885,6 +1388,101 @@ ANARI_USD_MIDDLEWARE_C_API int RequestFilesParallelDirect_C(
     ParallelDownloadCompleteCallback_C completion_callback,
     ParallelDownloadErrorCallback_C error_callback,
     int timeout_ms);
+
+// ============================================================================
+// POINT CLOUD EXTRACTION
+// ============================================================================
+
+/**
+ * Extract point cloud data from a USD buffer
+ * Calls UsdProcessor::LoadUSDBuffer with point cloud output, converts to C struct
+ * Gradient colors are auto-baked from the most recently cached PNG texture
+ *
+ * @param buffer Raw USD buffer data
+ * @param buffer_size Size of buffer in bytes
+ * @param filename Original filename for format detection
+ * @param out_clouds Output: allocated array of CPointCloudData (NULL if no point clouds)
+ * @param out_count Output: number of point clouds extracted
+ * @return 1 if successful, 0 on failure
+ */
+ANARI_USD_MIDDLEWARE_C_API int ProcessPointCloudFromUSD_C(
+    const unsigned char* buffer,
+    size_t buffer_size,
+    const char* filename,
+    CPointCloudData** out_clouds,
+    size_t* out_count);
+
+/**
+ * Retrieve the most recently cached gradient/colormap texture
+ * Colors are baked using the gradient texture width as the colormap size
+ *
+ * @param gradient_rgba Output: allocated RGBA gradient texture data (NULL if none cached)
+ * @param out_width Output: texture width in pixels
+ * @param out_height Output: texture height in pixels
+ * @return 1 if a gradient texture is available, 0 otherwise
+ */
+ANARI_USD_MIDDLEWARE_C_API int GetCachedGradientTexture_C(
+    unsigned char** gradient_png_data,
+    size_t* out_png_size,
+    int* out_width,
+    int* out_height);
+
+/**
+ * Free memory allocated by ProcessPointCloudFromUSD_C
+ *
+ * @param clouds Array of CPointCloudData previously returned by ProcessPointCloudFromUSD_C
+ * @param count Number of elements in the array
+ */
+ANARI_USD_MIDDLEWARE_C_API void FreePointCloudData_C(CPointCloudData* clouds, size_t count);
+
+/**
+ * Free memory allocated by GetCachedGradientTexture_C
+ *
+ * @param gradient_rgba Previously returned gradient texture data
+ */
+ANARI_USD_MIDDLEWARE_C_API void FreeCachedGradientTexture_C(unsigned char* gradient_rgba);
+
+/* --------------------------------------------------------------------------
+ * Streaming latency diagnostics (Phase 0 observability)
+ *
+ * Middleware stages (notify .. fill_done) are marked automatically inside the
+ * library. Hosts add their own stages (queue, spawned) with JusyncDiagMark_C
+ * and read the per-file stage journal with JusyncDiagDump_C.
+ * See StreamDiagnostics.h for the stage pipeline.
+ * -------------------------------------------------------------------------- */
+typedef enum JusyncDiagStage {
+    JUSYNC_DIAG_NOTIFY      = 0,
+    JUSYNC_DIAG_QUEUE       = 1,
+    JUSYNC_DIAG_DL_START    = 2,
+    JUSYNC_DIAG_DL_DONE     = 3,
+    JUSYNC_DIAG_PARSE_START = 4,
+    JUSYNC_DIAG_PARSE_DONE  = 5,
+    JUSYNC_DIAG_FILL_DONE   = 6,
+    JUSYNC_DIAG_SPAWNED     = 7
+} JusyncDiagStage;
+
+/**
+ * Mark a host stage for a file (filename must match the broker notification path).
+ * Marking JUSYNC_DIAG_SPAWNED emits a one-line stage summary to the middleware log.
+ * bytes/hashLo/hashHi pass through to the trace when non-zero (0 = keep previous).
+ */
+ANARI_USD_MIDDLEWARE_C_API void JusyncDiagMark_C(const char* filename, int stage,
+                                                 uint64_t bytes, uint64_t hashLo, uint64_t hashHi);
+
+/**
+ * Render the last `lastN` file traces as a fixed-width table into outBuf
+ * (always NUL-terminated when outBufSize > 0). Returns bytes written, 0 if empty.
+ */
+ANARI_USD_MIDDLEWARE_C_API int JusyncDiagDump_C(char* outBuf, int outBufSize, int lastN);
+
+/** notify->spawned latency (ms) for a file; -1 when unknown or not yet spawned. */
+ANARI_USD_MIDDLEWARE_C_API double JusyncDiagTotalMs_C(const char* filename);
+
+/** Drop all traces (e.g. before a benchmark run). */
+ANARI_USD_MIDDLEWARE_C_API void JusyncDiagClear_C(void);
+
+/** Master switch for mark() bookkeeping (default on; cost of marking is trivial). */
+ANARI_USD_MIDDLEWARE_C_API void JusyncDiagSetEnabled_C(int enabled);
 
 #ifdef __cplusplus
 }
