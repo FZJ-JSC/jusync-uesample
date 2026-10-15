@@ -222,9 +222,6 @@ bool JUSYNCBuildRealtimeMeshStreams(const FJUSYNCCompactMeshData& MeshData, Real
     return true;
 }
 
-// GPU-morph variant: float32 UV1/UV2 carry the previous sample's position
-// (UV1 = prev.xy, UV2 = (prev.z, 0)) so the material's WPO branch can
-// interpolate Position(prev -> curr) with no per-frame CPU work.
 bool JUSYNCBuildRealtimeMeshStreams(const FJUSYNCCompactMeshData& MeshData, RealtimeMesh::FRealtimeMeshStreamSet& OutStreams, const TArray<FVector3f>* PrevPositions)
 {
     if (!PrevPositions || PrevPositions->Num() == 0)
@@ -305,13 +302,10 @@ bool JUSYNCBuildRealtimeMeshStreams(const FJUSYNCCompactMeshData& MeshData, Real
         }
         Builder.SetNormal(i, N);
 
-        // UV0: real texture coordinates (float32; sampling precision unaffected).
         Builder.SetTexCoord(i, 0, bHasUVs && MeshData.UVs.IsValidIndex(i)
             ? FVector2f(MeshData.UVs[i])
             : FVector2f::ZeroVector);
 
-        // UV1/UV2: previous position. Born points (no prev counterpart) repeat
-        // their own position so the WPO delta is exactly zero for them.
         const FVector3f PrevPos = Prev.IsValidIndex(i) ? Prev[i] : MeshData.Points[i];
         Builder.SetTexCoord(i, 1, FVector2f(PrevPos.X, PrevPos.Y));
         Builder.SetTexCoord(i, 2, FVector2f(PrevPos.Z, 0.f));

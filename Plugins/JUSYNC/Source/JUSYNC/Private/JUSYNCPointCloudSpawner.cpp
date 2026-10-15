@@ -4,6 +4,7 @@
 #include "Engine/Engine.h"
 #include "Async/ParallelFor.h"
 #include "HAL/PlatformTime.h"
+#include "JUSYNCElementNames.h"
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
 #include "LidarPointCloud.h"
@@ -11,21 +12,13 @@
 #include "LidarPointCloudActor.h"
 #include "LidarPointCloudSettings.h"
 
-// 1 (default): streamed clouds build their octree on Epic's async import thread
-// (ULidarPointCloud::CreateFromData + FLidarPointCloudAsyncParameters) and swap
-// into the component on completion - the game thread never sits in the multi-second
 // SetData. 0: legacy in-place SetData on the game thread.
-// Async ramp: interpolated cloud steps streamed through the build pipeline on
-// live updates so .geo clouds glide between time samples instead of popping.
-// 0 = disabled (instant swap, old behavior), 1..6 = interpolated steps per update.
+
 static TAutoConsoleVariable<int32> CVarJusyncCloudMorphSteps(
     TEXT("jusync.Morph.CloudSteps"), 4,
     TEXT("Number of pre-interpolated cloud builds streamed between successive .geo time samples (1..6)."),
     ECVF_Default);
 
-// Blend window for the async ramp. 0 = auto: measured sample gap capped by
-// CloudMaxBlendMs. Force a fixed ms value to make slow-cadence streams glide
-// over a chosen window (steps land at smoothspaced fractions of it).
 static TAutoConsoleVariable<int32> CVarJusyncCloudBlendMs(
     TEXT("jusync.Morph.CloudBlendMs"), 0,
     TEXT("Fixed cloud blend window in ms; 0 = auto (measured sample gap clamped by CloudMaxBlendMs)."),
@@ -36,51 +29,26 @@ static TAutoConsoleVariable<int32> CVarJusyncCloudMaxBlendMs(
     TEXT("Cap in ms for the auto cloud blend window."),
     ECVF_Default);
 
-// Per-frame smooth cloud morph: lerps the DISPLAYED cloud's own point data every
-// frame via the plugin's public ExecuteActionOnAllPoints (nodes go render-dirty ->
-// GPU re-uploads each LOD tick), then swaps the authoritative rebuilt cloud at
-// blend end. 1 = smooth (falls back to stepped ramp when point correspondence
-// cannot be resolved), 0 = ramp only.
 static TAutoConsoleVariable<int32> CVarJusyncCloudSmooth(
     TEXT("jusync.Morph.CloudSmooth"), 1,
     TEXT("Per-frame smooth morphing of streamed clouds via in-place point updates (1) vs stepped ramp (0)."),
     ECVF_Default);
 
-// The LOD manager budgets per-frame node render-data re-uploads (default: cut the
-// dirty-node loop after 10 ms). A live morph dirties EVERY node every frame
-// (~780 bucket nodes at MaxBucketSize=200 for 156k pts), so the cut lands
-// mid-list: nodes before it show the latest blend time, nodes after it a stale
-// one -> the cloud visibly splits into two time states. Force the setting off
-// while smooth morphs run (it only throttles re-uploads; nothing else).
-// Set to 1 to keep Epic's smoothing enabled (tearing may return).
 static TAutoConsoleVariable<int32> CVarJusyncCloudRenderSmoothing(
     TEXT("jusync.Morph.CloudRenderSmoothing"), 0,
     TEXT("1 = keep LidarPointCloud render-data smoothing during morphs (default 0 = disable for upload consistency)."),
     ECVF_Default);
 
-// Octree-free point sizing for streamed clouds. PerNodeAdaptive/PerNode/PerPoint
-// derive every sprite size from the ASSET's octree (shader: RootCellSize / 2^VirtualDepth),
-// so swapping the authoritative cloud at blend end re-quantizes ALL point sizes in one
-// frame - the cloud "snaps into shape" at the settle moment even though positions are
-// identical. FixedScreenSize computes size from view depth only: continuous across
-// morphs and swaps. 0 = fall back to the PointScaling chosen on the spawner actor.
 static TAutoConsoleVariable<int32> CVarJusyncCloudFixedSize(
     TEXT("jusync.Morph.CloudFixedSize"), 1,
     TEXT("1 (default) = render streamed clouds with FixedScreenSize scaling (octree-independent point size)."),
     ECVF_Default);
 
-// Sprite size while CloudFixedSize is on. In FixedScreenSize mode PointSize means
-// screen-fraction (dot diameter ~ 8 * value px at 90 FOV), NOT the adaptive multiplier.
 static TAutoConsoleVariable<float> CVarJusyncCloudScreenSize(
     TEXT("jusync.Morph.CloudScreenSize"), 0.25f,
     TEXT("Point size (screen-fraction units) used while jusync.Morph.CloudFixedSize is on."),
     ECVF_Default);
 
-// Comma-separated substrings; streamed elements whose name contains any part are
-// NEVER spawned (initial or live). Kills duplicate attribute variants at the
-// source, e.g. when the exporter ships spheres_0 AND spheres_0_u1 and both glide
-// out of phase = visible "two time steps". Parts containing * / ? match as
-// wildcards instead (e.g. "*_0" to keep only the _u1 variant).
 static TAutoConsoleVariable<FString> CVarJusyncIgnoreElements(
     TEXT("jusync.Spawner.IgnoreElements"), TEXT(""),
     TEXT("Comma-separated substrings (or * patterns); elements with matching names are skipped, e.g. \"_u1\"."),
@@ -94,11 +62,6 @@ static TAutoConsoleVariable<int32> CVarJusyncAsyncCloudBuild(
 
 namespace
 {
-    // ULidarPointCloud refuses a cloud whose bounds are degenerate on any axis
-    // (min == max) - e.g. genuinely planar simulation data (a z=0 slice / flat
-    // sheet), which otherwise silently spawns as an EMPTY actor with
-    // "Provided bounds are incorrect". Nudge a single point per flat axis by a
-    // sub-visual epsilon so the octree can be built. 0.01 cm is invisible.
     void JUSYNCPadDegenerateBounds(TArray64<FLidarPointCloudPoint>& Points)
     {
         if (Points.Num() == 0)
@@ -220,9 +183,6 @@ void FJUSYNCPointCloudSpawner::FlushExpiredNoColorClouds()
 
     for (FPendingNoColorCloud& Pending : ToFlush)
     {
-        // Expired entries spawn WITHOUT the gradient rather than ping-ponging
-        // in the queue forever (which also pins PendingAsyncPCS and blocks
-        // initial-spawn completion / live updates).
         EnqueuePointCloud(MoveTemp(Pending.Data), Pending.Rank, /*bAllowNoGradient=*/!bLUTReady);
     }
 }
@@ -247,7 +207,6 @@ void FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudRef&& PCRef, i
 
 void FJUSYNCPointCloudSpawner::EnqueuePointCloud(const FJUSYNCPointCloudData& PCData, int32 InRank)
 {
-    // Copy once, then move into the async task via the rvalue overload.
     EnqueuePointCloud(FJUSYNCPointCloudData(PCData), InRank);
 }
 
@@ -287,8 +246,14 @@ void FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudData&& PCData,
 {
     if (!PCData.IsValid() || !Owner.IsValid() || bShuttingDown.load()) return;
 
-    // Spawner-level name filter (jusync.Spawner.IgnoreElements): duplicate
-    // attribute variants from the exporter must never reach the scene.
+    // Rankless data would key its morph chain like rank 0 and blend rank 0's
+    // previous positions into this sample, so say so instead of only showing it
+    // as a warp.
+    if (InRank < 0)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("JUSYNC Spawner: cloud '%s' arrived with no owner rank; morph state keyed as rank 0"), *PCData.ElementName);
+    }
+
     if (IsElementFiltered(PCData.ElementName))
     {
         UE_LOG(LogTemp, Log, TEXT("JUSYNC Spawner: SKIPPED filtered PC '%s' (%d points)"),
@@ -349,7 +314,6 @@ void FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudData&& PCData,
 
                 if (LocalLUT.Num() > 0)
                 {
-                    // ParallelFor'd: per-point LUT lookup writes only Points[i].
                     ParallelFor(static_cast<int32>(Points.Num()), [&](int32 i)
                     {
                         const float Attr0 = (i < Widths.Num()) ? Widths[i] : 0.0f;
@@ -366,9 +330,7 @@ void FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudData&& PCData,
             FPointCloudReadyEntry Entry;
             Entry.Points = MoveTemp(Points);
             Entry.ElementName = ElementName;
-            Entry.Key = ElementName.IsEmpty()
-                ? FString::Printf(TEXT("jusync_pc_r%d"), InRank)
-                : FString::Printf(TEXT("%s_r%d"), *ElementName, InRank);
+            Entry.Key = JUSYNCElementNames::MakeRankedElementKey(ElementName, InRank);
             Entry.Rank = InRank;
             Entry.PointSize = PointSize;
             Entry.bSpawned = false;
@@ -424,8 +386,6 @@ void FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudData&& PCData,
     UE_LOG(LogTemp, Log, TEXT("JUSYNC Spawner: queued PC '%s' for async conversion (%d points)"),
            *PCData.ElementName, PCData.PointCount);
 
-    // Spawn async task — doesn't block the game thread. The rvalue overload
-    // moves the arrays into the task instead of copying the whole cloud.
     AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask,
         [this, PointCount = PCData.PointCount, Positions = MoveTemp(PCData.Positions),
           Colors = MoveTemp(PCData.Colors), bHasColors = bLegacyHasColors,
@@ -433,7 +393,6 @@ void FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudData&& PCData,
           InRank]()
     {
 #ifdef WITH_ANARI_USD_MIDDLEWARE
-        // Capture gradient LUT lazily at conversion time (after possible SetGradientLUT)
         TArray<FColor> LocalLUT;
         {
             FScopeLock Lock(&this->GradientMutex);
@@ -441,8 +400,6 @@ void FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudData&& PCData,
         }
         bool bUseGradient = LocalLUT.Num() > 0;
 
-        // Build LiDAR points on background thread (parallel: every index
-        // reads its own input slots and writes its own output slot).
         TArray64<FLidarPointCloudPoint> Points;
         Points.SetNum(PointCount);
         ParallelFor(PointCount, [&](int32 i)
@@ -455,23 +412,23 @@ void FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudData&& PCData,
             }
             else if (bUseGradient && Widths.Num() > i)
             {
-                // attribute0 scalar value (0-1) maps to gradient LUT index
                 float Attr0 = Widths[i];
                 int32 LUTIdx = FMath::Clamp(FMath::RoundToInt(Attr0 * (LocalLUT.Num() - 1)), 0, LocalLUT.Num() - 1);
                 Col = LocalLUT[LUTIdx];
             }
             else
             {
-                Col = FColor::White;
+                // Neutral gray instead of white: uncolored / recolor-pending clouds used to
+                // flash pure-white (a glare "glow") until the gradient LUT recolored them.
+                Col = FColor(128, 128, 128);
             }
             Points[i] = FLidarPointCloudPoint(Pos.X, Pos.Y, Pos.Z, Col.R / 255.f, Col.G / 255.f, Col.B / 255.f, Col.A / 255.f);
         });
 
-        // Marshal to game thread
         FPointCloudReadyEntry Entry;
         Entry.Points = MoveTemp(Points);
         Entry.ElementName = ElementName;
-        Entry.Key = FString::Printf(TEXT("%s_r%d"), *ElementName, InRank);
+        Entry.Key = JUSYNCElementNames::MakeRankedElementKey(ElementName, InRank);
         Entry.Rank = InRank;
         Entry.PointSize = PointSize;
         Entry.bSpawned = false;
@@ -489,8 +446,8 @@ void FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudData&& PCData,
                     FScopeLock Lock(&QueueMutex);
                     ReadyQueue.Add(MoveTemp(Entry));
 
-                    // Threshold flush: if queue exceeds 8, drain immediately.
                     // QueueMutex is already held by the enclosing game-thread task.
+
                     if (ReadyQueue.Num() >= 8)
                     {
                         DrainReadyQueueLocked();
@@ -528,21 +485,10 @@ ULidarPointCloud* FJUSYNCPointCloudSpawner::GetOrCreateCloudForComponent(ULidarP
         Comp->SetPointCloud(Cloud);
     }
 
-    // Static (non-dynamic) optimization builds the octree LOD hierarchy, which gives distance-
-    // based decimation: far nodes render a coarse LOD, close nodes the full-resolution LOD.
-    // Dynamic optimization skips the LOD pipeline entirely (no granular density control).
     Cloud->SetOptimizedForDynamicData(false);
     return Cloud;
 }
 
-// ---------------------------------------------------------------------------
-// Async streaming rebuild: Epic's sanctioned async path (CreateFromData +
-// FLidarPointCloudAsyncParameters builds the octree on a worker thread; see
-// LidarPointCloud.cpp CreateFromData_Internal). Exactly ONE build in flight
-// per actor key; later updates for the same key are stashed latest-wins and
-// start when the current build finishes. The finished asset is swapped in on
-// the game thread; the old asset becomes unreferenced for GC.
-// ---------------------------------------------------------------------------
 void FJUSYNCPointCloudSpawner::StartAsyncCloudBuild(const FString& Key, FPointCloudReadyEntry&& Entry, AActor* Actor,
                                                     double EarliestApply, bool bChainStep, bool bChainFinal)
 {
@@ -560,7 +506,6 @@ void FJUSYNCPointCloudSpawner::StartAsyncCloudBuild(const FString& Key, FPointCl
 
     if (F->bBuilding)
     {
-        // Latest-wins: replace the stash outright (old stashed points freed here).
         F->PendingReplacement = MoveTemp(Entry);
         F->bHasPending = true;
         UE_LOG(LogTemp, Log, TEXT("JUSYNC Spawner: build in flight for '%s' - stashed newer update (latest-wins)"), *Key);
@@ -573,18 +518,12 @@ void FJUSYNCPointCloudSpawner::StartAsyncCloudBuild(const FString& Key, FPointCl
     F->bBuilding = true;
     F->BuildStarted = FPlatformTime::Seconds();
 
-    // Ramp bookkeeping: a superseded chain step's held swap is cancelled the moment
-    // a new build takes over this key (its asset is released with CloudRef below
-    // only after completion; while the worker runs we must keep the asset alive).
     F->EarliestApply = EarliestApply;
     F->bDeferred = false;
     F->bChainStep = bChainStep;
     F->bChainFinal = bChainFinal;
     F->bChainAborted = false;
 
-    // Input-order positions this build will put on screen; recorded on swap so the
-    // NEXT sample's ramp interpolates from what the user actually sees.
-    // (SetNum, NOT Reset: Reset only grows capacity and leaves Num()==0.)
     F->RampPos.SetNum(F->Points->Num());
     for (int64 i = 0; i < F->Points->Num(); ++i)
     {
@@ -595,9 +534,7 @@ void FJUSYNCPointCloudSpawner::StartAsyncCloudBuild(const FString& Key, FPointCl
     const int32 NumPts = static_cast<int32>(F->Points->Num());
 
     // Completion fires on Epic's build worker thread; swap work hops to the GT.
-    // The worker may outlive shutdown waits, so it must not dereference the
-    // spawner: it decrements the shared outstanding count directly, and the
-    // GT hop is dropped via the alive flag if the spawner died meanwhile.
+
     FLidarPointCloudAsyncParameters Params(
         /*bUseAsync=*/true,
         /*ProgressCallback=*/nullptr,
@@ -620,6 +557,7 @@ void FJUSYNCPointCloudSpawner::StartAsyncCloudBuild(const FString& Key, FPointCl
     JUSYNCPadDegenerateBounds(*F->Points);
     ULidarPointCloud* NewCloud = ULidarPointCloud::CreateFromData(*F->Points, Params);
     // GT-only strong ref: keeps the asset GC-safe while the worker fills it.
+
     F->CloudRef = MakeUnique<TStrongObjectPtr<UObject>>(NewCloud);
 
     UE_LOG(LogTemp, Log, TEXT("JUSYNC Spawner: started async build '%s' (%d points)%s"), *Key, NumPts,
@@ -638,12 +576,8 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
         delete F.Points;
         F.Points = nullptr;
 
-        // Deferred chain swap re-entry: decide at this moment whether the held
-        // asset still describes what should go on screen.
         F.bDeferred = false;
 
-        // Superseded chain step: its newer sample already owns the pipeline, so
-        // discard this asset instead of flashing the older intermediate.
         if (F.bChainAborted)
         {
             bSuccess = false;
@@ -652,11 +586,6 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
             F.bChainFinal = false;
         }
 
-        // A NEWER sample is stashed behind this one: the in-flight smooth morph
-        // already glides toward that newer sample, so swapping this now-stale
-        // asset in would rewind the display and kill the glide (the snap users
-        // see at blend end). Drop it and kick the newer build instead, landing
-        // at the current glide's end - never mid-glide.
         if (bSuccess && F.bHasPending)
         {
             if (ULidarPointCloud* Stale = F.CloudRef.IsValid()
@@ -688,16 +617,11 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
             return;
         }
 
-        // Ramp hold window: keep the finished asset (via CloudRef) until its
-        // scheduled moment; the promotion call from TickCloudRamps re-enters.
-        // ALSO hold while a smooth morph owns the display: the swap's
-        // SmoothMorphs.Remove below must never kill a glide mid-flight - it
-        // lands the frame AFTER the morph wrote its exact final positions.
         if (bSuccess && (NowSeconds < F.EarliestApply || SmoothMorphs.Contains(Key)))
         {
             F.bBuilding = false; // worker is done; only the SWAP is pending now
             F.bDeferred = true;
-            return; // CloudRef intentionally NOT reset: keeps the held asset GC-safe
+            return;
         }
 
         ULidarPointCloud* Cloud = F.CloudRef.IsValid() ? Cast<ULidarPointCloud>(F.CloudRef->Get()) : nullptr;
@@ -718,10 +642,6 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
                     const double SwapStart = FPlatformTime::Seconds();
                     ReplacedCloud = Comp->GetPointCloud();
 
-                    // MEASURE the visible jerk: worst-case distance between what
-                    // is on screen right now and what the swap will put there.
-                    // ~0 => the swap is positionally inert and the perceived
-                    // "jerk" is elsewhere; cm-scale => morph convergence bug.
                     const TArray<int32>* Map = CloudWalkInputIdx.Find(Key);
                     if (Map && IsValid(ReplacedCloud) && F.RampPos.Num() > 0)
                     {
@@ -738,7 +658,6 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
                                 return;
                             }
                             ++Checked;
-                            // Point as the swapped-in asset will store it (walk space).
                             const FVector3f NewWalk = F.RampPos[Src] + NewNegOffset;
                             ResidMax = FMath::Max(ResidMax, (P->Location - NewWalk).Length());
                         };
@@ -750,15 +669,6 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
                                Map->Num(), F.RampPos.Num(), (int32)ReplacedCloud->GetNumPoints());
                     }
 
-                    // Per-frame smooth morphing re-uploads every dirtied node on each
-                    // LOD tick. Dynamic mode routes those uploads through the cheap
-                    // staging path (lock+copy, ~20 B/pt) instead of the static path,
-                    // which reallocates the full RHI buffer with 4x vertex duplication
-                    // per point per node every frame. Safe to rebuild the tree here:
-                    // this octree is not registered with the LOD manager until the
-                    // component references it on the next line. (The tree rebuild
-                    // costs a few ms game-thread per swapped sample — far cheaper
-                    // than the per-frame cost it removes.)
                     Cloud->SetOptimizedForDynamicData(true);
 
                     Comp->SetPointCloud(Cloud);
@@ -767,8 +677,6 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
                     F.bEverSwapped = true;
                     bSwapped = true;
 
-                    // What is on screen now becomes the interpolation source for
-                    // the next sample's ramp.
                     if (F.RampPos.Num() > 0 && F.bChainStep)
                     {
                         UE_LOG(LogTemp, Log, TEXT("JUSYNC CloudRamp: %s swapped in for '%s' (%d pts displayed)"),
@@ -779,9 +687,6 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
                         CloudDisplayPos.Add(Key, MoveTemp(F.RampPos));
                     }
 
-                    // The previous cloud is gone: its in-flight morph and its
-                    // walk-order mapping belong to a dead asset — the next
-                    // arrival re-resolves against the freshly swapped cloud.
                     SmoothMorphs.Remove(Key);
                     CloudWalkInputIdx.Remove(Key);
 
@@ -820,16 +725,9 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
         }
         else if (bSwapped && IsValid(ReplacedCloud) && ReplacedCloud != Cloud)
         {
-            // Detached last-frame asset: nothing renders it anymore, so flag
-            // it for GC immediately instead of waiting for the default purge
-            // interval (streamed clouds would otherwise pile up between sweeps).
             ReplacedCloud->MarkAsGarbage();
-            // NOTE: deliberately NOT forcing a GC sweep here. A full
-            // CollectGarbage(true) purge stalls the game thread for hundreds of
-            // ms exactly on a swap frame - i.e. at blend end, which felt like
-            // the cloud "jerking into position". MarkAsGarbage'd assets are
-            // reclaimed by the engine's regular pending-kill purge
             // (gc.TimeBetweenPurgingPendingKillObjects) without user-visible hitches.
+
         }
 
         if (F.bHasPending)
@@ -843,9 +741,6 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
             if (Actor)
             {
                 ApplyTransformToActor(Actor);
-                // Land the newer build at the current glide's end (when one owns
-                // the display), never with EarliestApply=0 - an immediate swap
-                // here would kill a mid-flight morph and snap the whole delta.
                 double NextApply = 0.0;
                 if (const FCloudSmoothMorph* M = SmoothMorphs.Find(Key))
                 {
@@ -860,28 +755,17 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
                    *Key, bSuccess ? TEXT("discarded") : TEXT("FAILED"), BuildMs);
             if (IsValid(Actor) && !F.bEverSwapped)
             {
-                // First frame never landed: give the actor back and forget the key.
                 ReleaseActor(Actor);
                 InFlightBuilds.Remove(Key);
             }
         }
     }
 }
-// ---------------------------------------------------------------------------
-// Async ramp chains: synthesize 1..3 interpolated point sets between the
-// displayed sample and the incoming one, build them through the same async
-// pipeline, and defer each swap to its slot in the blend window. The plugin is
-// untouched — smoothness comes from streaming MORE (pre-lerped) clouds in time.
-// ---------------------------------------------------------------------------
 
 namespace JUSyncCloudRamp
 {
     static float StepFraction(int32 K, int32 Total)
     {
-        // LINEAR spacing on purpose: with discrete staged swaps every hop moves
-        // the same distance, which reads as steady motion. Smoothstep easing only
-        // helps continuous GPU lerps (mesh path) — on swaps it fattens the middle
-        // hops and looks jaggier.
         return FMath::Clamp(float(K) / float(FMath::Max(Total, 1)), 0.f, 1.f);
     }
 }
@@ -898,10 +782,9 @@ bool FJUSYNCPointCloudSpawner::ShouldStartCloudRamp(const FString& Key, double N
     const TArray<FVector3f>* Display = CloudDisplayPos.Find(Key);
     if (!Display || Display->Num() == 0)
     {
-        return false; // nothing ever displayed for this key: first sample snaps (correct)
+        return false;
     }
 
-    // Too close to the previous arrival to interpolate meaningfully (burst coalescing).
     return (NowSeconds - CloudLastArrival.FindRef(Key)) >= 0.012;
 }
 
@@ -913,6 +796,7 @@ void FJUSYNCPointCloudSpawner::KickRampStep(const FString& Key, FCloudRampChain&
     }
 
     // One build in flight per key (pipeline invariant): wait for the slot.
+
     if (const TSharedRef<FInFlightCloudBuild>* F = InFlightBuilds.Find(Key))
     {
         if ((*F)->bBuilding || (*F)->bDeferred)
@@ -925,9 +809,6 @@ void FJUSYNCPointCloudSpawner::KickRampStep(const FString& Key, FCloudRampChain&
     const bool bFinal = (Chain.Step == Chain.TotalSteps);
     double ApplyAt = Chain.T0 + Chain.Duration * double(Chain.Step) / double(Chain.TotalSteps);
 
-    // Late arrival (build overran its slot or the pipeline was busy): slip the
-    // whole schedule instead of firing the remaining swaps back-to-back —
-    // clump-then-stall is exactly what reads as "jagged".
     const double NowSeconds = FPlatformTime::Seconds();
     if (ApplyAt <= NowSeconds + 0.0005)
     {
@@ -942,8 +823,6 @@ void FJUSYNCPointCloudSpawner::KickRampStep(const FString& Key, FCloudRampChain&
         return;
     }
 
-    // Intermediate: clone the real sample's point array and slide each point an
-    // EQUAL fraction of the way from the displayed position toward it.
     const int32 PointCount = Chain.Entry.Points.Num();
     TArray64<FLidarPointCloudPoint> Lerped = Chain.Entry.Points; // 20 B/pt copy per step
     const float S = JUSyncCloudRamp::StepFraction(Chain.Step, Chain.TotalSteps);
@@ -951,8 +830,6 @@ void FJUSYNCPointCloudSpawner::KickRampStep(const FString& Key, FCloudRampChain&
     for (int32 i = 0; i < PointCount; ++i)
     {
         FLidarPointCloudPoint& P = Lerped[i];
-        // Overlapping index prefix lerps; points beyond the previous sample stay
-        // put (birth), mirroring the mesh morph's rules.
         if (Chain.PrevPos.IsValidIndex(i))
         {
             P.Location = FMath::Lerp(Chain.PrevPos[i], P.Location, S);
@@ -967,9 +844,6 @@ void FJUSYNCPointCloudSpawner::KickRampStep(const FString& Key, FCloudRampChain&
 
 void FJUSYNCPointCloudSpawner::AbortDeferredSwap(const FString& Key)
 {
-    // Only chain steps are disposable; ordinary builds are the truth and use the
-    // latest-wins stash instead. Works for both in-flight (flag consumed at
-    // completion) and deferred (flag consumed at promotion) states.
     if (TSharedRef<FInFlightCloudBuild>* F = InFlightBuilds.Find(Key))
     {
         if ((*F)->bChainStep && ((*F)->bBuilding || (*F)->bDeferred))
@@ -981,7 +855,6 @@ void FJUSYNCPointCloudSpawner::AbortDeferredSwap(const FString& Key)
 
 void FJUSYNCPointCloudSpawner::TickCloudRamps(double NowSeconds)
 {
-    // 1) Promote deferred swaps whose hold window elapsed.
     for (TPair<FString, TSharedRef<FInFlightCloudBuild>>& Pair : InFlightBuilds)
     {
         FInFlightCloudBuild& F = *Pair.Value;
@@ -991,13 +864,10 @@ void FJUSYNCPointCloudSpawner::TickCloudRamps(double NowSeconds)
         }
     }
 
-    // 2) Advance chains whose previous step freed the pipeline slot.
     for (auto It = RampChains.CreateIterator(); It; ++It)
     {
         FCloudRampChain& Chain = It.Value();
 
-        // Actor went back to the pool or to another key: chain is moot. The
-        // superseded build, if any, self-discards via the existing guards.
         if (!IsValid(Chain.Actor) || FindActorByElementKey(It.Key()) != Chain.Actor)
         {
             It.RemoveCurrent();
@@ -1008,21 +878,9 @@ void FJUSYNCPointCloudSpawner::TickCloudRamps(double NowSeconds)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Per-frame SMOOTH cloud morph: mutate the displayed cloud's own point data
-// every frame through the plugin's public ExecuteActionOnAllPoints (it flags
-// the touched nodes render-dirty; the LOD manager re-uploads dirty nodes to
-// the GPU on its always-tick), and swap the authoritative rebuilt cloud in at
-// blend end via the deferred-swap machinery. No plugin modification, no
-// per-sample octree rebuilds. Falls back to the stepped ramp when point
-// correspondence (stable source order, required by VTK/USD streaming) cannot
-// be resolved.
-// ---------------------------------------------------------------------------
 
 namespace JUSyncCloudSmooth
 {
-    /** Quantized key (0.01 cm grid) matching walk positions to the
-     *  input-order array the displayed cloud was built from. */
     static inline int32 QKey(const FVector3f& V)
     {
         const FIntVector Q(
@@ -1065,20 +923,9 @@ bool FJUSYNCPointCloudSpawner::StartCloudSmoothMorph(const FString& Key, FPointC
     Morph.Start.Reserve(ExpectedPts);
     Morph.End.Reserve(ExpectedPts);
 
-    // Walk-slot -> input-order index: reuse the map resolved while THIS cloud
-    // has been displayed (retarget mid-blend); otherwise build it by quantized
-    // position match (first morph after a swap / first ramp->smooth transition).
     const TArray<int32>* KnownMap = CloudWalkInputIdx.Find(Key);
     const bool bReuseMap = (KnownMap && KnownMap->Num() == ExpectedPts);
 
-    // The octree translates every position by -LocationOffset on insert
-    // (SetData_Internal -> InsertPoints_NoLock(..., -LocationOffset)), so
-    // walk-space equals absolute only while LocationOffset is zero (true for
-    // CreateFromData-built clouds). Replicate the same shift for BOTH the
-    // match key and the lerp End so morphs stay correct if the displayed
-    // cloud ever carries a real offset (e.g. loaded .ulidarcPointCloud assets):
-    // writing raw absolute positions into an offset cloud would glide the
-    // display toward target + Offset and let the swap yank it back.
     const FVector3f NegOffset = (FVector3f)(-Cloud->LocationOffset);
 
     TMap<int32, int32> QuantToInput;
@@ -1110,11 +957,8 @@ bool FJUSYNCPointCloudSpawner::StartCloudSmoothMorph(const FString& Key, FPointC
         WalkToInput.Add(Src);
 
         Morph.Start.Add(P->Location);
-        // Prefix rule mirrors the mesh morph: matched points lerp toward their
-        // new-sample position; surplus (dying) points hold until the swap.
-        // End is shifted into THIS cloud's walk space (-LocationOffset) so the
-        // glide lands exactly where the authoritative swap will put the point.
         Morph.End.Add((Src != INDEX_NONE && Src < NewCount) ? NewPts[Src].Location + NegOffset : P->Location);
+        Morph.NewColors.Add((Src != INDEX_NONE && Src < NewCount) ? NewPts[Src].Color : P->Color);
         if (Src == INDEX_NONE || Src >= NewCount)
         {
             ++Held;
@@ -1128,8 +972,6 @@ bool FJUSYNCPointCloudSpawner::StartCloudSmoothMorph(const FString& Key, FPointC
         return false;
     }
 
-    // Too many unmatched points means the correspondence assumption broke
-    // (duplicates, actor transform baking, re-ordering): use the stepped ramp.
     if (Held > FMath::Max(64, Walked / 4))
     {
         UE_LOG(LogTemp, Log, TEXT("JUSYNC CloudMorph: '%s' correspondence %d/%d unmatched -> ramp fallback"),
@@ -1142,8 +984,6 @@ bool FJUSYNCPointCloudSpawner::StartCloudSmoothMorph(const FString& Key, FPointC
         CloudWalkInputIdx.Add(Key, MoveTemp(WalkToInput));
     }
 
-    // Kill the LOD manager's re-upload budget cut while morphs run, so every
-    // dirty node refreshes within the same frame (see CVar comment above).
     if (CVarJusyncCloudRenderSmoothing.GetValueOnGameThread() <= 0)
     {
         ULidarPointCloudSettings* LidarSettings = GetMutableDefault<ULidarPointCloudSettings>();
@@ -1173,7 +1013,6 @@ void FJUSYNCPointCloudSpawner::AdvanceCloudSmoothMorphs(double NowSeconds)
         ULidarPointCloud* Cloud = JUSyncCloudSmooth::GetDisplayedCloud(M.Actor.Get());
         if (!IsValid(Cloud) || FindActorByElementKey(It.Key()) != M.Actor.Get())
         {
-            // Swapped away / actor pooled: mapping is void, morph done.
             CloudWalkInputIdx.Remove(It.Key());
             It.RemoveCurrent();
             continue;
@@ -1189,6 +1028,10 @@ void FJUSYNCPointCloudSpawner::AdvanceCloudSmoothMorphs(double NowSeconds)
             if (Slot < Num)
             {
                 P->Location = FMath::Lerp(M.Start[Slot], M.End[Slot], S);
+                if (Slot < M.NewColors.Num())
+                {
+                    P->Color = M.NewColors[Slot];
+                }
                 ++Slot;
             }
         };
@@ -1196,8 +1039,6 @@ void FJUSYNCPointCloudSpawner::AdvanceCloudSmoothMorphs(double NowSeconds)
 
         if (U >= 1.f)
         {
-            // Exactly on target; the deferred authoritative swap finalizes the
-            // asset (walk mapping stays valid: order unchanged, End == new data).
             It.RemoveCurrent();
         }
     }
@@ -1220,9 +1061,6 @@ void FJUSYNCPointCloudSpawner::ApplyVisualSettings(ULidarPointCloudComponent* Co
 
     if (CVarJusyncCloudFixedSize.GetValueOnGameThread() > 0)
     {
-        // See CVarJusyncCloudFixedSize: octree-derived sizes re-quantize at the
-        // blend-end swap (the settle "snap"). Depth-only sizing is continuous
-        // across in-place morphs AND cloud swaps.
         Comp->ScalingMethod = ELidarPointCloudScalingMethod::FixedScreenSize;
         Comp->PointSize = FMath::Max(0.0f, CVarJusyncCloudScreenSize.GetValueOnGameThread());
     }
@@ -1257,7 +1095,6 @@ void FJUSYNCPointCloudSpawner::ApplyPointShapeToActiveActors(ELidarPointCloudSpr
         {
             if (ULidarPointCloudComponent* Comp = LidarActor->GetPointCloudComponent())
             {
-                // SetPointShape re-derives the material but does not dirty the render state.
                 Comp->SetPointShape(InShape);
                 Comp->MarkRenderStateDirty();
             }
@@ -1337,20 +1174,73 @@ AActor* FJUSYNCPointCloudSpawner::AllocateActor()
 
     if (ActiveActors.Num() >= MaxPoolSize)
     {
-        if (AActor* Oldest = ActiveActors.Array().Num() > 0 ? ActiveActors.Array()[0] : nullptr)
+        // Reuse the cloud that has been idle longest, and only take one that is
+        // mid-morph when nothing else is left. Every rank owns a piece of the same
+        // element, so the pool is tight under multi-rank streaming; the previous
+        // "first entry" pick was TSet order and could take the actor a rank is
+        // actively ramping on, leaving that element's key pointing at an actor that
+        // now shows another rank's points.
+        AActor* Victim = nullptr;
+        FString VictimKey;
+        bool bVictimMorphing = false;
+        double VictimStamp = TNumericLimits<double>::Lowest();
+
+        for (AActor* Candidate : ActiveActors)
         {
-            if (Oldest && Oldest->IsValidLowLevel())
+            if (!Candidate || !Candidate->IsValidLowLevel())
             {
-                ActiveActors.Remove(Oldest);
-                UntrackActorElement(Oldest);
-                Oldest->SetActorHiddenInGame(false);
-#ifdef WITH_ANARI_USD_MIDDLEWARE
-                ApplyVisualSettingsToActor(Oldest);
-#endif
-                ApplyTransformToActor(Oldest);
-                ActiveActors.Add(Oldest);
-                return Oldest;
+                Victim = Candidate;
+                VictimKey.Reset();
+                bVictimMorphing = false;
+                break;
             }
+
+            const FString* Key = ActorToElement.Find(Candidate);
+            const double Stamp = (Key && CloudLastArrival.Contains(*Key))
+                ? CloudLastArrival[*Key]
+                : TNumericLimits<double>::Lowest();
+            const bool bMorphing = Key && (RampChains.Contains(*Key) || SmoothMorphs.Contains(*Key));
+
+            bool bBetter;
+            if (!Victim)
+            {
+                bBetter = true;
+            }
+            else if (bMorphing != bVictimMorphing)
+            {
+                bBetter = !bMorphing;
+            }
+            else
+            {
+                bBetter = Stamp < VictimStamp;
+            }
+
+            if (bBetter)
+            {
+                Victim = Candidate;
+                VictimKey = Key ? *Key : FString();
+                bVictimMorphing = bMorphing;
+                VictimStamp = Stamp;
+            }
+        }
+
+        if (Victim && Victim->IsValidLowLevel())
+        {
+            if (bVictimMorphing)
+            {
+                UE_LOG(LogTemp, Warning, TEXT("JUSYNC Spawner: cloud pool full (%d), reusing the actor of mid-morph element '%s' - raise PointCloudPoolSize for multi-rank streams"),
+                    MaxPoolSize, *VictimKey);
+            }
+
+            ActiveActors.Remove(Victim);
+            UntrackActorElement(Victim);
+            Victim->SetActorHiddenInGame(false);
+#ifdef WITH_ANARI_USD_MIDDLEWARE
+            ApplyVisualSettingsToActor(Victim);
+#endif
+            ApplyTransformToActor(Victim);
+            ActiveActors.Add(Victim);
+            return Victim;
         }
         return nullptr;
     }
@@ -1378,8 +1268,6 @@ AActor* FJUSYNCPointCloudSpawner::AllocateActor()
             Comp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
             Comp->ColorSource = ELidarPointCloudColorationMode::Data;
             ApplyVisualSettings(Comp);
-            // LOD streaming: full depth range, but render only nodes within the view frustum.
-            // r.LidarPointBudget (adaptive) then decimates far nodes to hold the target FPS.
             Comp->MinDepth = 0;
             Comp->MaxDepth = -1;
             Comp->bUseFrustumCulling = true;
@@ -1473,8 +1361,6 @@ void FJUSYNCPointCloudSpawner::Tick(float DeltaTime)
     TickCloudRamps(NowSeconds);
     AdvanceCloudSmoothMorphs(NowSeconds);
 
-    // Live-console path: apply sizing changes to on-screen clouds instantly
-    // instead of waiting for the next swap.
     const int32 FixedNow = CVarJusyncCloudFixedSize.GetValueOnGameThread();
     const float ScreenNow = CVarJusyncCloudScreenSize.GetValueOnGameThread();
     if (FixedNow != LastFixedSizeState || ScreenNow != LastFixedScreenSize)
@@ -1518,9 +1404,7 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
 
         if (Entry.Key.IsEmpty())
         {
-            Entry.Key = Entry.ElementName.IsEmpty()
-                ? FString::Printf(TEXT("jusync_pc_r%d"), Entry.Rank)
-                : FString::Printf(TEXT("%s_r%d"), *Entry.ElementName, Entry.Rank);
+            Entry.Key = JUSYNCElementNames::MakeRankedElementKey(Entry.ElementName, Entry.Rank);
         }
 
         if (Entry.Points.Num() == 0)
@@ -1545,13 +1429,9 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
             }
         }
 
-        // Pooled/in-place actors keep whatever transform they were created with, so re-apply the
-        // spawner's current location/scale here; otherwise extent changes never resize them.
         ApplyTransformToActor(Actor);
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
-        // Async path (default): off-thread octree build + latest-wins swap
-        // (see StartAsyncCloudBuild).
         if (CVarJusyncAsyncCloudBuild.GetValueOnGameThread() > 0
             && Entry.Points.Num() > 0 && !Entry.bNeedsRecolor)
         {
@@ -1567,8 +1447,6 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
 
             if (bInPlaceUpdate && ShouldStartCloudRamp(Key, NowSeconds))
             {
-                // Supersede whatever this key's pipeline is holding (in-flight or
-                // deferred swap of the PREVIOUS chain) and glide to this sample.
                 AbortDeferredSwap(Key);
                 RampChains.Remove(Key);
 
@@ -1582,8 +1460,6 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
                 if (CVarJusyncCloudSmooth.GetValueOnGameThread() > 0
                     && StartCloudSmoothMorph(Key, Entry, Actor, NowSeconds, BlendSeconds))
                 {
-                    // Per-frame smooth glide NOW; the authoritative rebuild streams
-                    // concurrently and swaps in when the blend lands (deferred swap).
                     StartAsyncCloudBuild(Key, MoveTemp(Entry), Actor, NowSeconds + BlendSeconds);
                 }
                 else
@@ -1685,7 +1561,6 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
 #endif
     }
 
-    // Recolor any actors that spawned white but LUT is now available
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     if (GradientPendingActors.Num() > 0)
     {
@@ -1714,9 +1589,6 @@ void FJUSYNCPointCloudSpawner::DestroyAllActors()
     }
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
-    // Ramp state is actor/key-scoped: pooled actors get recycled, so never let a
-    // chain or its display positions outlive the teardown. (In-flight builds
-    // self-discard at swap time because the actors are gone.)
     RampChains.Reset();
     CloudDisplayPos.Reset();
     CloudLastArrival.Reset();
@@ -1743,9 +1615,6 @@ void FJUSYNCPointCloudSpawner::DestroyAllActors()
     LastNormalCalcTime.Empty();
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
-    // Drop stashed replacements (points owned by the entry dtor). In-flight builds
-    // self-discard on completion: the actor is untracked, so the key-ownership
-    // check fails and the fresh asset is marked garbage.
     for (auto& Pair : InFlightBuilds)
     {
         Pair.Value->PendingReplacement = FPointCloudReadyEntry();

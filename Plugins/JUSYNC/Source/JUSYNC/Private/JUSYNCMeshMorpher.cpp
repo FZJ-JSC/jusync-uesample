@@ -18,11 +18,6 @@ static TAutoConsoleVariable<int32> CVarJUSyncMorphEnabled(
     TEXT(" meshes without it keep the instant-apply path."),
     ECVF_Default);
 
-// Timing policy: by default one blend per measured sample interval, clamped so
-// very fast bursts skip blending entirely and long stalls still land on the new
-// key. The window (and the stall cap) is user-tunable via the CVars below: a
-// slow-cadence stream (seconds between samples) feels far too snappy with the
-// old hard 500 ms cap, so raise MeshMaxBlendMs or force MeshBlendMs.
 static TAutoConsoleVariable<int32> CVarJUSyncMorphBlendMs(
     TEXT("jusync.Morph.MeshBlendMs"), 0,
     TEXT("Fixed mesh blend window in ms; 0 = auto (measured sample gap clamped by MeshMaxBlendMs)."),
@@ -33,25 +28,17 @@ static TAutoConsoleVariable<int32> CVarJUSyncMorphMaxBlendMs(
     TEXT("Cap in ms for the auto mesh blend window."),
     ECVF_Default);
 
-// Timing policy: one blend per measured sample interval, clamped so very fast
-// bursts skip blending entirely and long stalls still land on the new key.
 namespace JUSyncMorph
 {
     static constexpr double MinBlendGapSeconds = 0.004;
     static constexpr double MinDurationSeconds = 0.008;
 
-    /** Eased morph fraction from linear progress u in [0,1]. */
     static float EaseSaturated(double u)
     {
         const float t = FMath::Clamp(static_cast<float>(u), 0.f, 1.f);
         return t * t * (3.f - 2.f * t); // smoothstep: zero velocity at both keys
     }
 
-    /**
-     * Previous displayed position for vertex i of the new sample.
-     * Overlapping index prefix lerps between the baked states; points beyond the
-     * old sample are held at their own position (birth without dragging anything).
-     */
     static void WriteDisplayedPrev(
         const TArray<FVector3f>& FromA, const TArray<FVector3f>& FromB, float S,
         int32 NewCount, const TArray<FVector3f>& OwnPositions, TArray<FVector3f>& Out)
@@ -113,8 +100,6 @@ UMaterialInstanceDynamic* FJUSYNCMeshMorpher::ResolveMorphMID(URealtimeMeshCompo
         return nullptr;
     }
 
-    // Dynamic instance (ours, a LUT-baked one, or anyone's): if the parent chain
-    // has the morph parameters we can drive them directly — no re-wrapping.
     if (UMaterialInstanceDynamic* CurrentMID = Cast<UMaterialInstanceDynamic>(Current))
     {
         if (IsMorphCapable(CurrentMID))
@@ -127,13 +112,12 @@ UMaterialInstanceDynamic* FJUSYNCMeshMorpher::ResolveMorphMID(URealtimeMeshCompo
     }
 
     // Static material that has the parameters -> create our own MID.
+
     if (IsMorphCapable(Current))
     {
         UMaterialInstanceDynamic* NewMID = UMaterialInstanceDynamic::Create(Current, Comp);
         if (NewMID)
         {
-            // Matches the parameter defaults the material should ship with
-            // (T=1 & Active=0 => zero WPO contribution until a blend starts).
             NewMID->SetScalarParameterValue(MorphActiveParameter, 0.f);
             NewMID->SetScalarParameterValue(MorphTParameter, 1.f);
             Comp->SetMaterial(0, NewMID);
@@ -165,28 +149,23 @@ FJUSYNCMeshMorpher::EApplyMode FJUSYNCMeshMorpher::BeginUpdate(
         return EApplyMode::Normal;
     }
 
-    // Remeshed (different index block) -> never crossfade random topology.
     const uint64 NewHash = ComputeTriHash(MeshData.Triangles);
     if (NewHash != Entry->TriHash)
     {
         return EApplyMode::Normal;
     }
 
-    // Bursts closer than a few ms coalesce into a snap instead of chasing.
     const double Gap = NowSeconds - Entry->LastArrival;
     if (Gap < JUSyncMorph::MinBlendGapSeconds)
     {
         return EApplyMode::Normal;
     }
 
-    // The material about to render must carry the WPO morph branch (parameters
-    // reachable through its parent chain).
     if (!IsMorphCapable(IntentMaterial))
     {
         return EApplyMode::Normal;
     }
 
-    // Prev for the new blend = whatever is on screen right now.
     if (Entry->bBlending && Entry->Duration > SMALL_NUMBER)
     {
         const float S = JUSyncMorph::EaseSaturated((NowSeconds - Entry->BlendStart) / Entry->Duration);
@@ -213,7 +192,6 @@ void FJUSYNCMeshMorpher::Commit(
 
     FEntry& Entry = Entries.FindOrAdd(Comp);
 
-    // Measure the arrival gap BEFORE overwriting the timestamp.
     const double Gap = NowSeconds - Entry.LastArrival;
 
     Entry.TriHash = ComputeTriHash(MeshData.Triangles);
@@ -221,8 +199,6 @@ void FJUSYNCMeshMorpher::Commit(
     Entry.CurrPoints = MeshData.Points; // one copy per sample; source of next blend's prev
     Entry.LastArrival = NowSeconds;
 
-    // Runs after the final SetMaterial() of the update so we adopt/wrap whatever
-    // material actually ended up in the slot.
     UMaterialInstanceDynamic* MID = ResolveMorphMID(Comp, Entry);
 
     if (bBlended && MID && Gap > 0.0)
@@ -253,7 +229,6 @@ void FJUSYNCMeshMorpher::Commit(
 
 void FJUSYNCMeshMorpher::Seed(URealtimeMeshComponent* Comp, const FJUSYNCCompactMeshData& MeshData, double NowSeconds)
 {
-    // Baseline record with no blend: the next refresh can already morph from this sample.
     Commit(Comp, MeshData, NowSeconds, /*bBlended*/false, TArray<FVector3f>{});
 }
 
@@ -266,7 +241,6 @@ void FJUSYNCMeshMorpher::Tick(float DeltaTime)
 {
     const double Now = FPlatformTime::Seconds();
 
-    // Prune destroyed components cheaply while iterating.
     for (auto It = Entries.CreateIterator(); It; ++It)
     {
         if (!It.Key().IsValid() || !It.Key().Get())
@@ -296,8 +270,6 @@ void FJUSYNCMeshMorpher::Tick(float DeltaTime)
         }
         else
         {
-            // WPO uses (1 - T), so feeding the eased progress lands geometry on
-            // prev at T=0 and on the fresh Position-stream keys at T=1.
             MID->SetScalarParameterValue(MorphTParameter, JUSyncMorph::EaseSaturated(u));
         }
     }
