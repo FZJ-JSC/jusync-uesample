@@ -1,0 +1,71 @@
+﻿diff --git a/Source/RealtimeMeshComponent/Private/RenderProxy/RealtimeMeshSectionGroupProxy.cpp b/Source/RealtimeMeshComponent/Private/RenderProxy/RealtimeMeshSectionGroupProxy.cpp
+index 99135ca..79468ee 100644
+--- a/Source/RealtimeMeshComponent/Private/RenderProxy/RealtimeMeshSectionGroupProxy.cpp
++++ b/Source/RealtimeMeshComponent/Private/RenderProxy/RealtimeMeshSectionGroupProxy.cpp
+@@ -317,17 +317,44 @@ namespace RealtimeMesh
+ 			const auto PositionStream = StaticCastSharedPtr<FRealtimeMeshVertexBuffer>(Streams.FindChecked(FRealtimeMeshStreams::Position));
+ 			const auto IndexStream = StaticCastSharedPtr<FRealtimeMeshIndexBuffer>(Streams.FindChecked(FRealtimeMeshStreams::Triangles));
+ 
++			// LOCAL PATCH (JUSYNC, 2026-10-16) - candidate upstream fix.
++			// While a sender re-meshes every update, the section stream ranges and the live
++			// index-buffer resource can transiently disagree; D3D12 then asserts in
++			// D3D12RayTracing.cpp ("IndexBuffer->GetSize() >= ..."). Clamp the ray tracing
++			// range to the buffer that actually exists and skip that one BLAS build instead
++			// of crashing - it rebuilds consistently on the next update.
++			const uint32 IndexStride = IndexStream->IndexBufferRHI.IsValid() ? IndexStream->IndexBufferRHI->GetStride() : 0;
++			const int64 LiveIndexCount = IndexStride > 0 ? static_cast<int64>(IndexStream->IndexBufferRHI->GetSize() / IndexStride) : 0;
++			int32 RTMinIndex = MinIndex;
++			int32 RTMaxIndex = MaxIndex;
++			if (IndexStride == 0 || LiveIndexCount < 3 || RTMinIndex < 0 || static_cast<int64>(RTMinIndex) >= LiveIndexCount)
++			{
++				return false;
++			}
++			if (static_cast<int64>(RTMaxIndex) >= LiveIndexCount)
++			{
++				static uint32 NumRTClampWarnings = 0;
++				if (NumRTClampWarnings < 8)
++				{
++					++NumRTClampWarnings;
++					UE_LOG(LogRealtimeMesh, Warning, TEXT("Ray tracing for '%s': index range %d..%d exceeds live index buffer (%lld indices); BLAS range clamped this update"),
++						*SharedResources->GetMeshName().ToString(), RTMinIndex, RTMaxIndex, LiveIndexCount);
++				}
++				RTMaxIndex = static_cast<int32>(LiveIndexCount) - 1;
++			}
++
+ 			FRayTracingGeometryInitializer Initializer;
+ 			Initializer.DebugName = *(SharedResources->GetMeshName().ToString() + TEXT("_") + Key.ToString() + " RTGeometry");
+ 			Initializer.OwnerName = SharedResources->GetMeshName();
+ 			
+ 			Initializer.IndexBuffer = IndexStream->IndexBufferRHI;
+-			Initializer.IndexBufferOffset = IndexStream->IndexBufferRHI->GetStride() * MinIndex;
+-			Initializer.TotalPrimitiveCount = ((MaxIndex - MinIndex) + 1) / 3;
++			Initializer.IndexBufferOffset = IndexStream->IndexBufferRHI->GetStride() * RTMinIndex;
++			Initializer.TotalPrimitiveCount = ((RTMaxIndex - RTMinIndex) + 1) / 3;
+ 			Initializer.GeometryType = RTGT_Triangles;
+ 			Initializer.bFastBuild = true;
+ 			Initializer.bAllowUpdate = false;
+ 
++			const int32 LastValidPrimitive = (RTMaxIndex + 1) / 3;
+ 			for (const auto& Section : Sections)
+ 			{
+ 				if (Section->GetDrawMask().ShouldRender() && Section->GetDrawMask().ShouldRenderMainPass())
+@@ -339,9 +366,19 @@ namespace RealtimeMesh
+ 					Segment.FirstPrimitive = Section->GetStreamRange().GetMinIndex() / 3;
+ 					Segment.NumPrimitives = Section->GetStreamRange().NumPrimitives(3);
+ 					check(Segment.NumPrimitives > 0);
++					const int32 SegFirstPrim = static_cast<int32>(Segment.FirstPrimitive);
++					if (SegFirstPrim >= LastValidPrimitive)
++					{
++						continue; // whole section currently beyond the live buffer
++					}
++					Segment.NumPrimitives = static_cast<uint32>(FMath::Min(static_cast<int32>(Segment.NumPrimitives), LastValidPrimitive - SegFirstPrim));
+ 					Initializer.Segments.Add(Segment);
+ 				}
+ 			}
++			if (Initializer.Segments.Num() == 0 || Initializer.TotalPrimitiveCount <= 0)
++			{
++				return false;
++			}
+ 
+ 			RayTracingGeometry.SetInitializer(Initializer);
+ 			RayTracingGeometry.InitResource(RHICmdList);
