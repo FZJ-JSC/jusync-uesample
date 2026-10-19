@@ -2172,10 +2172,14 @@ const AJUSYNCFileSpawnerActor::FJUSYNCSampleCacheEntry* AJUSYNCFileSpawnerActor:
         }
     }
 
-    // A key that first appeared after the selected frame has no historical
-    // value. Returning the oldest available payload here would show a future
-    // sample next to older samples from other keys, so leave it unresolved and
-    // let the caller hide that element for this frame.
+    // Cached playback must never mix times. If this key does not have the
+    // exact selected frame, leave it unresolved and let the caller hide it.
+    // Falling back to an older entry is what made the mesh and point cloud
+    // show different samples when one key missed a frame.
+    if (Best && Best->SampleId != SelectedSampleId)
+    {
+        return nullptr;
+    }
     return Best;
 }
 
@@ -2714,6 +2718,19 @@ void AJUSYNCFileSpawnerActor::ApplyCachedSample(float NormalizedPosition)
     FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr;
 
     bApplyingCachedSample = true;
+
+    // Keep the mesh and cloud transitions on the same clock. The cloud cached
+    // path uses CloudMaxBlendMs (200 ms); force the mesh morpher to the same
+    // fixed window instead of its auto gap, otherwise rapid scrubs finish the
+    // mesh first and the pair visibly separates mid-blend.
+    IConsoleVariable* MeshBlendCVar = IConsoleManager::Get().FindConsoleVariable(
+        TEXT("jusync.Morph.MeshBlendMs"));
+    const int32 SavedMeshBlendMs = MeshBlendCVar ? MeshBlendCVar->GetInt() : 0;
+    if (MeshBlendCVar)
+    {
+        MeshBlendCVar->Set(200, ECVF_SetByCode);
+    }
+
     TSet<AActor*> AppliedActors;
 
     for (TPair<FString, TArray<FJUSYNCSampleCacheEntry>>& Pair : SampleCache)
@@ -2862,6 +2879,11 @@ void AJUSYNCFileSpawnerActor::ApplyCachedSample(float NormalizedPosition)
     // have retired later. Keep one actor per logical element so an old live
     // variant cannot stay visible behind the selected frame.
     DeduplicateLogicalActors();
+
+    if (MeshBlendCVar)
+    {
+        MeshBlendCVar->Set(SavedMeshBlendMs, ECVF_SetByCode);
+    }
 
     bApplyingCachedSample = false;
     PlaybackAnchorSampleId = SelectedSampleId;
