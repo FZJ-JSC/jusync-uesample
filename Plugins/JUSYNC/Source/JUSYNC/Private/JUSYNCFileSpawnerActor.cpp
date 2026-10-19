@@ -4,8 +4,10 @@
 #include "JUSYNCPointCloudSpawner.h"
 #include "JUSYNCBenchmarkTiming.h"
 #include "JUSYNCUSDLoader.h"
+#include "EngineUtils.h"
 #if WITH_ANARI_USD_MIDDLEWARE
 #include "AnariUsdMiddleware_C.h"
+#include "LidarPointCloudActor.h"
 #endif
 #include "HAL/PlatformMemory.h"
 #include "HAL/PlatformFileManager.h"
@@ -183,7 +185,8 @@ static FString JUSYNCBuildLogicalActorKey(const FString& Filename)
     const TCHAR* Payload = (Variant.Payload == JUSYNCElementNames::EPayload::RawGeo)
         ? TEXT("geo")
         : (Variant.Payload == JUSYNCElementNames::EPayload::Usd) ? TEXT("usd") : TEXT("other");
-    return FString::Printf(TEXT("%s@%s@%s"), *Variant.Element, Payload, *TimeMark);
+    const FString StableElement = JUSYNCElementNames::CanonicalActorIdentity(Variant.Element);
+    return FString::Printf(TEXT("%s@%s@%s"), *StableElement, Payload, *TimeMark);
 }
 
 // The RawGeo stream names consecutive samples "<element>" and
@@ -192,7 +195,35 @@ static FString JUSYNCBuildLogicalActorKey(const FString& Filename)
 static FString JUSYNCCanonicalPointCloudElement(const FString& ElementName)
 {
     const JUSYNCElementNames::FVariant Variant = JUSYNCElementNames::ParseElement(ElementName);
-    return (!Variant.Element.IsEmpty() && Variant.Uniq >= 0) ? Variant.Element : ElementName;
+    const FString Base = (!Variant.Element.IsEmpty() && Variant.Uniq >= 0) ? Variant.Element : ElementName;
+    return JUSYNCElementNames::CanonicalActorIdentity(Base);
+}
+
+// The sender packs the ANARI animation time (usd::time, seconds) into the
+// notification timestamp as milliseconds. Legacy senders used Unix
+// wall-clock milliseconds (>= 1e12), which is not a sample time.
+static double JUSYNCDecodeSenderTime(uint64 RawTimestamp)
+{
+    if (RawTimestamp > 0 && RawTimestamp < 1000000000ULL)
+    {
+        return static_cast<double>(RawTimestamp) / 1000.0;
+    }
+    return -1.0;
+}
+
+// Clip filenames end in "__<time>" (e.g. "..._Geom__0.700000.usd"). This is
+// used as a fallback when the notification did not carry a time.
+static double JUSYNCTimeFromFilename(const FString& Filename)
+{
+    const FString Base = FPaths::GetBaseFilename(FPaths::GetCleanFilename(Filename));
+    const int32 TimeSep = Base.Find(TEXT("__"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+    if (TimeSep == INDEX_NONE)
+    {
+        return -1.0;
+    }
+
+    const FString TimeText = Base.Mid(TimeSep + 2);
+    return TimeText.IsNumeric() ? FCString::Atod(*TimeText) : -1.0;
 }
 
 static bool JUSYNCMaterialUsesVertexColor(UMaterialInterface* Material)
@@ -384,6 +415,15 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     MeshCacheMaxEntries = 64;
     MeshCacheMaxMB = 2048;
     bCachePointClouds = true;
+
+    bEnableSampleCache = true;
+    SampleCacheSize = 8;
+    SampleCacheMaxMB = 512;
+    bPauseLiveApplyDuringPlayback = true;
+    PlaybackPosition = 1.0f;
+    CachedSampleCount = 0;
+    PlaybackSampleIndex = 0;
+    bSamplePlaybackActive = false;
 
     bEnableTimeStepAnimation = true;
     TimeStepPlaybackFPS = 30.0f;
@@ -962,6 +1002,7 @@ void AJUSYNCFileSpawnerActor::ClearSpawnedActors()
     FilenameToActors.Empty();
     FilenameToPCActors.Empty();
     PCElementToFilename.Empty();
+    ClearSampleCache();
     FileLastSize.Empty();
     FileHashLo.Empty();
     FileHashHi.Empty();
@@ -1429,7 +1470,7 @@ void AJUSYNCFileSpawnerActor::PipelineDownloadNext(UJUSYNCSubsystem* Subsystem)
     LoadFileThroughPipeline(Filename, TargetRank, FileSize, HashLo, HashHi, i, true);
 }
 
-void AJUSYNCFileSpawnerActor::LoadFileThroughPipeline(const FString& Filename, int32 Rank, int64 Size, uint64 HashLo, uint64 HashHi, int32 FileIndex, bool bIsInitial)
+void AJUSYNCFileSpawnerActor::LoadFileThroughPipeline(const FString& Filename, int32 Rank, int64 Size, uint64 HashLo, uint64 HashHi, int32 FileIndex, bool bIsInitial, uint64 SampleId)
 {
     if (bIsCancelled || Filename.IsEmpty())
     {
@@ -1503,7 +1544,7 @@ void AJUSYNCFileSpawnerActor::LoadFileThroughPipeline(const FString& Filename, i
             const uint64 Generation = (ChangeTracker && !bIsInitial) ? ChangeTracker->GetGeneration(Filename) : 0;
 
             FFunctionGraphTask::CreateAndDispatchWhenReady(
-                [WeakThis, Filename, FileIndex, Rank, Generation, HashLo, HashHi, Size, bIsInitial, ExpectedLUTVersion,
+                [WeakThis, Filename, FileIndex, Rank, Generation, HashLo, HashHi, SampleId, Size, bIsInitial, ExpectedLUTVersion,
                   CachedMeshes = MoveTemp(CachedMeshes), CachedPointClouds = MoveTemp(CachedPointClouds), CachedStreams = MoveTemp(CachedStreams), ParseLUT = MoveTemp(ParseLUT)]() mutable
                 {
                     FJUSYNCParsedFileResult Result;
@@ -1513,6 +1554,7 @@ void AJUSYNCFileSpawnerActor::LoadFileThroughPipeline(const FString& Filename, i
                     Result.Generation = Generation;
                     Result.HashLo = HashLo;
                     Result.HashHi = HashHi;
+                    Result.SampleId = SampleId;
                     Result.Size = Size;
                     Result.bParsed = true;
                     Result.LUTVersion = ExpectedLUTVersion;
@@ -1591,7 +1633,7 @@ void AJUSYNCFileSpawnerActor::LoadFileThroughPipeline(const FString& Filename, i
     }
 #endif
 
-    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [WeakSubsystem, WeakThis, Filename, Rank, Size, HashLo, HashHi, FileIndex, bIsInitial, DynamicTimeout, ExpectedSize, AbortHandle, FileData = MoveTemp(FileData)]() mutable
+    AsyncTask(ENamedThreads::AnyBackgroundThreadNormalTask, [WeakSubsystem, WeakThis, Filename, Rank, Size, HashLo, HashHi, FileIndex, bIsInitial, SampleId, DynamicTimeout, ExpectedSize, AbortHandle, FileData = MoveTemp(FileData)]() mutable
     {
         if (!WeakSubsystem.IsValid() || !WeakThis.IsValid())
         {
@@ -1607,7 +1649,7 @@ void AJUSYNCFileSpawnerActor::LoadFileThroughPipeline(const FString& Filename, i
         bool bSuccess = WeakSubsystem->RequestFileSized(Filename, Rank, DynamicTimeout, *FileData, ExpectedSize, AbortHandle);
 
         FFunctionGraphTask::CreateAndDispatchWhenReady(
-            [WeakThis, Filename, Rank, Size, HashLo, HashHi, FileIndex, bIsInitial, AbortHandle, FileData = MoveTemp(FileData), bSuccess]() mutable
+            [WeakThis, Filename, Rank, Size, HashLo, HashHi, FileIndex, bIsInitial, SampleId, AbortHandle, FileData = MoveTemp(FileData), bSuccess]() mutable
             {
                 if (!WeakThis.IsValid()) return;
                 AJUSYNCFileSpawnerActor* Self = WeakThis.Get();
@@ -1705,6 +1747,7 @@ void AJUSYNCFileSpawnerActor::LoadFileThroughPipeline(const FString& Filename, i
                     Generation,
                     HashLo,
                     HashHi,
+                    SampleId,
                     Size,
                     [WeakThis, bIsInitial](FJUSYNCParsedFileResult&& ParsedResult) mutable
                     {
@@ -1818,6 +1861,27 @@ void AJUSYNCFileSpawnerActor::ApplyParsedFileData(FJUSYNCParsedFileResult&& Resu
         !(Result.CompactPointClouds.Num() > 0 && !bCachePointClouds))
     {
         MeshCache->Store(Filename, Result.HashLo, Result.HashHi, Result.Size, Result.LUTVersion, Result.CompactMeshes, Result.CompactPointClouds, &Result.PrebuiltStreams);
+    }
+
+    // Keep a small local ring of recent parsed payloads before the arrays are
+    // consumed by the spawn/update path. This is what the Details scrub slider
+    // replays without a broker round-trip.
+    CacheParsedSample(Result, bIsInitial);
+
+    // While the user is scrubbing a cached sample, keep ingesting/caching live
+    // samples but do not let them overwrite the actor being inspected. Returning
+    // live is explicit (Follow Latest / slider at 1.0).
+    if (!bIsInitial && bSamplePlaybackActive && bPauseLiveApplyDuringPlayback && !bApplyingCachedSample)
+    {
+        UE_LOG(LogTemp, Log, TEXT("[SampleCache] Cached '%s' without applying (scrubbing; %d sample(s) cached)"),
+            *Filename, CachedSampleCount);
+        PendingParseTasks = FMath::Max(0, PendingParseTasks - 1);
+        if (ChangeTracker)
+        {
+            ChangeTracker->MarkCompleted(Filename);
+        }
+        ChainRefreshNext();
+        return;
     }
 
     TArray<AActor*> OldMeshActors;
@@ -2031,6 +2095,955 @@ void AJUSYNCFileSpawnerActor::ApplyParsedFileData(FJUSYNCParsedFileResult&& Resu
     }
 }
 
+void AJUSYNCFileSpawnerActor::GetSampleTimeline(TArray<uint64>& OutSampleIds) const
+{
+    TSet<uint64> Seen;
+    for (const TPair<FString, TArray<FJUSYNCSampleCacheEntry>>& Pair : SampleCache)
+    {
+        for (const FJUSYNCSampleCacheEntry& Entry : Pair.Value)
+        {
+            if (Entry.SampleId != 0)
+            {
+                Seen.Add(Entry.SampleId);
+            }
+        }
+    }
+
+    OutSampleIds.Reset(Seen.Num());
+    for (uint64 SampleId : Seen)
+    {
+        OutSampleIds.Add(SampleId);
+    }
+    OutSampleIds.Sort();
+}
+
+int32 AJUSYNCFileSpawnerActor::GetMaxSampleCacheCount() const
+{
+    TArray<uint64> Timeline;
+    GetSampleTimeline(Timeline);
+    return Timeline.Num();
+}
+
+double AJUSYNCFileSpawnerActor::GetCachedSampleTime(int32 Index) const
+{
+    TArray<uint64> Timeline;
+    GetSampleTimeline(Timeline);
+    if (!Timeline.IsValidIndex(Index))
+    {
+        return -1.0;
+    }
+
+    const uint64 SampleId = Timeline[Index];
+    for (const TPair<FString, TArray<FJUSYNCSampleCacheEntry>>& Pair : SampleCache)
+    {
+        for (const FJUSYNCSampleCacheEntry& Entry : Pair.Value)
+        {
+            if (Entry.SampleId == SampleId && Entry.SampleTime >= 0.0)
+            {
+                return Entry.SampleTime;
+            }
+        }
+    }
+
+    if (const double* SenderTime = SampleTimeById.Find(SampleId))
+    {
+        return *SenderTime;
+    }
+    return -1.0;
+}
+
+const AJUSYNCFileSpawnerActor::FJUSYNCSampleCacheEntry* AJUSYNCFileSpawnerActor::FindSampleForPlayback(
+    const TArray<FJUSYNCSampleCacheEntry>& List, uint64 SelectedSampleId) const
+{
+    const FJUSYNCSampleCacheEntry* Best = nullptr;
+    for (const FJUSYNCSampleCacheEntry& Entry : List)
+    {
+        if (Entry.SampleId == 0 || Entry.SampleId > SelectedSampleId)
+        {
+            continue;
+        }
+
+        // Entries are normally appended in sample order, but a delayed parse
+        // can land out of order. Pick the newest sample at or before the
+        // selected frame; on a tie the later entry is the refined variant.
+        if (!Best || Entry.SampleId >= Best->SampleId)
+        {
+            Best = &Entry;
+        }
+    }
+
+    // A key that first appeared after the selected frame has no historical
+    // value. Returning the oldest available payload here would show a future
+    // sample next to older samples from other keys, so leave it unresolved and
+    // let the caller hide that element for this frame.
+    return Best;
+}
+
+void AJUSYNCFileSpawnerActor::RefreshPlaybackWindow()
+{
+    CachedSampleCount = GetMaxSampleCacheCount();
+
+    if (bSamplePlaybackActive && PlaybackAnchorSampleId != 0)
+    {
+        TArray<uint64> Timeline;
+        GetSampleTimeline(Timeline);
+        const int32 FoundIndex = Timeline.IndexOfByKey(PlaybackAnchorSampleId);
+        if (FoundIndex != INDEX_NONE)
+        {
+            // Keep the inspected frame stable while live samples append and
+            // older entries roll out of the ring.
+            PlaybackSampleIndex = FoundIndex;
+            PlaybackPosition = Timeline.Num() > 1
+                ? static_cast<float>(FoundIndex) / static_cast<float>(Timeline.Num() - 1)
+                : 0.0f;
+            return;
+        }
+
+        // The inspected frame was evicted. Fall back to the oldest frame still
+        // cached; the next scrub input will re-apply it.
+        PlaybackAnchorSampleId = 0;
+        PlaybackSampleIndex = 0;
+        PlaybackPosition = 0.0f;
+        return;
+    }
+
+    if (CachedSampleCount > 0)
+    {
+        // Follow the live edge until the user explicitly scrubs backwards.
+        PlaybackPosition = 1.0f;
+        PlaybackSampleIndex = CachedSampleCount - 1;
+    }
+    else
+    {
+        PlaybackPosition = 1.0f;
+        PlaybackSampleIndex = 0;
+    }
+}
+
+void AJUSYNCFileSpawnerActor::ClearSampleCache()
+{
+    SampleCache.Empty();
+    PendingLiveSamples.Empty();
+    SampleCacheLiveFilename.Empty();
+    SampleTimeById.Empty();
+    SampleCacheBytes = 0;
+    SampleCacheEntryCount = 0;
+    NextSampleCacheSerial = 0;
+    NextPlaybackSampleId = 0;
+    LiveSampleId = 0;
+    LastClosedLiveSampleId = 0;
+    bLiveSampleFrameClosed = true;
+    PlaybackAnchorSampleId = 0;
+    CachedSampleCount = 0;
+    PlaybackSampleIndex = 0;
+    PlaybackPosition = 1.0f;
+    bSamplePlaybackActive = false;
+    bApplyingCachedSample = false;
+
+    UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
+    if (FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr)
+    {
+        PCSpawner->SetPlaybackMode(false);
+    }
+}
+
+void AJUSYNCFileSpawnerActor::ClearCachedSamples()
+{
+    ClearSampleCache();
+    UE_LOG(LogTemp, Log, TEXT("[SampleCache] cleared recent-sample cache"));
+}
+
+uint64 AJUSYNCFileSpawnerActor::ResolveLiveSampleId(uint64 SenderTimestamp)
+{
+    // The sender timestamp is the ANARI animation time, used for display.
+    // Playback identity is the commit frame: all files between two
+    // CommitComplete messages share one id, and the id is a monotonic sequence
+    // so timeline order is arrival order.
+    if (!bLiveSampleFrameClosed && LiveSampleId != 0)
+    {
+        return LiveSampleId;
+    }
+
+    LiveSampleId = ++NextPlaybackSampleId;
+    const double SenderTime = JUSYNCDecodeSenderTime(SenderTimestamp);
+    if (SenderTime >= 0.0)
+    {
+        // Keep the first time seen for this commit; all files in the commit
+        // carry the same ANARI time.
+        SampleTimeById.FindOrAdd(LiveSampleId) = SenderTime;
+    }
+    bLiveSampleFrameClosed = false;
+    return LiveSampleId;
+}
+
+FString AJUSYNCFileSpawnerActor::GetSampleCacheDebugString() const
+{
+    TArray<uint64> Timeline;
+    GetSampleTimeline(Timeline);
+
+    uint64 SelectedSampleId = 0;
+    if (bSamplePlaybackActive && PlaybackAnchorSampleId != 0)
+    {
+        SelectedSampleId = PlaybackAnchorSampleId;
+    }
+    else if (Timeline.Num() > 0)
+    {
+        SelectedSampleId = Timeline[FMath::Clamp(PlaybackSampleIndex, 0, Timeline.Num() - 1)];
+    }
+
+    FString Out = FString::Printf(
+        TEXT("pos=%.3f idx=%d active=%d anchor=%llu selected=%llu count=%d pending=%d timeline="),
+        PlaybackPosition, PlaybackSampleIndex, bSamplePlaybackActive ? 1 : 0,
+        static_cast<unsigned long long>(PlaybackAnchorSampleId),
+        static_cast<unsigned long long>(SelectedSampleId),
+        CachedSampleCount, PendingLiveSamples.Num());
+    for (uint64 Id : Timeline)
+    {
+        Out += FString::Printf(TEXT("%llu "), static_cast<unsigned long long>(Id));
+    }
+    Out += TEXT("\n");
+
+    for (const TPair<FString, TArray<FJUSYNCSampleCacheEntry>>& Pair : SampleCache)
+    {
+        Out += FString::Printf(TEXT("KEY %s live=%s\n"),
+            *Pair.Key, *SampleCacheLiveFilename.FindRef(Pair.Key));
+        for (const FJUSYNCSampleCacheEntry& Entry : Pair.Value)
+        {
+            Out += FString::Printf(TEXT("  id=%llu t=%.4f file=%s rank=%d pts=%d verts=%d\n"),
+                static_cast<unsigned long long>(Entry.SampleId),
+                Entry.SampleTime,
+                *Entry.Filename,
+                Entry.Rank,
+                Entry.PointCloud ? Entry.PointCloud->GetPointCount() : 0,
+                Entry.Mesh ? Entry.Mesh->GetVertexCount() : 0);
+        }
+
+        const FJUSYNCSampleCacheEntry* Chosen = FindSampleForPlayback(Pair.Value, SelectedSampleId);
+        const FString ChosenFilename = Chosen ? Chosen->Filename : FString(TEXT("-"));
+        Out += FString::Printf(TEXT("  chosen=%s id=%llu file=%s\n"),
+            Chosen ? TEXT("yes") : TEXT("none"),
+            Chosen ? static_cast<unsigned long long>(Chosen->SampleId) : 0ULL,
+            *ChosenFilename);
+    }
+
+    int32 ActorLines = 0;
+    for (const TPair<FString, AActor*>& Pair : FileToActorMap)
+    {
+        if (ActorLines++ >= 40)
+        {
+            break;
+        }
+        AActor* Actor = Pair.Value;
+        Out += FString::Printf(TEXT("ACTOR %s -> %s hidden=%d\n"),
+            *Pair.Key,
+            Actor && Actor->IsValidLowLevel() ? *Actor->GetName() : TEXT("null"),
+            Actor && Actor->IsValidLowLevel() && Actor->IsHidden() ? 1 : 0);
+    }
+    return Out;
+}
+
+void AJUSYNCFileSpawnerActor::TrimSampleCache()
+{
+    const int64 MaxBytes = static_cast<int64>(FMath::Max(16, SampleCacheMaxMB)) * 1024 * 1024;
+    while (SampleCacheBytes > MaxBytes && SampleCacheEntryCount > 1)
+    {
+        FString OldestKey;
+        uint64 OldestSerial = TNumericLimits<uint64>::Max();
+        for (const TPair<FString, TArray<FJUSYNCSampleCacheEntry>>& Pair : SampleCache)
+        {
+            if (Pair.Value.Num() == 0)
+            {
+                continue;
+            }
+            if (Pair.Value[0].Serial < OldestSerial)
+            {
+                OldestSerial = Pair.Value[0].Serial;
+                OldestKey = Pair.Key;
+            }
+        }
+
+        if (OldestKey.IsEmpty())
+        {
+            break;
+        }
+
+        TArray<FJUSYNCSampleCacheEntry>* List = SampleCache.Find(OldestKey);
+        if (!List || List->Num() == 0)
+        {
+            break;
+        }
+        SampleCacheBytes -= (*List)[0].Bytes;
+        SampleCacheEntryCount--;
+        List->RemoveAt(0);
+        if (List->Num() == 0)
+        {
+            SampleCacheLiveFilename.Remove(OldestKey);
+            SampleCache.Remove(OldestKey);
+        }
+    }
+
+    // Per-key rings are capped independently. If elements arrive at different
+    // cadences their union can exceed the ring size, which makes the sample
+    // dropdown grow without bound. Keep only the newest N distinct frames.
+    TArray<uint64> Timeline;
+    GetSampleTimeline(Timeline);
+    const int32 MaxTimeline = FMath::Clamp(SampleCacheSize, 1, 64);
+    if (Timeline.Num() > MaxTimeline)
+    {
+        TSet<uint64> DropIds;
+        for (int32 Index = 0; Index < Timeline.Num() - MaxTimeline; ++Index)
+        {
+            DropIds.Add(Timeline[Index]);
+        }
+
+        for (auto It = SampleCache.CreateIterator(); It; ++It)
+        {
+            TArray<FJUSYNCSampleCacheEntry>& List = It.Value();
+            for (int32 Index = List.Num() - 1; Index >= 0; --Index)
+            {
+                if (DropIds.Contains(List[Index].SampleId))
+                {
+                    SampleCacheBytes -= List[Index].Bytes;
+                    SampleCacheEntryCount--;
+                    List.RemoveAt(Index);
+                }
+            }
+
+            if (List.Num() == 0)
+            {
+                SampleCacheLiveFilename.Remove(It.Key());
+                It.RemoveCurrent();
+            }
+        }
+    }
+
+    RefreshPlaybackWindow();
+}
+
+void AJUSYNCFileSpawnerActor::AddSampleCacheEntry(const FString& Key, FJUSYNCSampleCacheEntry&& Entry)
+{
+    if (Key.IsEmpty())
+    {
+        return;
+    }
+
+    if (Entry.SampleId == 0)
+    {
+        Entry.SampleId = ++NextPlaybackSampleId;
+    }
+
+    if (bSamplePlaybackActive && bPauseLiveApplyDuringPlayback)
+    {
+        // Freeze the visible playback window. The one-deep pending slot keeps
+        // the most recent live payload so returning to Live does not drop it.
+        PendingLiveSamples.Add(Key, MoveTemp(Entry));
+        return;
+    }
+
+    TArray<FJUSYNCSampleCacheEntry>& List = SampleCache.FindOrAdd(Key);
+
+    // A sender frame can produce a base payload and one or more refinement
+    // variants for the same element. They all carry the same SampleId, so keep
+    // exactly one slot per frame: the densest/latest payload wins. Without this
+    // collapse, one list has two entries per frame while another has one, and
+    // normalized-index playback mixes different times together.
+    for (int32 Index = 0; Index < List.Num(); ++Index)
+    {
+        FJUSYNCSampleCacheEntry& Existing = List[Index];
+        if (Existing.SampleId != Entry.SampleId)
+        {
+            continue;
+        }
+
+        const bool bSamePayload =
+            (Entry.Mesh && Existing.Mesh == Entry.Mesh) ||
+            (Entry.PointCloud && Existing.PointCloud == Entry.PointCloud);
+        const bool bSameFileHash =
+            Entry.Filename == Existing.Filename &&
+            (Entry.HashLo != 0 || Entry.HashHi != 0) &&
+            Entry.HashLo == Existing.HashLo && Entry.HashHi == Existing.HashHi;
+        if (bSamePayload || bSameFileHash)
+        {
+            return;
+        }
+
+        bool bReplace = true;
+        if (Entry.PointCloud && Existing.PointCloud)
+        {
+            bReplace = Entry.PointCloud->GetPointCount() >= Existing.PointCloud->GetPointCount();
+        }
+        else if (Entry.Mesh && Existing.Mesh)
+        {
+            bReplace = Entry.Mesh->GetVertexCount() >= Existing.Mesh->GetVertexCount();
+        }
+
+        if (!bReplace)
+        {
+            return;
+        }
+
+        SampleCacheBytes -= Existing.Bytes;
+        Entry.Serial = Existing.Serial;
+        SampleCacheBytes += Entry.Bytes;
+        Existing = MoveTemp(Entry);
+
+        if (!bSamplePlaybackActive || !bPauseLiveApplyDuringPlayback)
+        {
+            SampleCacheLiveFilename.Add(Key, Existing.Filename);
+        }
+
+        RefreshPlaybackWindow();
+        return;
+    }
+
+    // A repeated notification can carry the exact same shared payload. Do not
+    // spend one of the ring slots on a duplicate frame. Only suppress a repeat
+    // of the *same* SampleId: a later frame can legitimately reuse the same
+    // shared payload (unchanged cloud geometry), and dropping it would leave
+    // that key with no entry for the later time while the mesh key advances.
+    if (List.Num() > 0 && List.Last().SampleId == Entry.SampleId)
+    {
+        const FJUSYNCSampleCacheEntry& Last = List.Last();
+        const bool bSamePayload =
+            (Entry.Mesh && Last.Mesh == Entry.Mesh) ||
+            (Entry.PointCloud && Last.PointCloud == Entry.PointCloud);
+        const bool bSameFileHash =
+            Entry.Filename == Last.Filename &&
+            (Entry.HashLo != 0 || Entry.HashHi != 0) &&
+            Entry.HashLo == Last.HashLo && Entry.HashHi == Last.HashHi;
+        if (bSamePayload || bSameFileHash)
+        {
+            return;
+        }
+    }
+
+    Entry.Serial = ++NextSampleCacheSerial;
+    SampleCacheBytes += Entry.Bytes;
+    SampleCacheEntryCount++;
+    List.Add(MoveTemp(Entry));
+
+    if (!bSamplePlaybackActive || !bPauseLiveApplyDuringPlayback)
+    {
+        SampleCacheLiveFilename.Add(Key, List.Last().Filename);
+    }
+
+    const int32 MaxEntries = FMath::Clamp(SampleCacheSize, 1, 64);
+    while (List.Num() > MaxEntries)
+    {
+        SampleCacheBytes -= List[0].Bytes;
+        SampleCacheEntryCount--;
+        List.RemoveAt(0);
+    }
+
+    TrimSampleCache();
+}
+
+void AJUSYNCFileSpawnerActor::CacheParsedSample(const FJUSYNCParsedFileResult& Result, bool bIsInitial)
+{
+    if (!bEnableSampleCache || !Result.bParsed)
+    {
+        return;
+    }
+
+    // The sender stamps every clip from one render frame with the same
+    // timestamp. That is the frame identity the scrubber uses, so a mesh and
+    // its point cloud stay on the same playback step even when their downloads
+    // finish milliseconds apart.
+    //
+    // Initial file-list loads have no timestamp. Group them into one oldest
+    // sample (id 1); a later scene diff without a timestamp gets its own
+    // synthetic id so it cannot be mistaken for the initial state.
+    uint64 EffectiveSampleId = Result.SampleId;
+    if (EffectiveSampleId == 0)
+    {
+        // Initial file-list loads have no commit id: keep every late initial
+        // payload in the oldest slot (1) so a slow parse does not create a
+        // second "initial" cache entry.
+        if (bIsInitial || !bInitialSpawnDone)
+        {
+            EffectiveSampleId = 1;
+            NextPlaybackSampleId = FMath::Max(NextPlaybackSampleId, static_cast<uint64>(1));
+        }
+        else
+        {
+            EffectiveSampleId = ++NextPlaybackSampleId;
+        }
+    }
+    else
+    {
+        NextPlaybackSampleId = FMath::Max(NextPlaybackSampleId, EffectiveSampleId);
+    }
+
+    // The dropdown should show the same animation time ParaView shows, not a
+    // synthetic counter. Prefer the sender's notification time, then the
+    // RawGeo header time, then the clip filename's "__<time>" suffix.
+    double EffectiveSampleTime = -1.0;
+    if (const double* SentTime = SampleTimeById.Find(EffectiveSampleId))
+    {
+        EffectiveSampleTime = *SentTime;
+    }
+    if (EffectiveSampleTime < 0.0)
+    {
+        for (const FJUSYNCPointCloudRef& PC : Result.CompactPointClouds)
+        {
+            if (PC && PC->Time >= 0.0)
+            {
+                EffectiveSampleTime = PC->Time;
+                break;
+            }
+        }
+    }
+    if (EffectiveSampleTime < 0.0)
+    {
+        EffectiveSampleTime = JUSYNCTimeFromFilename(Result.Filename);
+    }
+
+    const int32 Rank = FMath::Max(Result.Rank, 0);
+    for (const FJUSYNCCompactMeshRef& Mesh : Result.CompactMeshes)
+    {
+        if (!Mesh || !Mesh->IsValid())
+        {
+            continue;
+        }
+
+        FString Element = JUSYNCCanonicalPointCloudElement(Mesh->ElementName);
+        if (Element.IsEmpty())
+        {
+            Element = Mesh->ElementName;
+        }
+
+        FJUSYNCSampleCacheEntry Entry;
+        Entry.Mesh = Mesh;
+        Entry.Filename = Result.Filename;
+        Entry.Rank = Rank;
+        Entry.Bytes = Mesh->EstimateBytes();
+        Entry.SampleId = EffectiveSampleId;
+        Entry.SampleTime = EffectiveSampleTime;
+        Entry.HashLo = Result.HashLo;
+        Entry.HashHi = Result.HashHi;
+
+        const FString Key = FString::Printf(TEXT("%s|mesh|r%d"), *Element, Rank);
+        AddSampleCacheEntry(Key, MoveTemp(Entry));
+    }
+
+    if (!bSpawnPointClouds)
+    {
+        return;
+    }
+
+    for (const FJUSYNCPointCloudRef& PointCloud : Result.CompactPointClouds)
+    {
+        if (!PointCloud || !PointCloud->IsValid())
+        {
+            continue;
+        }
+
+        FString Element = JUSYNCCanonicalPointCloudElement(PointCloud->ElementName);
+        if (Element.IsEmpty())
+        {
+            Element = PointCloud->ElementName;
+        }
+
+        int64 Bytes = 128;
+        if (PointCloud->HasLidarPoints())
+        {
+            Bytes += static_cast<int64>(PointCloud->LidarPoints.Num()) * sizeof(FLidarPointCloudPoint);
+        }
+        else
+        {
+            Bytes += static_cast<int64>(PointCloud->Positions.Num()) * sizeof(FVector);
+            Bytes += static_cast<int64>(PointCloud->Colors.Num()) * sizeof(FColor);
+        }
+        Bytes += static_cast<int64>(PointCloud->Widths.Num()) * sizeof(float);
+
+        FJUSYNCSampleCacheEntry Entry;
+        Entry.PointCloud = PointCloud;
+        Entry.Filename = Result.Filename;
+        Entry.Rank = Rank;
+        Entry.Bytes = Bytes;
+        Entry.SampleId = EffectiveSampleId;
+        Entry.SampleTime = EffectiveSampleTime;
+        Entry.HashLo = Result.HashLo;
+        Entry.HashHi = Result.HashHi;
+
+        const FString Key = FString::Printf(TEXT("%s|pc|r%d"), *Element, Rank);
+        AddSampleCacheEntry(Key, MoveTemp(Entry));
+    }
+}
+
+void AJUSYNCFileSpawnerActor::FlushPendingLiveSamples()
+{
+    if (PendingLiveSamples.Num() == 0)
+    {
+        return;
+    }
+
+    TMap<FString, FJUSYNCSampleCacheEntry> Pending = MoveTemp(PendingLiveSamples);
+    PendingLiveSamples.Empty();
+
+    // We are resuming at the live edge, so these payloads will be applied and
+    // their filenames become the actor-identity anchors for subsequent scrubs.
+    for (TPair<FString, FJUSYNCSampleCacheEntry>& Pair : Pending)
+    {
+        SampleCacheLiveFilename.Add(Pair.Key, Pair.Value.Filename);
+        AddSampleCacheEntry(Pair.Key, MoveTemp(Pair.Value));
+    }
+}
+
+void AJUSYNCFileSpawnerActor::ApplyCachedSample(float NormalizedPosition)
+{
+    if (!bEnableSampleCache || SampleCache.Num() == 0 || bApplyingCachedSample)
+    {
+        return;
+    }
+
+    TArray<uint64> Timeline;
+    GetSampleTimeline(Timeline);
+    if (Timeline.Num() == 0)
+    {
+        return;
+    }
+
+    const float Position = FMath::Clamp(NormalizedPosition, 0.0f, 1.0f);
+    const int32 TimelineIndex = Timeline.Num() <= 1
+        ? 0
+        : FMath::Clamp(FMath::RoundToInt(Position * static_cast<float>(Timeline.Num() - 1)), 0, Timeline.Num() - 1);
+    const uint64 SelectedSampleId = Timeline[TimelineIndex];
+
+    UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
+    FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr;
+
+    bApplyingCachedSample = true;
+    TSet<AActor*> AppliedActors;
+
+    for (TPair<FString, TArray<FJUSYNCSampleCacheEntry>>& Pair : SampleCache)
+    {
+        const FJUSYNCSampleCacheEntry* Chosen = FindSampleForPlayback(Pair.Value, SelectedSampleId);
+        if (!Chosen)
+        {
+            // This element has no cached payload at or before the selected
+            // frame (it appeared later in the stream). Hide its actor so a
+            // future sample cannot be mixed into the inspected time.
+            if (Pair.Key.Contains(TEXT("|mesh|")))
+            {
+                const FString* LiveFilename = SampleCacheLiveFilename.Find(Pair.Key);
+                const FString ActorFilename = (LiveFilename && !LiveFilename->IsEmpty())
+                    ? *LiveFilename
+                    : (Pair.Value.Num() > 0 ? Pair.Value.Last().Filename : FString());
+                if (!ActorFilename.IsEmpty())
+                {
+                    const FString LogicalKey = JUSYNCBuildLogicalActorKey(ActorFilename);
+                    if (!LogicalKey.IsEmpty())
+                    {
+                        if (AActor* Existing = FileToActorMap.FindRef(LogicalKey))
+                        {
+                            if (Existing->IsValidLowLevel())
+                            {
+                                Existing->SetActorHiddenInGame(true);
+                            }
+                        }
+                    }
+                }
+            }
+            else if (Pair.Key.Contains(TEXT("|pc|")) && PCSpawner && Pair.Value.Num() > 0)
+            {
+                const FJUSYNCSampleCacheEntry& First = Pair.Value[0];
+                if (First.PointCloud)
+                {
+                    const FString PCKey = JUSYNCElementNames::MakeRankedElementKey(
+                        JUSYNCCanonicalPointCloudElement(First.PointCloud->ElementName),
+                        FMath::Max(First.Rank, 0));
+                    if (AActor* Existing = PCSpawner->FindActorByElementKey(PCKey))
+                    {
+                        if (Existing->IsValidLowLevel())
+                        {
+                            Existing->SetActorHiddenInGame(true);
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (Chosen->Mesh)
+        {
+            // Reuse the live actor for this element even when the cached sample
+            // carries an older time mark. The cached payload supplies the
+            // geometry; the last actually-applied filename supplies identity.
+            const FString* LiveFilename = SampleCacheLiveFilename.Find(Pair.Key);
+            const FString ActorFilename = (LiveFilename && !LiveFilename->IsEmpty())
+                ? *LiveFilename
+                : Chosen->Filename;
+
+            // Hidden mesh updates are deferred by SpawnOrUpdateMesh; unhide the
+            // logical actor first so a scrub applies immediately even if the
+            // time-step controller had hidden it.
+            const FString LogicalKey = JUSYNCBuildLogicalActorKey(ActorFilename);
+            if (!LogicalKey.IsEmpty())
+            {
+                if (AActor* Existing = FileToActorMap.FindRef(LogicalKey))
+                {
+                    if (Existing->IsValidLowLevel())
+                    {
+                        Existing->SetActorHiddenInGame(false);
+                    }
+                }
+            }
+
+            TArray<AActor*> ReplacementActors;
+            FJUSYNCCompactMeshRef Mesh = Chosen->Mesh;
+            // Playback is an explicit inspect request: do not defer the update
+            // behind the gradient LUT or a hidden-actor queue.
+            SpawnOrUpdateMesh(Mesh, ActorFilename, true, ReplacementActors, nullptr, nullptr, true, Chosen->Rank, true);
+
+            for (AActor* Applied : ReplacementActors)
+            {
+                if (Applied)
+                {
+                    AppliedActors.Add(Applied);
+                }
+            }
+            if (!LogicalKey.IsEmpty())
+            {
+                if (AActor* Applied = FileToActorMap.FindRef(LogicalKey))
+                {
+                    AppliedActors.Add(Applied);
+                }
+            }
+        }
+        else if (Chosen->PointCloud && bSpawnPointClouds && PCSpawner)
+        {
+            if (PCSpawner->IsElementFiltered(Chosen->PointCloud->ElementName))
+            {
+                continue;
+            }
+
+            const FString PCKey = JUSYNCElementNames::MakeRankedElementKey(
+                JUSYNCCanonicalPointCloudElement(Chosen->PointCloud->ElementName), FMath::Max(Chosen->Rank, 0));
+            if (AActor* Existing = PCSpawner->FindActorByElementKey(PCKey))
+            {
+                if (Existing->IsValidLowLevel())
+                {
+                    Existing->SetActorHiddenInGame(false);
+                }
+            }
+
+            // Drop any live morph/deferred swap for this element first; the
+            // cached frame must replace what is on screen immediately, not
+            // blend from the live sample.
+            if (bSamplePlaybackActive)
+            {
+                PCSpawner->PreparePointCloudForPlayback(PCKey);
+            }
+
+            FJUSYNCPointCloudRef PointCloud = Chosen->PointCloud;
+            if (bSamplePlaybackActive)
+            {
+                PCSpawner->EnqueuePointCloudForPlayback(MoveTemp(PointCloud), Chosen->Rank);
+            }
+            else
+            {
+                PCSpawner->EnqueuePointCloud(MoveTemp(PointCloud), Chosen->Rank);
+            }
+
+            if (AActor* Applied = PCSpawner->FindActorByElementKey(PCKey))
+            {
+                AppliedActors.Add(Applied);
+            }
+        }
+    }
+
+    // A time-varying live scene can leave one actor per time step in the
+    // level. Only the actors that received the selected frame may stay
+    // visible; otherwise scrubbing shows the same element several times.
+    HideUnselectedPlaybackActors(AppliedActors);
+
+    // Cached playback can reveal a duplicate actor that the live path would
+    // have retired later. Keep one actor per logical element so an old live
+    // variant cannot stay visible behind the selected frame.
+    DeduplicateLogicalActors();
+
+    bApplyingCachedSample = false;
+    PlaybackAnchorSampleId = SelectedSampleId;
+    PlaybackSampleIndex = TimelineIndex;
+    CachedSampleCount = Timeline.Num();
+}
+
+void AJUSYNCFileSpawnerActor::HideUnselectedPlaybackActors(const TSet<AActor*>& KeptActors)
+{
+    for (const TPair<FString, TArray<AActor*>>& Pair : FilenameToActors)
+    {
+        for (AActor* Actor : Pair.Value)
+        {
+            if (Actor && Actor->IsValidLowLevel() && !KeptActors.Contains(Actor))
+            {
+                Actor->SetActorHiddenInGame(true);
+            }
+        }
+    }
+
+    UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
+    FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr;
+    if (!PCSpawner || !GetWorld())
+    {
+        return;
+    }
+
+#if WITH_ANARI_USD_MIDDLEWARE
+    for (TActorIterator<ALidarPointCloudActor> It(GetWorld()); It; ++It)
+    {
+        ALidarPointCloudActor* Actor = *It;
+        if (Actor && !KeptActors.Contains(Actor) && !PCSpawner->GetElementKeyForActor(Actor).IsEmpty())
+        {
+            Actor->SetActorHiddenInGame(true);
+        }
+    }
+#endif
+}
+
+void AJUSYNCFileSpawnerActor::SetPlaybackPosition(float NewPosition)
+{
+    PlaybackPosition = FMath::Clamp(NewPosition, 0.0f, 1.0f);
+
+    // Do not abort the initial async spawn while it is still assembling the
+    // first scene; the playback UI only becomes useful once live samples flow.
+    if (!bInitialSpawnDone)
+    {
+        bSamplePlaybackActive = false;
+        return;
+    }
+
+    if (!bEnableSampleCache || GetMaxSampleCacheCount() <= 0)
+    {
+        return;
+    }
+
+    UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
+    FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr;
+
+    // At the live edge we no longer suppress incoming samples; anywhere behind
+    // it we freeze the visible actor so the user can inspect a past sample.
+    bSamplePlaybackActive = PlaybackPosition < 0.999f;
+    if (!bSamplePlaybackActive)
+    {
+        if (PCSpawner)
+        {
+            PCSpawner->SetPlaybackMode(false);
+        }
+
+        // Merge the last live payloads that arrived while the ring was frozen.
+        FlushPendingLiveSamples();
+    }
+    else
+    {
+        if (PCSpawner)
+        {
+            PCSpawner->EnterPlaybackMode();
+        }
+
+        // Live updates that were already queued for this frame must not land
+        // after the selected cached sample and overwrite it.
+        DeferredSpawns.Empty();
+        GradientDeferredMeshes.Empty();
+        HiddenPendingMeshUpdates.Empty();
+        if (AnimationController)
+        {
+            AnimationController->Pause();
+        }
+    }
+
+    ApplyCachedSample(PlaybackPosition);
+    if (!bSamplePlaybackActive)
+    {
+        PlaybackSampleIndex = FMath::Max(0, CachedSampleCount - 1);
+    }
+}
+
+void AJUSYNCFileSpawnerActor::PlaybackPreviousSample()
+{
+    const int32 Count = CachedSampleCount > 0 ? CachedSampleCount : GetMaxSampleCacheCount();
+    if (Count <= 1)
+    {
+        return;
+    }
+
+    const int32 Index = FMath::Clamp(PlaybackSampleIndex - 1, 0, Count - 1);
+    SetPlaybackPosition(static_cast<float>(Index) / static_cast<float>(Count - 1));
+}
+
+void AJUSYNCFileSpawnerActor::PlaybackNextSample()
+{
+    const int32 Count = CachedSampleCount > 0 ? CachedSampleCount : GetMaxSampleCacheCount();
+    if (Count <= 1)
+    {
+        return;
+    }
+
+    const int32 Index = FMath::Clamp(PlaybackSampleIndex + 1, 0, Count - 1);
+    SetPlaybackPosition(static_cast<float>(Index) / static_cast<float>(Count - 1));
+}
+
+void AJUSYNCFileSpawnerActor::FollowLatestSample()
+{
+    bSamplePlaybackActive = false;
+    PlaybackPosition = 1.0f;
+
+    UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
+    if (FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr)
+    {
+        PCSpawner->SetPlaybackMode(false);
+    }
+
+    FlushPendingLiveSamples();
+    ApplyCachedSample(1.0f);
+    PlaybackSampleIndex = FMath::Max(0, CachedSampleCount - 1);
+}
+
+#if WITH_EDITOR
+void AJUSYNCFileSpawnerActor::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
+{
+    Super::PostEditChangeProperty(PropertyChangedEvent);
+
+    const FName PropertyName = PropertyChangedEvent.GetPropertyName();
+    if (PropertyName == GET_MEMBER_NAME_CHECKED(AJUSYNCFileSpawnerActor, PlaybackPosition))
+    {
+        if (bEnableSampleCache && GetMaxSampleCacheCount() > 0)
+        {
+            SetPlaybackPosition(PlaybackPosition);
+        }
+    }
+    else if (PropertyName == GET_MEMBER_NAME_CHECKED(AJUSYNCFileSpawnerActor, bEnableSampleCache))
+    {
+        if (!bEnableSampleCache)
+        {
+            ClearSampleCache();
+        }
+    }
+    else if (PropertyName == GET_MEMBER_NAME_CHECKED(AJUSYNCFileSpawnerActor, bPauseLiveApplyDuringPlayback))
+    {
+        if (!bPauseLiveApplyDuringPlayback)
+        {
+            FlushPendingLiveSamples();
+        }
+    }
+    else if (PropertyName == GET_MEMBER_NAME_CHECKED(AJUSYNCFileSpawnerActor, SampleCacheSize))
+    {
+        const int32 MaxEntries = FMath::Clamp(SampleCacheSize, 1, 64);
+        for (TPair<FString, TArray<FJUSYNCSampleCacheEntry>>& Pair : SampleCache)
+        {
+            while (Pair.Value.Num() > MaxEntries)
+            {
+                SampleCacheBytes -= Pair.Value[0].Bytes;
+                SampleCacheEntryCount--;
+                Pair.Value.RemoveAt(0);
+            }
+        }
+        TrimSampleCache();
+        CachedSampleCount = GetMaxSampleCacheCount();
+    }
+}
+#endif
+
 void AJUSYNCFileSpawnerActor::ApplyPointCloudSettingsToSpawner(FJUSYNCPointCloudSpawner* Spawner)
 {
     if (!Spawner)
@@ -2151,7 +3164,7 @@ static FORCEINLINE void JUSYNC_DIAG_MARK(const FString& File, int32 Stage, uint6
 #endif
 }
 
-AActor* AJUSYNCFileSpawnerActor::SpawnOrUpdateMesh(FJUSYNCCompactMeshRef& Mesh, const FString& Filename, bool bIsRefresh, TArray<AActor*>& ReplacementActors, RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams, const TArray<AActor*>* OldMeshActors, bool bForceGradientSpawn, int32 Rank)
+AActor* AJUSYNCFileSpawnerActor::SpawnOrUpdateMesh(FJUSYNCCompactMeshRef& Mesh, const FString& Filename, bool bIsRefresh, TArray<AActor*>& ReplacementActors, RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams, const TArray<AActor*>* OldMeshActors, bool bForceGradientSpawn, int32 Rank, bool bForceApplyHidden)
 {
     if (!Mesh || !Mesh->IsValid())
     {
@@ -2196,24 +3209,31 @@ AActor* AJUSYNCFileSpawnerActor::SpawnOrUpdateMesh(FJUSYNCCompactMeshRef& Mesh, 
 
     if (bCanReuse && Existing && Existing->IsValidLowLevel() && Existing->IsHidden())
     {
-        RegisterMeshForLUTRecolor(Existing, Mesh, Filename, Existing->GetActorLocation());
-
-        FRecolorMeshEntry Pending;
-        Pending.Mesh = MoveTemp(Mesh);
-        Pending.Filename = Filename;
-        Pending.Rank = Rank;
-        Pending.Loc = Existing->GetActorLocation();
-        Pending.Rot = Existing->GetActorRotation();
-        Pending.Scale = Existing->GetActorScale3D();
-        HiddenPendingMeshUpdates.Add(Existing, MoveTemp(Pending));
-
-        if (!ReplacementActors.Contains(Existing))
+        if (!bForceApplyHidden)
         {
-            ReplacementActors.Add(Existing);
+            RegisterMeshForLUTRecolor(Existing, Mesh, Filename, Existing->GetActorLocation());
+
+            FRecolorMeshEntry Pending;
+            Pending.Mesh = MoveTemp(Mesh);
+            Pending.Filename = Filename;
+            Pending.Rank = Rank;
+            Pending.Loc = Existing->GetActorLocation();
+            Pending.Rot = Existing->GetActorRotation();
+            Pending.Scale = Existing->GetActorScale3D();
+            HiddenPendingMeshUpdates.Add(Existing, MoveTemp(Pending));
+
+            if (!ReplacementActors.Contains(Existing))
+            {
+                ReplacementActors.Add(Existing);
+            }
+
+            UE_LOG(LogTemp, Verbose, TEXT("[Spawner] Deferred hidden mesh update for '%s'"), *Filename);
+            return Existing;
         }
 
-        UE_LOG(LogTemp, Verbose, TEXT("[Spawner] Deferred hidden mesh update for '%s'"), *Filename);
-        return Existing;
+        // Cached playback is explicit: the time-step controller may have left
+        // the actor hidden, but the user is asking to see this sample now.
+        Existing->SetActorHiddenInGame(false);
     }
 
     const bool bGradientExpected = !bForceGradientSpawn &&
@@ -3882,7 +4902,8 @@ void AJUSYNCFileSpawnerActor::OnBrokerNotification(const FJUSYNCNotification& No
                *Notification.Filename, Notification.SourceRank, (long long)Notification.FileSize);
         if (MinimumFileSizeBytes <= 0 || Notification.FileSize >= MinimumFileSizeBytes)
         {
-            HandleFileUpdateNotification(Notification.Filename, Notification.SourceRank, Notification.FileSize, 0, 0);
+            HandleFileUpdateNotification(Notification.Filename, Notification.SourceRank, Notification.FileSize, 0, 0,
+                static_cast<uint64>(Notification.Timestamp));
         }
     }
     else if (Notification.Type == EJUSYNCNotificationType::FileUpdateV2)
@@ -3907,7 +4928,8 @@ void AJUSYNCFileSpawnerActor::OnBrokerNotification(const FJUSYNCNotification& No
         else
         {
             HandleFileUpdateNotification(Notification.Filename, Notification.SourceRank, Notification.FileSize,
-                static_cast<uint64>(Notification.HashLo), static_cast<uint64>(Notification.HashHi));
+                static_cast<uint64>(Notification.HashLo), static_cast<uint64>(Notification.HashHi),
+                static_cast<uint64>(Notification.Timestamp));
         }
     }
     else if (Notification.Type == EJUSYNCNotificationType::CommitComplete)
@@ -3917,7 +4939,7 @@ void AJUSYNCFileSpawnerActor::OnBrokerNotification(const FJUSYNCNotification& No
     }
 }
 
-void AJUSYNCFileSpawnerActor::HandleFileUpdateNotification(const FString& Filename, int32_t SourceRank, int64 FileSize, uint64 HashLo, uint64 HashHi)
+void AJUSYNCFileSpawnerActor::HandleFileUpdateNotification(const FString& Filename, int32_t SourceRank, int64 FileSize, uint64 HashLo, uint64 HashHi, uint64 SampleId)
 {
     if (!bAutoRefreshMeshes || Filename.IsEmpty())
     {
@@ -3990,6 +5012,7 @@ void AJUSYNCFileSpawnerActor::HandleFileUpdateNotification(const FString& Filena
     // unresolved -1 here would reach the wrong worker.
     const int32 TargetRank = ResolveFileRank(Filename, SourceRank);
     SeenV2Files.Add(Filename, TargetRank);
+    SampleId = ResolveLiveSampleId(SampleId);
 
     JUSYNC_DIAG_MARK(Filename, JUSYNC_DIAG_QUEUE, static_cast<uint64>(FileSize));
 
@@ -3998,7 +5021,7 @@ void AJUSYNCFileSpawnerActor::HandleFileUpdateNotification(const FString& Filena
         const FJUSYNCFileChangeRequest* ReqBefore = ChangeTracker->Find(Filename);
         const bool bWasQueued = ReqBefore && ReqBefore->State == EJUSYNCFileChangeState::Queued;
 
-        ChangeTracker->QueueChange(Filename, TargetRank, FileSize, HashLo, HashHi);
+        ChangeTracker->QueueChange(Filename, TargetRank, FileSize, HashLo, HashHi, -1, false, SampleId);
 
         if (bWasQueued)
         {
@@ -4023,7 +5046,7 @@ void AJUSYNCFileSpawnerActor::HandleFileUpdateNotification(const FString& Filena
 
     UE_LOG(LogTemp, Log, TEXT("[LiveUpdate] Refreshing file: '%s' from rank %d"), *Filename, TargetRank);
 
-    if (QueueRefreshFile(Filename, TargetRank, FileSize, HashLo, HashHi))
+    if (QueueRefreshFile(Filename, TargetRank, FileSize, HashLo, HashHi, SampleId))
     {
         ChainRefreshNext();
     }
@@ -4035,6 +5058,15 @@ void AJUSYNCFileSpawnerActor::HandleCommitCompleteNotification(bool bIsTimer)
     {
         UE_LOG(LogTemp, Log, TEXT("[LiveUpdate] Skipping commit complete: auto-refresh disabled"));
         return;
+    }
+
+    if (!bIsTimer)
+    {
+        // Close the current playback frame. The next geometry notification
+        // starts a new sample id even if its sender timestamp is only a few
+        // milliseconds later.
+        LastClosedLiveSampleId = LiveSampleId;
+        bLiveSampleFrameClosed = true;
     }
 
     double Now = FPlatformTime::Seconds();
@@ -4161,6 +5193,12 @@ void AJUSYNCFileSpawnerActor::DiffAndRefreshFileList(const TArray<FString>& NewF
 
     int32 ChangedCount = 0;
     int32 NewCount = 0;
+    // Files discovered by the commit's deletion/refetch sweep still belong to
+    // that commit's playback sample. If multiple commits were coalesced, the
+    // latest id is the best available identity.
+    const uint64 DiffSampleId = (!bIsManual && LastClosedLiveSampleId != 0)
+        ? LastClosedLiveSampleId
+        : 0;
 
     for (int32 i = 0; i < NewFilteredFiles.Num(); ++i)
     {
@@ -4198,7 +5236,7 @@ void AJUSYNCFileSpawnerActor::DiffAndRefreshFileList(const TArray<FString>& NewF
 
         if (bShouldRefresh)
         {
-            if (QueueRefreshFile(Fname, Rank, NewSize, NewHLo, NewHHi))
+            if (QueueRefreshFile(Fname, Rank, NewSize, NewHLo, NewHHi, DiffSampleId))
             {
                 const char* Reason = bIsManual ? "manual" : (!bFound ? "new" : (bSizeChanged ? "size" : "hash"));
                 UE_LOG(LogTemp, Verbose, TEXT("[LiveUpdate] File changed '%s': %s"), *Fname, ANSI_TO_TCHAR(Reason));
@@ -4437,7 +5475,7 @@ void AJUSYNCFileSpawnerActor::OnLiveUpdateTimer()
     });
 }
 
-bool AJUSYNCFileSpawnerActor::QueueRefreshFile(const FString& Filename, int32 Rank, int64 Size, uint64 HashLo, uint64 HashHi)
+bool AJUSYNCFileSpawnerActor::QueueRefreshFile(const FString& Filename, int32 Rank, int64 Size, uint64 HashLo, uint64 HashHi, uint64 SampleId)
 {
     if (!bAutoRefreshMeshes || Filename.IsEmpty())
     {
@@ -4460,7 +5498,7 @@ bool AJUSYNCFileSpawnerActor::QueueRefreshFile(const FString& Filename, int32 Ra
         LogicalTrackedFile.Add(LogicalKey, Filename);
     }
 
-    ChangeTracker->QueueChange(Filename, Rank, Size, HashLo, HashHi, -1, false);
+    ChangeTracker->QueueChange(Filename, Rank, Size, HashLo, HashHi, -1, false, SampleId);
     return true;
 }
 
@@ -4878,7 +5916,8 @@ void AJUSYNCFileSpawnerActor::ChainRefreshNext()
             Request ? Request->HashLo : 0,
             Request ? Request->HashHi : 0,
             Request ? Request->FileIndex : -1,
-            false);
+            false,
+            Request ? Request->SampleId : 0);
 
         Spawned++;
     }

@@ -46,8 +46,20 @@ public:
     // Shared overload: avoids an extra copy when the caller owns the payload exclusively.
 
     bool EnqueuePointCloud(FJUSYNCPointCloudRef&& PCRef, int32 InRank = 0);
+    // Synchronous cached-playback path. Converts and swaps on the game thread so
+    // the selected frame is visible immediately instead of waiting for a
+    // background conversion/build and a later tick.
+    bool EnqueuePointCloudForPlayback(FJUSYNCPointCloudRef&& PCRef, int32 InRank = 0);
 
     bool IsElementFiltered(const FString& ElementName) const;
+
+    // Cached-sample scrubbing wants the selected frame on screen now, not a
+    // 200 ms morph from the live frame. Playback mode also lets the spawner
+    // discard live builds that were already in flight when the user scrubbed.
+    void SetPlaybackMode(bool bEnabled) { bPlaybackMode = bEnabled; }
+    void EnterPlaybackMode();
+    void PreparePointCloudForPlayback(const FString& Key);
+
     virtual void Tick(float DeltaTime) override;
     virtual ETickableTickType GetTickableTickType() const override { return ETickableTickType::Conditional; }
     virtual bool IsTickable() const override { return Owner.IsValid() && !bShuttingDown.load(); }
@@ -130,6 +142,7 @@ private:
     float PointSizeBias = 0.035f;
     float GapFillingStrength = 0.0f;
     bool bPerfLogging = false;
+    bool bPlaybackMode = false;
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     ELidarPointCloudSpriteShape PointShape = ELidarPointCloudSpriteShape::Circle;
     ELidarPointCloudSpriteOrientation PointOrientation = ELidarPointCloudSpriteOrientation::PreferFacingCamera;

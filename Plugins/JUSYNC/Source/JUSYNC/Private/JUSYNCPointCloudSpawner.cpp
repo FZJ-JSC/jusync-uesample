@@ -162,6 +162,13 @@ void FJUSYNCPointCloudSpawner::SetGradientLUT(const TArray<FColor>& InLUT)
         PendingNoColorClouds.Empty();
     }
 
+    // Cached playback must not replay live payloads that were waiting on the
+    // gradient LUT. They are retained by the sample cache instead.
+    if (bPlaybackMode)
+    {
+        return;
+    }
+
     for (FPendingNoColorCloud& Pending : ToFlush)
     {
         EnqueuePointCloud(MoveTemp(Pending.Data), Pending.Rank);
@@ -170,6 +177,13 @@ void FJUSYNCPointCloudSpawner::SetGradientLUT(const TArray<FColor>& InLUT)
 
 void FJUSYNCPointCloudSpawner::FlushExpiredNoColorClouds()
 {
+    if (bPlaybackMode)
+    {
+        FScopeLock Lock(&QueueMutex);
+        PendingNoColorClouds.Empty();
+        return;
+    }
+
     const TArray<FColor> LUT = GetGradientLUT();
     const bool bLUTReady = LUT.Num() > 0;
 
@@ -218,6 +232,112 @@ bool FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudRef&& PCRef, i
 
     FJUSYNCPointCloudData Copy = *PCRef;
     return EnqueuePointCloud(MoveTemp(Copy), InRank);
+}
+
+bool FJUSYNCPointCloudSpawner::EnqueuePointCloudForPlayback(FJUSYNCPointCloudRef&& PCRef, int32 InRank)
+{
+    if (!PCRef || !PCRef->IsValid() || !Owner.IsValid() || bShuttingDown.load())
+    {
+        return false;
+    }
+
+    FJUSYNCPointCloudData PCData = PCRef.IsUnique() ? MoveTemp(*PCRef) : *PCRef;
+
+    const JUSYNCElementNames::FVariant ElementVariant =
+        JUSYNCElementNames::ParseElement(PCData.ElementName);
+    if (!ElementVariant.Element.IsEmpty())
+    {
+        PCData.ElementName = JUSYNCElementNames::CanonicalActorIdentity(ElementVariant.Element);
+    }
+
+    if (IsElementFiltered(PCData.ElementName))
+    {
+        return false;
+    }
+
+#ifdef WITH_ANARI_USD_MIDDLEWARE
+    FPointCloudReadyEntry Entry;
+    Entry.ElementName = PCData.ElementName;
+    Entry.Key = JUSYNCElementNames::MakeRankedElementKey(PCData.ElementName, InRank);
+    Entry.Rank = InRank;
+    Entry.PointSize = PointSize;
+    Entry.bSpawned = false;
+    Entry.bNeedsRecolor = false;
+
+    if (PCData.HasLidarPoints())
+    {
+        Entry.Points = MoveTemp(PCData.LidarPoints);
+        if (!PCData.HasBakedColors() && PCData.Widths.Num() > 0)
+        {
+            const TArray<FColor> LUT = GetGradientLUT();
+            if (LUT.Num() > 0)
+            {
+                ParallelFor(static_cast<int32>(Entry.Points.Num()), [&](int32 i)
+                {
+                    const float Attr0 = (i < PCData.Widths.Num()) ? PCData.Widths[i] : 0.0f;
+                    const int32 LUTIdx = FMath::Clamp(
+                        FMath::RoundToInt(Attr0 * static_cast<float>(LUT.Num() - 1)),
+                        0,
+                        LUT.Num() - 1);
+                    Entry.Points[i].Color = LUT[LUTIdx];
+                });
+            }
+        }
+    }
+    else
+    {
+        const int32 PointCount = PCData.Positions.Num();
+        if (PointCount <= 0)
+        {
+            return false;
+        }
+
+        const bool bHasColors = PCData.Colors.Num() == PointCount;
+        const TArray<FColor> LUT = GetGradientLUT();
+        const bool bUseGradient = LUT.Num() > 0;
+        Entry.Points.SetNum(PointCount);
+        for (int32 i = 0; i < PointCount; ++i)
+        {
+            const FVector& P = PCData.Positions[i];
+            FColor Col;
+            if (bHasColors)
+            {
+                Col = PCData.Colors[i];
+            }
+            else if (bUseGradient && PCData.Widths.Num() > i)
+            {
+                const int32 LUTIdx = FMath::Clamp(
+                    FMath::RoundToInt(PCData.Widths[i] * static_cast<float>(LUT.Num() - 1)),
+                    0,
+                    LUT.Num() - 1);
+                Col = LUT[LUTIdx];
+            }
+            else
+            {
+                Col = FColor(128, 128, 128);
+            }
+
+            Entry.Points[i] = FLidarPointCloudPoint(
+                P.X, P.Y, P.Z,
+                Col.R / 255.f, Col.G / 255.f, Col.B / 255.f, Col.A / 255.f);
+        }
+    }
+
+    if (Entry.Points.Num() == 0)
+    {
+        return false;
+    }
+
+    {
+        FScopeLock Lock(&QueueMutex);
+        ReadyQueue.Add(MoveTemp(Entry));
+        DrainReadyQueueLocked();
+    }
+    return true;
+#else
+    (void)InRank;
+    return false;
+#endif
 }
 
 bool FJUSYNCPointCloudSpawner::EnqueuePointCloud(const FJUSYNCPointCloudData& PCData, int32 InRank)
@@ -269,11 +389,12 @@ bool FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudData&& PCData,
     {
         const JUSYNCElementNames::FVariant ElementVariant =
             JUSYNCElementNames::ParseElement(PCData.ElementName);
-        if (!ElementVariant.Element.IsEmpty() && ElementVariant.Uniq >= 0)
+        if (!ElementVariant.Element.IsEmpty())
         {
-            UE_LOG(LogTemp, Verbose, TEXT("JUSYNC Spawner: folding variant cloud '%s' onto '%s'"),
-                *PCData.ElementName, *ElementVariant.Element);
-            PCData.ElementName = ElementVariant.Element;
+            const FString StableElement = JUSYNCElementNames::CanonicalActorIdentity(ElementVariant.Element);
+            UE_LOG(LogTemp, Verbose, TEXT("JUSYNC Spawner: canonical cloud '%s' onto '%s'"),
+                *PCData.ElementName, *StableElement);
+            PCData.ElementName = StableElement;
         }
     }
 
@@ -373,6 +494,13 @@ bool FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudData&& PCData,
             FFunctionGraphTask::CreateAndDispatchWhenReady(
                 [this, Entry = MoveTemp(Entry)]() mutable
                 {
+                    // Live payloads that finish conversion after the user
+                    // entered playback must not overwrite the cached frame on
+                    // the next tick.
+                    if (bPlaybackMode)
+                    {
+                        return;
+                    }
                     {
                         FScopeLock Lock(&QueueMutex);
                         ReadyQueue.Add(MoveTemp(Entry));
@@ -473,6 +601,10 @@ bool FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudData&& PCData,
         FFunctionGraphTask::CreateAndDispatchWhenReady(
             [this, Entry = MoveTemp(Entry)]() mutable
             {
+                if (bPlaybackMode)
+                {
+                    return;
+                }
                 {
                     FScopeLock Lock(&QueueMutex);
                     ReadyQueue.Add(MoveTemp(Entry));
@@ -904,6 +1036,76 @@ void FJUSYNCPointCloudSpawner::AbortDeferredSwap(const FString& Key)
         if ((*F)->bChainStep && ((*F)->bBuilding || (*F)->bDeferred))
         {
             (*F)->bChainAborted = true;
+        }
+    }
+}
+
+void FJUSYNCPointCloudSpawner::EnterPlaybackMode()
+{
+    bPlaybackMode = true;
+
+    // Live clouds that were already converted/queued must not land after the
+    // cached frame. In-flight builds are aborted per key below; builds that
+    // finished and are only waiting out a morph window are dropped immediately.
+    {
+        FScopeLock Lock(&QueueMutex);
+        ReadyQueue.Empty();
+        PendingNoColorClouds.Empty();
+    }
+
+    RampChains.Empty();
+    SmoothMorphs.Empty();
+    CloudWalkInputIdx.Empty();
+    CloudDisplayPos.Empty();
+    CloudLastArrival.Empty();
+
+    TArray<FString> Keys;
+    InFlightBuilds.GetKeys(Keys);
+    for (const FString& Key : Keys)
+    {
+        PreparePointCloudForPlayback(Key);
+    }
+}
+
+void FJUSYNCPointCloudSpawner::PreparePointCloudForPlayback(const FString& Key)
+{
+    // A scrub is an explicit jump, not a continuation of the live animation.
+    // Stop every morph/ramp path for this element and make sure a build that
+    // was already running cannot land its live payload on top of the cached
+    // frame we are about to enqueue.
+    RampChains.Remove(Key);
+    SmoothMorphs.Remove(Key);
+    CloudWalkInputIdx.Remove(Key);
+    CloudDisplayPos.Remove(Key);
+    CloudLastArrival.Remove(Key);
+
+    if (TSharedRef<FInFlightCloudBuild>* Found = InFlightBuilds.Find(Key))
+    {
+        FInFlightCloudBuild& F = **Found;
+        F.bHasPending = false;
+        F.PendingReplacement = FPointCloudReadyEntry();
+        F.bChainStep = false;
+        F.bChainFinal = false;
+
+        if (F.bBuilding)
+        {
+            // The worker owns F.Points until its completion callback. Flag it
+            // so OnAsyncCloudBuildFinished discards the result instead of
+            // swapping the live cloud back in.
+            F.bChainAborted = true;
+        }
+        else if (F.bDeferred)
+        {
+            // The build already finished and is only waiting out its morph
+            // window; land-and-discard it now so the slot is free.
+            F.bChainAborted = true;
+            const uint64 Generation = F.Generation;
+            OnAsyncCloudBuildFinished(Key, Generation, true);
+            InFlightBuilds.Remove(Key);
+        }
+        else
+        {
+            InFlightBuilds.Remove(Key);
         }
     }
 }
@@ -1661,7 +1863,7 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
         if (CVarJusyncAsyncCloudBuild.GetValueOnGameThread() > 0
-            && Entry.Points.Num() > 0 && !Entry.bNeedsRecolor)
+            && Entry.Points.Num() > 0 && !Entry.bNeedsRecolor && !bPlaybackMode)
         {
             if (!bInPlaceUpdate)
             {
@@ -1673,7 +1875,7 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
             const double NowSeconds = FPlatformTime::Seconds();
             const FString Key = Entry.Key;
 
-            if (bInPlaceUpdate && ShouldStartCloudRamp(Key, NowSeconds))
+            if (!bPlaybackMode && bInPlaceUpdate && ShouldStartCloudRamp(Key, NowSeconds))
             {
                 AbortDeferredSwap(Key);
                 RampChains.Remove(Key);

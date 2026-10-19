@@ -262,6 +262,33 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Cache", meta = (EditCondition = "bEnableMeshCache", EditConditionHides))
     bool bCachePointClouds;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Playback")
+    bool bEnableSampleCache;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Playback", meta = (EditCondition = "bEnableSampleCache", EditConditionHides, ClampMin = "1", ClampMax = "64"))
+    int32 SampleCacheSize;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Playback", meta = (EditCondition = "bEnableSampleCache", EditConditionHides, ClampMin = "16"))
+    int32 SampleCacheMaxMB;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Playback", meta = (EditCondition = "bEnableSampleCache", EditConditionHides))
+    bool bPauseLiveApplyDuringPlayback;
+
+    // Normalized scrub position across the cached window. 0 = oldest cached
+    // sample, 1 = newest/live sample. The custom Details row binds a real
+    // SSlider to this value; PostEditChangeProperty also handles direct edits.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Playback", meta = (EditCondition = "bEnableSampleCache", EditConditionHides, UIMin = "0.0", UIMax = "1.0", ClampMin = "0.0", ClampMax = "1.0"))
+    float PlaybackPosition;
+
+    UPROPERTY(BlueprintReadOnly, VisibleAnywhere, Category = "JUSYNC|Spawner|Playback")
+    int32 CachedSampleCount;
+
+    UPROPERTY(BlueprintReadOnly, VisibleAnywhere, Category = "JUSYNC|Spawner|Playback")
+    int32 PlaybackSampleIndex;
+
+    UPROPERTY(BlueprintReadOnly, VisibleAnywhere, Category = "JUSYNC|Spawner|Playback")
+    bool bSamplePlaybackActive;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Animation")
     bool bEnableTimeStepAnimation;
 
@@ -346,6 +373,47 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Animation")
     void SetTimeStepIndex(int32 NewIndex);
 
+    // --- Recent-sample cache / local playback -------------------------------
+    // Each played stream sample is retained as a compact payload (mesh refs or
+    // point-cloud refs) in a small per-element ring. Moving the Details slider
+    // re-applies the selected cached sample to the existing live actors.
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
+    void SetPlaybackPosition(float NewPosition);
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
+    void PlaybackPreviousSample();
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
+    void PlaybackNextSample();
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
+    void FollowLatestSample();
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
+    void ClearCachedSamples();
+
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner|Playback")
+    float GetPlaybackPosition() const { return PlaybackPosition; }
+
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner|Playback")
+    int32 GetCachedSampleCount() const { return CachedSampleCount; }
+
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner|Playback")
+    int32 GetPlaybackSampleIndex() const { return PlaybackSampleIndex; }
+
+    // Sender animation time (ANARI usd::time) for a timeline entry, in
+    // seconds. Returns -1 when the sender did not provide a time.
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner|Playback")
+    double GetCachedSampleTime(int32 Index) const;
+
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner|Playback")
+    bool IsPlayingCachedSample() const { return bSamplePlaybackActive; }
+
+    // Temporary diagnostics: dumps the cache timeline, per-key entries and the
+    // actor each key currently maps to. Safe to call from Python/BP.
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
+    FString GetSampleCacheDebugString() const;
+
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner")
     FVector GetNextSpawnLocation() const;
 
@@ -353,6 +421,9 @@ protected:
     virtual void BeginPlay() override;
     virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
     virtual void Tick(float DeltaSeconds) override;
+#if WITH_EDITOR
+    virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
 
 private:
     void ConnectToBroker();
@@ -378,9 +449,9 @@ private:
     void FetchClusterBenchmarkReport(FJUSYNCBenchmarkResult& Result);
 
     int32 CalculateDynamicTimeout(int64 FileSizeBytes) const;
-    void LoadFileThroughPipeline(const FString& Filename, int32 Rank, int64 Size, uint64 HashLo, uint64 HashHi, int32 FileIndex, bool bIsInitial);
+    void LoadFileThroughPipeline(const FString& Filename, int32 Rank, int64 Size, uint64 HashLo, uint64 HashHi, int32 FileIndex, bool bIsInitial, uint64 SampleId = 0);
     void ApplyParsedFileData(FJUSYNCParsedFileResult&& Result);
-    AActor* SpawnOrUpdateMesh(FJUSYNCCompactMeshRef& Mesh, const FString& Filename, bool bIsRefresh, TArray<AActor*>& ReplacementActors, RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams = nullptr, const TArray<AActor*>* OldMeshActors = nullptr, bool bForceGradientSpawn = false, int32 Rank = 0);
+    AActor* SpawnOrUpdateMesh(FJUSYNCCompactMeshRef& Mesh, const FString& Filename, bool bIsRefresh, TArray<AActor*>& ReplacementActors, RealtimeMesh::FRealtimeMeshStreamSet* PrebuiltStreams = nullptr, const TArray<AActor*>* OldMeshActors = nullptr, bool bForceGradientSpawn = false, int32 Rank = 0, bool bForceApplyHidden = false);
     void DestroyUnreplacedMeshActors(const FString& Filename, const TArray<AActor*>& OldMeshActors, const TArray<AActor*>& ReplacementActors);
     void DestroyUnreplacedPCActors(const FString& Filename, const TArray<AActor*>& OldPCActors, const TSet<FString>& NewPCKeys);
 
@@ -419,7 +490,7 @@ private:
 
     UFUNCTION()
     void OnBrokerNotification(const FJUSYNCNotification& Notification);
-    void HandleFileUpdateNotification(const FString& Filename, int32_t SourceRank, int64 FileSize, uint64 HashLo, uint64 HashHi);
+    void HandleFileUpdateNotification(const FString& Filename, int32_t SourceRank, int64 FileSize, uint64 HashLo, uint64 HashHi, uint64 SampleId = 0);
     void HandleCommitCompleteNotification(bool bIsTimer = false);
     void StartLiveUpdatePolling();
     void StopLiveUpdatePolling();
@@ -431,7 +502,7 @@ private:
         TArray<FString>& OutFiles, TArray<int64>& OutSizes, TArray<int32>& OutRanks,
         TArray<uint64>& OutHashLo, TArray<uint64>& OutHashHi,
         TArray<FString>& OutPngFiles, TArray<int64>& OutPngSizes, TArray<int32>& OutPngRanks) const;
-    bool QueueRefreshFile(const FString& Filename, int32 Rank, int64 Size, uint64 HashLo, uint64 HashHi);
+    bool QueueRefreshFile(const FString& Filename, int32 Rank, int64 Size, uint64 HashLo, uint64 HashHi, uint64 SampleId = 0);
     void UpdateTrackedFileMetadata(const FString& Filename, int32 Rank, int64 Size, uint64 HashLo, uint64 HashHi);
 
     // Recovers the rank that owns a file. A notification can arrive without an
@@ -569,6 +640,73 @@ private:
     TUniquePtr<FJUSYNCAnimationController> AnimationController;
 
     TMap<FString, uint64> ActiveDownloadAborts;
+
+    // Recent live samples, grouped by logical element + payload + rank. The
+    // payload refs are shared with the live spawn path, so caching a sample
+    // does not duplicate the mesh/point-cloud buffers.
+    struct FJUSYNCSampleCacheEntry
+    {
+        FJUSYNCCompactMeshRef Mesh;
+        FJUSYNCPointCloudRef PointCloud;
+        FString Filename;
+        int32 Rank = 0;
+        int64 Bytes = 0;
+        // Ring ordering / duplicate bookkeeping.
+        uint64 Serial = 0;
+        // Sender frame timestamp. Entries from the same frame share this id so
+        // the playback timeline can select the matching mesh and point cloud.
+        uint64 SampleId = 0;
+        // Sender animation time in seconds (ANARI usd::time). -1 means unknown.
+        double SampleTime = -1.0;
+        uint64 HashLo = 0;
+        uint64 HashHi = 0;
+    };
+    TMap<FString, TArray<FJUSYNCSampleCacheEntry>> SampleCache;
+    // While the user scrubs, keep only the newest live payload per key in a
+    // one-deep holding map. This freezes the playback ring (so the inspected
+    // frame cannot be evicted) without losing the sample that arrived last.
+    TMap<FString, FJUSYNCSampleCacheEntry> PendingLiveSamples;
+    // Cache key -> filename of the last sample that was actually applied live.
+    // A scrub can be several samples behind, so actor identity must not follow
+    // the cached payload's older time mark.
+    TMap<FString, FString> SampleCacheLiveFilename;
+    int64 SampleCacheBytes = 0;
+    int64 SampleCacheEntryCount = 0;
+    uint64 NextSampleCacheSerial = 0;
+    // Monotonic playback sequence. Every commit/frame and every timestamp-less
+    // payload gets the next id, so numeric timeline order is arrival order even
+    // when the sender's wall clock jumps backwards or a manual refresh lands
+    // between live frames.
+    uint64 NextPlaybackSampleId = 0;
+    // Sender animation time per playback id. The sender packs its ANARI
+    // usd::time (seconds * 1000) into the notification timestamp, so the
+    // dropdown can show the same 0.700 that ParaView shows instead of a
+    // synthetic 1/2/3 counter.
+    TMap<uint64, double> SampleTimeById;
+    // Live sample identity is assigned per commit/frame, not per notification:
+    // all files that arrive between two CommitComplete messages share one id,
+    // even if the sender timestamp differs by a few milliseconds.
+    uint64 LiveSampleId = 0;
+    uint64 LastClosedLiveSampleId = 0;
+    bool bLiveSampleFrameClosed = true;
+    // While scrubbing, track the exact cached sample (not just its ring index)
+    // so live appends/evictions do not make Previous/Next jump to another frame.
+    uint64 PlaybackAnchorSampleId = 0;
+    bool bApplyingCachedSample = false;
+
+    uint64 ResolveLiveSampleId(uint64 SenderTimestamp);
+    void CacheParsedSample(const FJUSYNCParsedFileResult& Result, bool bIsInitial);
+    void AddSampleCacheEntry(const FString& Key, FJUSYNCSampleCacheEntry&& Entry);
+    void TrimSampleCache();
+    void ClearSampleCache();
+    void FlushPendingLiveSamples();
+    void ApplyCachedSample(float NormalizedPosition);
+    int32 GetMaxSampleCacheCount() const;
+    void GetSampleTimeline(TArray<uint64>& OutSampleIds) const;
+    void RefreshPlaybackWindow();
+    const FJUSYNCSampleCacheEntry* FindSampleForPlayback(
+        const TArray<FJUSYNCSampleCacheEntry>& List, uint64 SelectedSampleId) const;
+    void HideUnselectedPlaybackActors(const TSet<AActor*>& KeptActors);
 
     void AbortAllInFlightDownloads();
 

@@ -182,6 +182,11 @@ struct JUSYNC_API FJUSYNCPointCloudData
 	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
 	int32 PointCount = 0;
 
+	// Sender animation time for this payload (ANARI usd::time), in seconds.
+	// -1 means the payload did not carry a time (older sender / non-RawGeo).
+	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
+	double Time = -1.0;
+
 	UPROPERTY(BlueprintReadOnly, Category = "JUSYNC")
 	bool bHasColors = false;
 

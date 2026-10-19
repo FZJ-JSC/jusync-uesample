@@ -1541,11 +1541,13 @@ static int64 GRawGeoMergeTotalPoints = 0;
 
 static FJUSYNCPointCloudRef JUSYNCBuildCloudFromMergedPoints(
     const FString& ElementName, bool bHasColors, bool bHasWidths,
-    TArray<FLidarPointCloudPoint>&& Points, TArray<float>&& Widths)
+    TArray<FLidarPointCloudPoint>&& Points, TArray<float>&& Widths,
+    double Time = -1.0)
 {
     FJUSYNCPointCloudRef PC = MakeShared<FJUSYNCPointCloudData, ESPMode::ThreadSafe>();
     PC->ElementName = ElementName;
     PC->TypeName = TEXT("GeomPoints");
+    PC->Time = Time;
     PC->PointCount = Points.Num();
     PC->bHasColors = bHasColors;
     PC->bHasNormals = false;
@@ -1751,6 +1753,7 @@ static bool JUSYNCParseRawGeoBuffer(const TArray<uint8>& Buffer, FJUSYNCPointClo
         auto PC = MakeShared<FJUSYNCPointCloudData, ESPMode::ThreadSafe>();
         PC->ElementName = ElementName;
         PC->TypeName = TEXT("GeomPoints");
+        PC->Time = Hdr.time;
         PC->PointCount = (int32)N;
         PC->bHasColors = Hdr.color_components != 0;
         PC->bHasNormals = false;
@@ -1842,7 +1845,7 @@ static bool JUSYNCParseRawGeoBuffer(const TArray<uint8>& Buffer, FJUSYNCPointClo
             Pts.SetNumUninitialized((int32)N);
             ParallelFor((int32)N, [&](int32 i) { Pts[i] = MakePoint(i); });
             OutCloud = JUSYNCBuildCloudFromMergedPoints(
-                ElementName, Hdr.color_components != 0, false, MoveTemp(Pts), {});
+                ElementName, Hdr.color_components != 0, false, MoveTemp(Pts), {}, Hdr.time);
         }
         return true;
     }
@@ -1887,7 +1890,7 @@ static bool JUSYNCParseRawGeoBuffer(const TArray<uint8>& Buffer, FJUSYNCPointClo
                 Pts.SetNumUninitialized((int32)N);
                 ParallelFor((int32)N, [&](int32 i) { Pts[i] = MakePoint(i); });
                 OutCloud = JUSYNCBuildCloudFromMergedPoints(
-                    ElementName, Hdr.color_components != 0, false, MoveTemp(Pts), {});
+                    ElementName, Hdr.color_components != 0, false, MoveTemp(Pts), {}, Hdr.time);
             }
             return true; // subsets beyond the coarse base: dropped
         }
@@ -1984,7 +1987,7 @@ static bool JUSYNCParseRawGeoBuffer(const TArray<uint8>& Buffer, FJUSYNCPointClo
     }
 
     OutCloud = JUSYNCBuildCloudFromMergedPoints(
-        ElementName, bOutColors, bOutWidths, MoveTemp(OutPts), MoveTemp(OutW));
+        ElementName, bOutColors, bOutWidths, MoveTemp(OutPts), MoveTemp(OutW), Hdr.time);
     return true;
 }
 
