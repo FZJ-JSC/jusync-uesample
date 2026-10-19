@@ -16,6 +16,7 @@ class UTexture2D;
 class URealtimeMeshComponent;
 class UMaterialInterface;
 class UMaterialInstanceDynamic;
+class UBoxComponent;
 struct FJUSYNCParsedFileResult;
 
 UENUM(BlueprintType)
@@ -51,6 +52,13 @@ enum class EJUSYNCPointScaling : uint8
     PerNodeAdaptive UMETA(DisplayName = "Per Node Adaptive"),
     PerPoint UMETA(DisplayName = "Per Point"),
     FixedScreenSize UMETA(DisplayName = "Fixed Screen Size")
+};
+
+UENUM(BlueprintType)
+enum class EJUSYNCFitMode : uint8
+{
+    Uniform UMETA(DisplayName = "Uniform (keep proportions)"),
+    Stretch UMETA(DisplayName = "Stretch (fill each axis)")
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnSpawnerFileProgress, int32, CurrentFile, int32, TotalFiles);
@@ -108,6 +116,31 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Placement")
     bool bUseUniformScaling;
 
+    /** Draggable/resizable box shown in the viewport. When Fit To Volume is on,
+        spawned meshes are scaled and centered to fill this volume instead of
+        using SpawnScale/grid placement. Resize it via the component's Box Extent
+        (select the actor, then the FitVolume component) or the scale gizmo. */
+    UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "JUSYNC|Spawner|Placement")
+    TObjectPtr<UBoxComponent> FitVolume;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Placement")
+    bool bFitToVolume;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Placement", meta = (EditCondition = "bFitToVolume", EditConditionHides))
+    EJUSYNCFitMode FitMode;
+
+    /** Fraction (0-0.9) of the volume left as margin on each axis. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Placement", meta = (EditCondition = "bFitToVolume", EditConditionHides, ClampMin = "0.0", ClampMax = "0.9"))
+    float FitPaddingFraction;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Placement", meta = (EditCondition = "bFitToVolume", EditConditionHides))
+    bool bCenterInVolume;
+
+    /** Re-applies the current FitVolume to all actors spawned so far (e.g. after
+        resizing the box while a scene is live). */
+    UFUNCTION(BlueprintCallable, CallInEditor, Category = "JUSYNC|Spawner|Placement")
+    void RefitSpawnedActorsToVolume();
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Behavior")
     bool bAutoStart;
 
@@ -131,6 +164,12 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pipeline")
     bool bCollapseElementVariants;
+
+    // One-time migration marker: existing levels serialized the pre-v2 default
+    // (true), which suppressed protocol-v2 subset pieces. Default to accepting
+    // every variant/subset; the checkbox above can still opt in afterwards.
+    UPROPERTY()
+    bool bCollapseVariantsMigrated = false;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|LiveUpdate", meta = (ClampMin = "0.0", ClampMax = "30.0"))
     float CommitCompleteCooldownSeconds;
@@ -345,6 +384,27 @@ private:
     void DestroyUnreplacedMeshActors(const FString& Filename, const TArray<AActor*>& OldMeshActors, const TArray<AActor*>& ReplacementActors);
     void DestroyUnreplacedPCActors(const FString& Filename, const TArray<AActor*>& OldPCActors, const TSet<FString>& NewPCKeys);
 
+    // Fit-to-volume: scale/location derived from the mesh's local bounds and the
+    // FitVolume. ComputeFitScale returns FVector::ZeroVector when fit is off or
+    // the box is degenerate, so call sites can fall back to SpawnScale.
+    FVector ComputeFitScale(const FBox& MeshBox) const;
+    FVector ComputeFitLocation(const FBox& MeshBox, const FVector& Scale) const;
+
+    // Union of every fitted bounds seen for the current scene. The fit transform
+    // is derived from this accumulated union (not from each mesh/timestep), so a
+    // time-series that changes extent morphs in place instead of being rescaled
+    // and re-centred on every frame. Grows monotonically; a 2% dead band keeps
+    // floating-point noise from triggering refits.
+    FBox FitUnionBounds;
+    bool bHasFitUnionBounds = false;
+    bool bFitLocked = false;
+    bool bFitUnionGrew = false;
+    void AccumulateFitBounds(const FBox& B);
+
+    // Remembered per-actor local mesh bounds so RefitSpawnedActorsToVolume can
+    // rescale live actors without a re-download.
+    TMap<TWeakObjectPtr<AActor>, FBox> LastMeshLocalBounds;
+
     bool BakeLUTVertexColorCompact(FJUSYNCCompactMeshRef& Mesh, UMaterialInterface*& OutVertexMaterial);
     void RegisterMeshForLUTRecolor(AActor* Spawned, FJUSYNCCompactMeshRef& Mesh, const FString& Filename, const FVector& Loc);
     void RecolorGradientPendingMeshes();
@@ -380,6 +440,11 @@ private:
     // instead of falling back. Resolve it, and only then fall back to rank 0.
     int32 ResolveFileRank(const FString& Filename, int32 KnownRank) const;
     int32 DestroyFileActors(const FString& Filename);
+
+    // One logical element (including all "_u<k>" rebuild variants) must own a
+    // single actor. Duplicates left by the pre-fix initial spawn are retired
+    // here so an older sample cannot stay visible.
+    void DeduplicateLogicalActors();
 
     TMap<FString, TPair<int32, FString>> ElementVariantWinners;
     TSet<FString> IgnoredVariantFiles;
@@ -467,7 +532,18 @@ private:
     TMap<FString, int64> FileLastSize;
     double LastCommitCompleteTime;
     bool bSceneDiffInFlight;
+    // A commit-complete arrived while file changes were still in flight (or a
+    // diff was already running). Do not drop it: the next diff is what retires
+    // actors whose files the sender deleted. Apply the pending diff as soon as
+    // the change queue drains instead of waiting for the 20 s backstop poll.
+    bool bCommitDiffPending = false;
     bool bInitialSpawnDone;
+    // Initial spawn can be held open by a point-cloud spawn that never calls
+    // back (empty cloud, filtered enqueue, failed actor allocation). Watchdog
+    // state: when the only outstanding work is PendingAsyncPCS, force the
+    // spawn complete after a short grace period so live updates start.
+    double InitialSpawnPendingSince = 0.0;
+    bool bInCheckAllDownloads = false;
 
     bool bBenchmarkSessionActive = false;
     bool bBenchmarkWindowScheduled = false;
@@ -480,6 +556,12 @@ private:
     FTimerHandle BenchmarkFinalizeTimerHandle;
 
     TMap<FString, int32> SeenV2Files;
+    // Logical element (element+payload+time, rebuild uniquifier folded away) ->
+    // the clip filename currently queued/in flight for it. The sender rebuilds
+    // a prim as "<name>_u<k>", so one element alternates between filenames;
+    // without this, both variants run their own parse and an older one can land
+    // after (and overwrite) a newer sample.
+    TMap<FString, FString> LogicalTrackedFile;
     FTimerHandle SpawnThrottleTimer;
 
     TUniquePtr<FJUSYNCMeshCache> MeshCache;

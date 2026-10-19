@@ -95,7 +95,7 @@ def build_cloud_material():
     # jusync.Spawner.CloudEmissiveFloor.
     floor_param = expr(mat, unreal.MaterialExpressionScalarParameter, -600, -100)
     set_prop(floor_param, "parameter_name", "EmissiveFloor")
-    set_prop(floor_param, "default_value", 0.5)
+    set_prop(floor_param, "default_value", 0.004)
     set_prop(floor_param, "group", "Jusync")
     vcol2 = expr(mat, unreal.MaterialExpressionVertexColor, -600, -500)
     emul = expr(mat, unreal.MaterialExpressionMultiply, -300, -100)

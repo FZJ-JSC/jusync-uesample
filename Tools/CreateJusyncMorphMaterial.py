@@ -79,10 +79,42 @@ def expr(mat, cls, x, y):
     return MEL.create_material_expression(mat, cls, x, y)
 
 
+def add_emissive_floor(mat, x, y, default_value):
+    """VertexColor * EmissiveFloor -> EmissiveColor.
+
+    Kept low: a large mesh surface with a strong self-lit term blooms into a
+    halo. 0.05 only lifts the darkest parts; the rest of the brightness comes
+    from the (matte) lit base color.
+    """
+    vcol = expr(mat, unreal.MaterialExpressionVertexColor, x, y - 300)
+    floor_param = expr(mat, unreal.MaterialExpressionScalarParameter, x - 300, y)
+    set_prop(floor_param, "parameter_name", "EmissiveFloor")
+    set_prop(floor_param, "default_value", default_value)
+    set_prop(floor_param, "group", "Jusync")
+    emul = expr(mat, unreal.MaterialExpressionMultiply, x + 300, y)
+    connect(vcol, emul, "", "A")
+    connect(floor_param, emul, "", "B")
+    MEL.connect_material_property(emul, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
+
+
+def make_matte(mat, x, y):
+    """Kill the broad specular sheen that reads as "glow" on a big surface."""
+    rough = expr(mat, unreal.MaterialExpressionConstant, x, y)
+    set_prop(rough, "r", 0.92)
+    MEL.connect_material_property(rough, "", unreal.MaterialProperty.MP_ROUGHNESS)
+
+    spec = expr(mat, unreal.MaterialExpressionConstant, x, y + 120)
+    set_prop(spec, "r", 0.03)
+    MEL.connect_material_property(spec, "", unreal.MaterialProperty.MP_SPECULAR)
+
+
 def build_vertex_color():
     mat, path = recreate("/Game/Materials", "M_VertexColor")
+    set_prop(mat, "two_sided", True)
     vcol = expr(mat, unreal.MaterialExpressionVertexColor, 0, 0)
     MEL.connect_material_property(vcol, "", unreal.MaterialProperty.MP_BASE_COLOR)
+    add_emissive_floor(mat, 0, 400, 0.004)
+    make_matte(mat, 0, 700)
     MEL.recompile_material(mat)
     unreal.EditorAssetLibrary.save_asset(path)
     log(path + " rebuilt")
@@ -90,6 +122,7 @@ def build_vertex_color():
 
 def build_morph_material():
     mat, path = recreate("/Game/Materials", "M_JusyncMorph")
+    set_prop(mat, "two_sided", True)
 
     # Parameters (names must match FJUSYNCMeshMorpher exactly)
     morph_t = expr(mat, unreal.MaterialExpressionScalarParameter, -800, 400)
@@ -133,6 +166,8 @@ def build_morph_material():
     # Vertex colors (same look as the LUT-baked path)
     vcol = expr(mat, unreal.MaterialExpressionVertexColor, -200, -400)
     MEL.connect_material_property(vcol, "", unreal.MaterialProperty.MP_BASE_COLOR)
+    add_emissive_floor(mat, -200, 800, 0.004)
+    make_matte(mat, -200, 1100)
 
     MEL.recompile_material(mat)
     unreal.EditorAssetLibrary.save_asset(path)

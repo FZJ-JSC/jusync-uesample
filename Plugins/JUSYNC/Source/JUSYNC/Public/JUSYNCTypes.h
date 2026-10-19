@@ -238,6 +238,17 @@ struct JUSYNC_API FJUSYNCCompactMeshData
 
 	int32 GetVertexCount() const { return Points.Num(); }
 	int32 GetTriangleCount() const { return Triangles.Num() / 3; }
+
+	/** Local-space AABB of the vertex cloud (invalid when empty). */
+	FBox GetLocalBounds() const
+	{
+		FBox Box(ForceInit);
+		for (const FVector3f& P : Points)
+		{
+			Box += FVector(P.X, P.Y, P.Z);
+		}
+		return Box;
+	}
 	bool HasNormals() const { return Normals.Num() == Points.Num() && Normals.Num() > 0; }
 	bool HasUVs() const { return UVs.Num() == Points.Num() && UVs.Num() > 0; }
 	bool HasVertexColors() const { return VertexColors.Num() == Points.Num() && VertexColors.Num() > 0; }
