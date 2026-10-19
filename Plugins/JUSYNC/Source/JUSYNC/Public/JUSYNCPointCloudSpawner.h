@@ -26,12 +26,15 @@ struct FPointCloudReadyEntry
     float PointSize;
     bool bSpawned;
     bool bNeedsRecolor;
+    // Cached-playback selection: keep the live smooth-morph path instead of
+    // snapping to the selected cloud, so clicking through samples animates.
+    bool bPlaybackMorph;
 
     TArray<FVector> Positions;
     TArray<float> Widths;
 
     FPointCloudReadyEntry()
-        : Rank(0), PointSize(1.0f), bSpawned(false), bNeedsRecolor(false)
+        : Rank(0), PointSize(1.0f), bSpawned(false), bNeedsRecolor(false), bPlaybackMorph(false)
     {}
 };
 

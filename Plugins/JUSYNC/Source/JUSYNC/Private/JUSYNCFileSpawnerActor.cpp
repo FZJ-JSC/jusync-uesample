@@ -5562,12 +5562,12 @@ void AJUSYNCFileSpawnerActor::UpdateTrackedFileMetadata(const FString& Filename,
         {
             continue;
         }
-        if (Rank >= 0) FilteredRanks[i] = Rank;
-        if (Size > 0) FilteredSizes[i] = Size;
+        if (Rank >= 0 && FilteredRanks.IsValidIndex(i)) FilteredRanks[i] = Rank;
+        if (Size > 0 && FilteredSizes.IsValidIndex(i)) FilteredSizes[i] = Size;
         if (HashLo != 0 || HashHi != 0)
         {
-            if (HashLo != 0) FilteredHashLo[i] = HashLo;
-            if (HashHi != 0) FilteredHashHi[i] = HashHi;
+            if (HashLo != 0 && FilteredHashLo.IsValidIndex(i)) FilteredHashLo[i] = HashLo;
+            if (HashHi != 0 && FilteredHashHi.IsValidIndex(i)) FilteredHashHi[i] = HashHi;
         }
         break;
     }
@@ -5578,12 +5578,12 @@ void AJUSYNCFileSpawnerActor::UpdateTrackedFileMetadata(const FString& Filename,
         {
             continue;
         }
-        if (Rank >= 0) RawFileRanks[i] = Rank;
-        if (Size > 0) RawFileSizes[i] = Size;
+        if (Rank >= 0 && RawFileRanks.IsValidIndex(i)) RawFileRanks[i] = Rank;
+        if (Size > 0 && RawFileSizes.IsValidIndex(i)) RawFileSizes[i] = Size;
         if (HashLo != 0 || HashHi != 0)
         {
-            if (HashLo != 0) RawHashLo[i] = HashLo;
-            if (HashHi != 0) RawHashHi[i] = HashHi;
+            if (HashLo != 0 && RawHashLo.IsValidIndex(i)) RawHashLo[i] = HashLo;
+            if (HashHi != 0 && RawHashHi.IsValidIndex(i)) RawHashHi[i] = HashHi;
         }
         break;
     }

@@ -263,6 +263,7 @@ bool FJUSYNCPointCloudSpawner::EnqueuePointCloudForPlayback(FJUSYNCPointCloudRef
     Entry.PointSize = PointSize;
     Entry.bSpawned = false;
     Entry.bNeedsRecolor = false;
+    Entry.bPlaybackMorph = true;
 
     if (PCData.HasLidarPoints())
     {
@@ -1072,12 +1073,42 @@ void FJUSYNCPointCloudSpawner::PreparePointCloudForPlayback(const FString& Key)
     // A scrub is an explicit jump, not a continuation of the live animation.
     // Stop every morph/ramp path for this element and make sure a build that
     // was already running cannot land its live payload on top of the cached
-    // frame we are about to enqueue.
+    // frame we are about to enqueue. Keep CloudDisplayPos: it is the pose the
+    // next manually selected cached frame morphs from. Drop the correspondence
+    // map so a mid-morph snapshot gets a fresh mapping.
     RampChains.Remove(Key);
     SmoothMorphs.Remove(Key);
     CloudWalkInputIdx.Remove(Key);
-    CloudDisplayPos.Remove(Key);
     CloudLastArrival.Remove(Key);
+
+    // Seed the morph anchor from the cloud currently on screen. Without this,
+    // the first cached selection in playback mode has no CloudDisplayPos and
+    // every later selection also snaps because ShouldStartCloudRamp() never
+    // becomes true.
+    if (!CloudDisplayPos.Contains(Key))
+    {
+        if (AActor* Actor = FindActorByElementKey(Key))
+        {
+            if (ALidarPointCloudActor* LidarActor = Cast<ALidarPointCloudActor>(Actor))
+            {
+                if (ULidarPointCloudComponent* Comp = LidarActor->GetPointCloudComponent())
+                {
+                    if (ULidarPointCloud* Cloud = Comp->GetPointCloud())
+                    {
+                        TArray<FVector3f> Displayed;
+                        Displayed.Reserve(Cloud->GetNumPoints());
+                        Cloud->ExecuteActionOnAllPoints(
+                            [&](FLidarPointCloudPoint* P) { Displayed.Add(P->Location); },
+                            /*bVisibleOnly*/false);
+                        if (Displayed.Num() > 0)
+                        {
+                            CloudDisplayPos.Add(Key, MoveTemp(Displayed));
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     if (TSharedRef<FInFlightCloudBuild>* Found = InFlightBuilds.Find(Key))
     {
@@ -1862,8 +1893,13 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
         ApplyTransformToActor(Actor);
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
+        // Cached selections use the same async smooth-morph path as live
+        // samples, but only for entries explicitly marked as playback morphs;
+        // ordinary live entries are still dropped while the playback window is
+        // frozen.
+        const bool bAllowCloudMorph = !bPlaybackMode || Entry.bPlaybackMorph;
         if (CVarJusyncAsyncCloudBuild.GetValueOnGameThread() > 0
-            && Entry.Points.Num() > 0 && !Entry.bNeedsRecolor && !bPlaybackMode)
+            && Entry.Points.Num() > 0 && !Entry.bNeedsRecolor && bAllowCloudMorph)
         {
             if (!bInPlaceUpdate)
             {
@@ -1875,16 +1911,19 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
             const double NowSeconds = FPlatformTime::Seconds();
             const FString Key = Entry.Key;
 
-            if (!bPlaybackMode && bInPlaceUpdate && ShouldStartCloudRamp(Key, NowSeconds))
+            if (bAllowCloudMorph && bInPlaceUpdate && ShouldStartCloudRamp(Key, NowSeconds))
             {
                 AbortDeferredSwap(Key);
                 RampChains.Remove(Key);
 
                 const int32 ForcedMs = CVarJusyncCloudBlendMs.GetValueOnGameThread();
                 const double MaxBlend = FMath::Max(CVarJusyncCloudMaxBlendMs.GetValueOnGameThread(), 8) / 1000.0;
-                const double BlendSeconds = (ForcedMs > 0)
-                    ? ForcedMs / 1000.0
-                    : FMath::Clamp(NowSeconds - CloudLastArrival.FindRef(Key), 0.008, MaxBlend);
+                const bool bPlaybackMorph = bPlaybackMode && Entry.bPlaybackMorph;
+                const double BlendSeconds = bPlaybackMorph
+                    ? (ForcedMs > 0 ? ForcedMs / 1000.0 : MaxBlend)
+                    : (ForcedMs > 0
+                        ? ForcedMs / 1000.0
+                        : FMath::Clamp(NowSeconds - CloudLastArrival.FindRef(Key), 0.008, MaxBlend));
                 CloudLastArrival.Add(Key, NowSeconds);
 
                 if (CVarJusyncCloudSmooth.GetValueOnGameThread() > 0
