@@ -8,7 +8,7 @@ public class JusyncSampleProjectTarget : TargetRules
 	public JusyncSampleProjectTarget(TargetInfo Target) : base(Target)
 	{
 		Type = TargetType.Game;
-		DefaultBuildSettings = BuildSettingsVersion.V6;
+		DefaultBuildSettings = BuildSettingsVersion.V7;
 		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_7;
 		bOverrideBuildEnvironment = true;
 		UndefinedIdentifierWarningLevel = WarningLevel.Error;
