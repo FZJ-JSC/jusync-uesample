@@ -10,6 +10,7 @@ public class JusyncSampleProjectEditorTarget : TargetRules
 		Type = TargetType.Editor;
 		DefaultBuildSettings = BuildSettingsVersion.V6;
 		IncludeOrderVersion = EngineIncludeOrderVersion.Unreal5_7;
+		bOverrideBuildEnvironment = true;
 		CppCompileWarningSettings.UndefinedIdentifierWarningLevel = WarningLevel.Error;
 		ExtraModuleNames.Add("JusyncSampleProject");
 	}
