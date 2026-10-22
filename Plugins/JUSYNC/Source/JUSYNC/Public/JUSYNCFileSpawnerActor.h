@@ -209,6 +209,9 @@ public:
     float PointCloudSize;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|PointCloud")
+    EJUSYNCDisplayMode DisplayMode;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|PointCloud")
     EJUSYNCPointShape PointShape;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|PointCloud")

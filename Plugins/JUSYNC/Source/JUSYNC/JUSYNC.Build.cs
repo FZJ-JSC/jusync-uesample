@@ -30,7 +30,10 @@ public class JUSYNC : ModuleRules
             "GameplayTasks",
             "LidarPointCloudRuntime",
             "ImageWrapper",
-            "Json"
+            "Json",
+            // IPluginManager, used to map the plugin's Shaders directory so
+            // material Custom nodes can #include JUSYNCVolume.ush.
+            "Projects"
         });
 
         // The sample scrubber is a real Slate slider in the actor's Details

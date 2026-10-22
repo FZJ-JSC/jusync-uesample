@@ -6,6 +6,8 @@
 #include "HAL/PlatformFileManager.h"
 #include "HAL/IConsoleManager.h"
 #include "JUSYNCFileSpawnerActor.h"
+#include "Interfaces/IPluginManager.h"
+#include "ShaderCore.h"
 #if WITH_EDITOR
 #include "Editor.h"
 #include "JUSYNCFileSpawnerCustomization.h"
@@ -79,6 +81,7 @@ void FJUSYNCModule::StartupModule() {
                                         "Only basic JUSYNC functionality will be available."));
 #endif
 
+        RegisterShaderDirectory();
         RegisterModuleSystems();
     } catch (const std::exception&) {
         UE_LOG(LogJUSYNC, Error, TEXT("Exception during startup"));
@@ -237,6 +240,25 @@ bool FJUSYNCModule::AttemptLibraryLoad(const FString& FullPath, const FString& L
 void FJUSYNCModule::LogMiddlewareCapabilities() {
     UE_LOG(LogJUSYNC, Log, TEXT("Middleware ready: ZeroMQ, USD (TinyUSDZ), hash verification (OpenSSL), "
                                 "textures (STB), RealtimeMeshComponent integration"));
+}
+
+void FJUSYNCModule::RegisterShaderDirectory() {
+    // Material Custom nodes include /Plugin/JUSYNC/Private/JUSYNCVolume.ush.
+    // Plugin shader directories are not mapped by the engine, only /Engine and
+    // /Project, so the mapping has to be registered before any shader compiles.
+    const FString VirtualDirectory(TEXT("/Plugin/JUSYNC"));
+    if (AllShaderSourceDirectoryMappings().Contains(VirtualDirectory)) {
+        return;
+    }
+
+    const TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("JUSYNC"));
+    if (!Plugin.IsValid()) {
+        UE_LOG(LogJUSYNC, Warning, TEXT("Plugin instance not found, volume shader includes will not resolve"));
+        return;
+    }
+
+    AddShaderSourceDirectoryMapping(VirtualDirectory, FPaths::Combine(Plugin->GetBaseDir(), TEXT("Shaders")));
+    UE_LOG(LogJUSYNC, Log, TEXT("Mapped %s for material shader includes"), *VirtualDirectory);
 }
 
 void FJUSYNCModule::RegisterModuleSystems() {

@@ -591,6 +591,12 @@ private:
     static FDateTime BenchmarkSessionStartTime;
 
 public:
+    // Compiles a material synchronously and returns its errors, or an empty
+    // string on success. The normal asset path is asynchronous and a
+    // commandlet exits before the jobs finish.
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Volume")
+    static FString CompileMaterialNow(const FString& MaterialPath);
+
     static void RecordBenchmarkResult(const FJUSYNCBenchmarkResult& Result);
     static FJUSYNCBenchmarkResult CreateBenchmarkResult(const FString& TestName, float TotalTimeMs, int32 TriangleCount, int32 VertexCount, int64 RAMBefore, int64 RAMAfter, int32 ActorCount, int32 ErrorCount, int32 SplitMeshCount);
     static FJUSYNCBenchmarkResult CreateBenchmarkResultExtended(

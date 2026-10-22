@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "Tickable.h"
 #include "JUSYNCTypes.h"
+#include "JUSYNCVolumeBuilder.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformTime.h"
 #include <atomic>
@@ -12,6 +13,8 @@
 #include "LidarPointCloud.h"
 #include "LidarPointCloudComponent.h"
 #endif
+
+class FJUSYNCVolumeManager;
 
 DECLARE_MULTICAST_DELEGATE_TwoParams(FOnPointCloudSpawned, const FString&, AActor*);
 
@@ -72,6 +75,10 @@ public:
     void SetBudgetMs(float InBudget) { BudgetMs = InBudget; }
     void SetSpawnLocation(const FVector& In);
     void SetSpawnScale(float In) { SpawnScale = In; }
+
+    void SetDisplayMode(EJUSYNCDisplayMode InMode);
+    EJUSYNCDisplayMode GetDisplayMode() const { return DisplayMode; }
+    FJUSYNCVolumeManager* GetVolumeManager() const { return VolumeManager.Get(); }
 
     /** Re-applies the current SpawnLocation/SpawnScale to every active point
      *  cloud actor. Used when the FitVolume transform changes after actors have
@@ -146,6 +153,8 @@ private:
     float GapFillingStrength = 0.0f;
     bool bPerfLogging = false;
     bool bPlaybackMode = false;
+    TUniquePtr<FJUSYNCVolumeManager> VolumeManager;
+    EJUSYNCDisplayMode DisplayMode = EJUSYNCDisplayMode::Points;
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     ELidarPointCloudSpriteShape PointShape = ELidarPointCloudSpriteShape::Circle;
     ELidarPointCloudSpriteOrientation PointOrientation = ELidarPointCloudSpriteOrientation::PreferFacingCamera;
@@ -181,9 +190,8 @@ private:
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     struct FInFlightCloudBuild
     {
-        // Heap points read by the Epic async build thread; freed on completion.
-
-        TArray64<FLidarPointCloudPoint>* Points = nullptr;
+        // Shared with the voxelizer worker, which outlives this build.
+        FJUSYNCPointArrayPtr Points;
         TUniquePtr<TStrongObjectPtr<UObject>> CloudRef;
         TWeakObjectPtr<AActor> Actor;
         FPointCloudReadyEntry PendingReplacement;
@@ -200,7 +208,7 @@ private:
         bool bChainAborted = false;
         TArray<FVector3f> RampPos;
 
-        ~FInFlightCloudBuild() { delete Points; Points = nullptr; }
+        ~FInFlightCloudBuild() { Points.Reset(); }
     };
     TMap<FString, TSharedRef<FInFlightCloudBuild>> InFlightBuilds;
     uint64 NextCloudBuildGeneration = 0;

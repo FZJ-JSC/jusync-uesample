@@ -1,0 +1,41 @@
+// Helpers for the JUSYNC volume raymarch material. Included by a Custom node,
+// whose own code is emitted inside a function body, so these have to stay at
+// file scope and out of the node's HLSL.
+#pragma once
+
+// Value noise in [0,1].
+float VHash(float3 p)
+{
+	p = frac(p * float3(0.1031, 0.1030, 0.0973));
+	p += dot(p, p.yzx + 33.33);
+	return frac((p.x + p.y) * p.z);
+}
+
+float VNoise(float3 p)
+{
+	float3 i = floor(p);
+	float3 f = frac(p);
+	f = f * f * (3.0 - 2.0 * f);
+
+	float n000 = VHash(i + float3(0.0, 0.0, 0.0));
+	float n100 = VHash(i + float3(1.0, 0.0, 0.0));
+	float n010 = VHash(i + float3(0.0, 1.0, 0.0));
+	float n110 = VHash(i + float3(1.0, 1.0, 0.0));
+	float n001 = VHash(i + float3(0.0, 0.0, 1.0));
+	float n101 = VHash(i + float3(1.0, 0.0, 1.0));
+	float n011 = VHash(i + float3(0.0, 1.0, 1.0));
+	float n111 = VHash(i + float3(1.0, 1.0, 1.0));
+
+	return lerp(
+		lerp(lerp(n000, n100, f.x), lerp(n010, n110, f.x), f.y),
+		lerp(lerp(n001, n101, f.x), lerp(n011, n111, f.x), f.y),
+		f.z);
+}
+
+// One volume fetch: rgb is the point colour carried by the payload, a is the
+// normalized density. The Custom node cannot declare helper functions, so the
+// raymarch's samples come through here with the node's texture inputs passed in.
+float4 VSamp(Texture3D Volume, SamplerState VolumeSampler, float3 uvw)
+{
+	return Texture3DSampleLevel(Volume, VolumeSampler, uvw, 0);
+}

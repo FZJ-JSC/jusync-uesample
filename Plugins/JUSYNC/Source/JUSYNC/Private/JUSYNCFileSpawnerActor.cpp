@@ -376,6 +376,7 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     bUseGradientColors = true;
     GradientPngFilename = TEXT("");
     PointCloudSize = 0.04f;
+    DisplayMode = EJUSYNCDisplayMode::Points;
     PointShape = EJUSYNCPointShape::Square;
     PointOrientation = EJUSYNCPointOrientation::FacingCamera;
     PointScaling = EJUSYNCPointScaling::PerNodeAdaptive;
@@ -1093,9 +1094,15 @@ void AJUSYNCFileSpawnerActor::AccumulateFitBounds(const FBox& B)
     {
         return;
     }
+
+    // FBox does not order its corners, so a negative component scale (or a caller
+    // that converts the pair wrongly) yields Min > Max, passes IsValid, and makes
+    // the fit divide by a negative extent.
+    const FBox Ordered(FVector::Min(B.Min, B.Max), FVector::Max(B.Min, B.Max));
+
     if (!bHasFitUnionBounds)
     {
-        FitUnionBounds = B;
+        FitUnionBounds = Ordered;
         bHasFitUnionBounds = true;
         bFitUnionGrew = true;
         return;
@@ -1105,15 +1112,15 @@ void AJUSYNCFileSpawnerActor::AccumulateFitBounds(const FBox& B)
     // more than 2%. Keeps per-frame float noise from rescaling a whole series.
     const FVector Slack = FitUnionBounds.GetSize() * 0.02f;
     const bool bOutside =
-        B.Min.X < FitUnionBounds.Min.X - Slack.X ||
-        B.Min.Y < FitUnionBounds.Min.Y - Slack.Y ||
-        B.Min.Z < FitUnionBounds.Min.Z - Slack.Z ||
-        B.Max.X > FitUnionBounds.Max.X + Slack.X ||
-        B.Max.Y > FitUnionBounds.Max.Y + Slack.Y ||
-        B.Max.Z > FitUnionBounds.Max.Z + Slack.Z;
+        Ordered.Min.X < FitUnionBounds.Min.X - Slack.X ||
+        Ordered.Min.Y < FitUnionBounds.Min.Y - Slack.Y ||
+        Ordered.Min.Z < FitUnionBounds.Min.Z - Slack.Z ||
+        Ordered.Max.X > FitUnionBounds.Max.X + Slack.X ||
+        Ordered.Max.Y > FitUnionBounds.Max.Y + Slack.Y ||
+        Ordered.Max.Z > FitUnionBounds.Max.Z + Slack.Z;
     if (bOutside)
     {
-        FitUnionBounds += B;
+        FitUnionBounds += Ordered;
         bFitUnionGrew = true;
     }
 
@@ -3074,6 +3081,7 @@ void AJUSYNCFileSpawnerActor::ApplyPointCloudSettingsToSpawner(FJUSYNCPointCloud
     }
 
     Spawner->SetMaxPoolSize(PointCloudPoolSize);
+    Spawner->SetDisplayMode(DisplayMode);
     Spawner->SetPointSize(PointCloudSize);
     Spawner->SetPointSizeBias(PointSizeBias);
     Spawner->SetGapFillingStrength(GapFillingStrength);

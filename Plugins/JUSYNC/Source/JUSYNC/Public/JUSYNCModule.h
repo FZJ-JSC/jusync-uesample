@@ -22,6 +22,7 @@ private:
     void LogMiddlewareCapabilities();
     void RegisterModuleSystems();
     void UnregisterModuleSystems();
+    void RegisterShaderDirectory();
     void CleanupPlatformSpecific();
 
     bool bPlaybackDetailsRegistered = false;

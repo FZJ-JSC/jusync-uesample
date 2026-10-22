@@ -10,9 +10,18 @@
 #include "RealtimeMeshComponent.h"
 #include "Engine/GameInstance.h"
 #include "Misc/FileHelper.h"
+#include "Misc/PackageName.h"
 #include "Misc/Paths.h"
 #include "HAL/PlatformTime.h"
 #include "HAL/PlatformProcess.h"
+
+#if WITH_EDITOR
+#include "Misc/App.h"
+#include "RHI.h"
+#include "MaterialShared.h"
+#include "Materials/MaterialInterface.h"
+#include "ShaderCompiler.h"
+#endif
 
 #if PLATFORM_WINDOWS
 #include "Windows/AllowWindowsPlatformTypes.h"
@@ -4494,4 +4503,82 @@ void UJUSYNCBlueprintLibrary::RequestFileAsyncDynamic(
                     }
                 });
         });
+}
+FString UJUSYNCBlueprintLibrary::CompileMaterialNow(const FString& MaterialPath)
+{
+#if WITH_EDITOR
+    if (!FApp::CanEverRender())
+    {
+        // CacheResourceShadersForRendering is a no-op without a renderer, so a
+        // commandlet can never produce a shader map.
+        return TEXT("Renderer not initialized, run this from the editor");
+    }
+
+    FString ObjectPath = MaterialPath;
+    if (!ObjectPath.Contains(TEXT(".")))
+    {
+        ObjectPath += TEXT(".") + FPackageName::GetShortName(MaterialPath);
+    }
+
+    UMaterialInterface* Material = LoadObject<UMaterialInterface>(nullptr, *ObjectPath);
+    if (!Material)
+    {
+        return FString::Printf(TEXT("Material not found: %s"), *ObjectPath);
+    }
+
+    Material->ForceRecompileForRendering();
+    if (GShaderCompilingManager)
+    {
+        GShaderCompilingManager->FinishAllCompilation();
+    }
+
+    // The max shader platform and the level the material actually cached for
+    // differ in a headless editor, so scan the levels for a compiled resource.
+    const FMaterialResource* Resource = nullptr;
+    const FMaterialResource* AnyResource = nullptr;
+    for (int32 Level = 0; Level < ERHIFeatureLevel::Num; ++Level)
+    {
+        const FMaterialResource* Candidate =
+            Material->GetMaterialResource(GetFeatureLevelShaderPlatform((ERHIFeatureLevel::Type)Level));
+        if (!Candidate)
+        {
+            continue;
+        }
+
+        if (!AnyResource)
+        {
+            AnyResource = Candidate;
+        }
+
+        if (Candidate->GetGameThreadShaderMap())
+        {
+            Resource = Candidate;
+            UE_LOG(LogJUSYNC, Display, TEXT("[CompileMaterialNow] compiled at feature level %d"), Level);
+            break;
+        }
+    }
+
+    if (!Resource)
+    {
+        Resource = AnyResource;
+    }
+
+    if (!Resource)
+    {
+        return TEXT("No material resource for any feature level");
+    }
+
+    TArray<FString> Errors = Resource->GetCompileErrors();
+    if (!Resource->GetGameThreadShaderMap() && Errors.Num() == 0)
+    {
+        Errors.Add(TEXT("Shader map is empty, see LogShaderCompilers output"));
+    }
+
+    const FString Result = FString::Join(Errors, TEXT("\n"));
+    UE_LOG(LogJUSYNC, Display, TEXT("[CompileMaterialNow] %s -> %s"), *ObjectPath,
+        Result.IsEmpty() ? TEXT("ok") : *Result);
+    return Result;
+#else
+    return TEXT("Material compilation check requires an editor build");
+#endif
 }

@@ -5,6 +5,7 @@
 #include "Async/ParallelFor.h"
 #include "HAL/PlatformTime.h"
 #include "JUSYNCElementNames.h"
+#include "JUSYNCVolumeManager.h"
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
 #include "LidarPointCloud.h"
@@ -115,11 +116,16 @@ FJUSYNCPointCloudSpawner::FJUSYNCPointCloudSpawner(TWeakObjectPtr<UObject> InOwn
     : Owner(InOwner), MaxPoolSize(8), SpawnLocation(FVector::ZeroVector),
       SpawnScale(1.0f), BudgetMs(16.0f)
 {
+    if (UObject* OwnerObject = Owner.Get())
+    {
+        VolumeManager = MakeUnique<FJUSYNCVolumeManager>(OwnerObject->GetWorld());
+    }
 }
 
 FJUSYNCPointCloudSpawner::~FJUSYNCPointCloudSpawner()
 {
     AsyncBuildsAlive->store(false);
+    VolumeManager.Reset();
 }
 
 bool FJUSYNCPointCloudSpawner::BeginTask()
@@ -140,6 +146,10 @@ void FJUSYNCPointCloudSpawner::EndTask()
 void FJUSYNCPointCloudSpawner::WaitForCompletion(float TimeoutSeconds)
 {
     bShuttingDown.store(true);
+    if (VolumeManager.IsValid())
+    {
+        VolumeManager->WaitForCompletion(TimeoutSeconds);
+    }
     const double Start = FPlatformTime::Seconds();
     while ((InFlightTasks.load() > 0 || AsyncBuildsOutstanding->load() > 0)
         && (FPlatformTime::Seconds() - Start) < FMath::Max(0.0f, TimeoutSeconds))
@@ -701,7 +711,7 @@ void FJUSYNCPointCloudSpawner::StartAsyncCloudBuild(const FString& Key, FPointCl
     }
 
     F->Actor = Actor;
-    F->Points = new TArray64<FLidarPointCloudPoint>(MoveTemp(Entry.Points));
+    F->Points = MakeShared<FJUSYNCPointArray, ESPMode::ThreadSafe>(MoveTemp(Entry.Points));
     F->Generation = ++NextCloudBuildGeneration;
     F->bBuilding = true;
     F->BuildStarted = FPlatformTime::Seconds();
@@ -743,6 +753,14 @@ void FJUSYNCPointCloudSpawner::StartAsyncCloudBuild(const FString& Key, FPointCl
 
     AsyncBuildsOutstanding->fetch_add(1);
     JUSYNCPadDegenerateBounds(*F->Points);
+
+    if (VolumeManager.IsValid() && DisplayMode != EJUSYNCDisplayMode::Points
+        && (!bChainStep || bChainFinal))
+    {
+        VolumeManager->Submit(Key, Entry.ElementName, F->Points,
+                              FVector(SpawnScale), SpawnLocation);
+    }
+
     ULidarPointCloud* NewCloud = ULidarPointCloud::CreateFromData(*F->Points, Params);
     // GT-only strong ref: keeps the asset GC-safe while the worker fills it.
 
@@ -761,8 +779,7 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
         const double BuildMs = (FPlatformTime::Seconds() - F.BuildStarted) * 1000.0;
         const double NowSeconds = FPlatformTime::Seconds();
 
-        delete F.Points;
-        F.Points = nullptr;
+        F.Points.Reset();
 
         F.bDeferred = false;
 
@@ -1409,6 +1426,8 @@ void FJUSYNCPointCloudSpawner::ApplyVisualSettings(ULidarPointCloudComponent* Co
         return;
     }
 
+    Comp->SetVisibility(DisplayMode != EJUSYNCDisplayMode::Volume, true);
+
     Comp->PointSize = FMath::Max(0.0f, PointSize);
     Comp->PointSizeBias = FMath::Clamp(PointSizeBias, 0.0f, 0.15f);
     Comp->GapFillingStrength = FMath::Max(0.0f, GapFillingStrength);
@@ -1738,6 +1757,26 @@ void FJUSYNCPointCloudSpawner::ReleaseActor(AActor* Actor)
     AvailablePool.Add(Actor);
 }
 
+void FJUSYNCPointCloudSpawner::SetDisplayMode(EJUSYNCDisplayMode InMode)
+{
+    if (DisplayMode == InMode)
+    {
+        return;
+    }
+
+    DisplayMode = InMode;
+
+    for (AActor* Actor : ActiveActors)
+    {
+        ApplyVisualSettingsToActor(Actor);
+    }
+
+    if (DisplayMode == EJUSYNCDisplayMode::Points && VolumeManager.IsValid())
+    {
+        VolumeManager->ClearAll();
+    }
+}
+
 void FJUSYNCPointCloudSpawner::SetSpawnLocation(const FVector& In)
 {
     SpawnLocation = In;
@@ -1772,6 +1811,10 @@ void FJUSYNCPointCloudSpawner::Tick(float DeltaTime)
     if (!Owner.IsValid()) return;
     FlushExpiredNoColorClouds();
     DrainReadyQueue();
+    if (VolumeManager.IsValid())
+    {
+        VolumeManager->Tick();
+    }
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     const double NowSeconds = FPlatformTime::Seconds();
     TickCloudRamps(NowSeconds);
@@ -2042,6 +2085,10 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
 
 void FJUSYNCPointCloudSpawner::ClearAllActors()
 {
+    if (VolumeManager.IsValid())
+    {
+        VolumeManager->ClearAll();
+    }
     for (AActor* Actor : ActiveActors)
     {
         ReleaseActor(Actor);
@@ -2051,6 +2098,10 @@ void FJUSYNCPointCloudSpawner::ClearAllActors()
 
 void FJUSYNCPointCloudSpawner::DestroyAllActors()
 {
+    if (VolumeManager.IsValid())
+    {
+        VolumeManager->ClearAll();
+    }
     {
         FScopeLock Lock(&QueueMutex);
         ReadyQueue.Empty();

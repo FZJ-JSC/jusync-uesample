@@ -8,6 +8,14 @@
 class UProceduralMeshComponent;
 class URealtimeMeshComponent;
 
+UENUM(BlueprintType)
+enum class EJUSYNCDisplayMode : uint8
+{
+    Points  UMETA(DisplayName = "Points"),
+    Volume  UMETA(DisplayName = "Volume"),
+    Both    UMETA(DisplayName = "Both")
+};
+
 USTRUCT(BlueprintType)
 struct JUSYNC_API FJUSYNCFileData
 {
