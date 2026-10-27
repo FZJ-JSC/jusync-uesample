@@ -18,6 +18,8 @@ class URealtimeMeshComponent;
 class UMaterialInterface;
 class UMaterialInstanceDynamic;
 class UBoxComponent;
+class UNiagaraComponent;
+class UNiagaraSystem;
 struct FJUSYNCParsedFileResult;
 
 UENUM(BlueprintType)
@@ -273,9 +275,14 @@ public:
         meta = (EditCondition = "bEnablePathlines", EditConditionHides, ClampMin = "1", ClampMax = "512"))
     int32 PathlineTrackExpirySamples;
 
+    /**
+     * Niagara system that draws the trails as ribbons (NS_JusyncStreamlines).
+     * When null the CPU track store still ingests - scrubbing and picking stay
+     * valid - but nothing is drawn.
+     */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
-        meta = (EditCondition = "bEnablePathlines", EditConditionHides, ClampMin = "3", ClampMax = "16"))
-    int32 PathlineTubeSides;
+        meta = (EditCondition = "bEnablePathlines", EditConditionHides))
+    TSoftObjectPtr<UNiagaraSystem> PathlineNiagaraSystem;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
         meta = (EditCondition = "bEnablePathlines", EditConditionHides, ClampMin = "0.001"))
@@ -810,6 +817,9 @@ private:
     TMap<FString, uint64> FileHashLo;
     TMap<FString, uint64> FileHashHi;
     TMap<FString, int64> FileLastSize;
+    /** Sizes actually applied to actors (not merely polled). Only consulted when the
+     *  middleware apply-check is unavailable; empty means "never dedup by size". */
+    TMap<FString, int64> AppliedFileSizes;
     double LastCommitCompleteTime;
     bool bSceneDiffInFlight;
     // A commit-complete arrived while file changes were still in flight (or a
@@ -893,8 +903,15 @@ private:
     // synthetic 1/2/3 counter.
     TMap<uint64, double> SampleTimeById;
 
-    // Game-thread owner of the pathline state/worker and its actor uploads.
+    // Game-thread owner of the pathline state/worker.
     TSharedPtr<FJUSYNCPathlineManager> PathlineManager;
+
+    // One Niagara component per canonical element. The spawner owns the GPU
+    // side: the manager only produces plain ribbon arrays.
+    UPROPERTY(Transient)
+    TMap<FString, TObjectPtr<UNiagaraComponent>> PathlineComponents;
+
+    bool bPathlineSystemWarned = false;
 
     // Live sample identity is assigned per commit/frame, not per notification:
     // all files that arrive between two CommitComplete messages share one id,
@@ -913,6 +930,15 @@ private:
     void RebuildPathlinesFromSampleCache();
     FJUSYNCPathlineSettings BuildPathlineSettings() const;
     void SyncPathlineManager();
+
+    /** Drains finished ribbon arrays and pushes them into Niagara. */
+    void SyncPathlineComponents();
+
+    /** Destroys the component for one element (and its renderer state). */
+    void DestroyPathlineComponent(const FString& ElementName);
+
+    /** Destroys every streamline component. */
+    void DestroyAllPathlineComponents();
 
     /** Runtime VertexColor -> BaseColor+Emissive material so baked trail
         colours survive without scene lighting (editor builds only). */

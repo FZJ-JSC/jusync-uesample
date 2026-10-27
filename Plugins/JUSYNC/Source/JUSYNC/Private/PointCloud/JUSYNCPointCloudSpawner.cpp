@@ -404,6 +404,16 @@ bool FJUSYNCPointCloudSpawner::IsElementFiltered(const FString& ElementName) con
     return false;
 }
 
+bool FJUSYNCPointCloudSpawner::HasAppliedFileHash(const FString& Filename, uint64 HashLo, uint64 HashHi) const
+{
+    if (Filename.IsEmpty())
+    {
+        return false;
+    }
+    const TPair<uint64, uint64>* Entry = AppliedFileHashes.Find(Filename);
+    return Entry && Entry->Key == HashLo && Entry->Value == HashHi;
+}
+
 bool FJUSYNCPointCloudSpawner::EnqueuePointCloud(FJUSYNCPointCloudData&& PCData, int32 InRank, bool bAllowNoGradient)
 {
     if (!PCData.IsValid() || !Owner.IsValid() || bShuttingDown.load()) return false;

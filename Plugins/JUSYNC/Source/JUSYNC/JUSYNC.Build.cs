@@ -30,7 +30,11 @@ public class JUSYNC : ModuleRules
             "GameplayTasks",
             "LidarPointCloudRuntime",
             "ImageWrapper",
-            "Json"
+            "Json",
+            // Streamline trails are drawn by Niagara ribbons; the CPU track
+            // store stays the source of truth, Niagara is only the renderer.
+            "Niagara",
+            "NiagaraCore"
         });
 
         // The sample scrubber is a real Slate slider in the actor's Details

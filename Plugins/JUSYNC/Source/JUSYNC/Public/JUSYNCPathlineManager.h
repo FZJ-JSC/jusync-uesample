@@ -2,10 +2,10 @@
 
 #include "CoreMinimal.h"
 #include "JUSYNCTypes.h"
+#include "UObject/SoftObjectPtr.h"
 
 class UMaterialInterface;
-class UWorld;
-class FJUSYNCPointCloudSpawner;
+class UNiagaraSystem;
 
 /**
  * User-facing pathline controls. These mirror the details panel controls on
@@ -21,7 +21,13 @@ struct JUSYNC_API FJUSYNCPathlineSettings
 	// A track that is not present in N consecutive emitted samples is removed.
 	int32 TrackExpirySamples = 32;
 
-	int32 TubeSides = 4;
+	/**
+	 * Niagara system that draws the trails as ribbons. When null nothing is
+	 * drawn; the CPU track store still ingests so picking and scrubbing stay
+	 * valid.
+	 */
+	TSoftObjectPtr<UNiagaraSystem> NiagaraSystem;
+
 	float Radius = 0.5f;
 	float RadiusScale = 1.0f;
 	bool bUsePointWidth = false;
@@ -65,11 +71,52 @@ struct JUSYNC_API FJUSYNCPathlineStats
 };
 
 /**
- * CPU pathline store and mesh builder.
+ * Ribbon particle data for one element, ready to be pushed into Niagara.
+ *
+ * Every array has the same length: one entry per emitted ribbon point. The
+ * ribbon renderer joins the points of one element in LinkOrder sequence, so a
+ * single track that breaks into several runs is emitted as one polyline with
+ * zero-width duplicate points bridging the gaps.
+ *
+ * Plain data only (no UObjects): built on the worker thread, consumed on the
+ * game thread.
+ */
+struct JUSYNC_API FJUSYNCPathlineArrays
+{
+	TArray<FVector> Positions;
+	TArray<float> LinkOrders;
+	TArray<float> Widths;
+	TArray<FLinearColor> Colors;
+	/** Normalised 0-1 scalar per point, for materials that sample a LUT. */
+	TArray<float> Scalars;
+
+	int32 Num() const { return Positions.Num(); }
+
+	void Reset()
+	{
+		Positions.Reset();
+		LinkOrders.Reset();
+		Widths.Reset();
+		Colors.Reset();
+		Scalars.Reset();
+	}
+
+	void Reserve(int32 Count)
+	{
+		Positions.Reserve(Count);
+		LinkOrders.Reserve(Count);
+		Widths.Reserve(Count);
+		Colors.Reserve(Count);
+		Scalars.Reserve(Count);
+	}
+};
+
+/**
+ * CPU pathline store and ribbon array builder.
  *
  * Ingestion and geometry construction run on a serialized background worker.
- * The game thread only applies finished meshes (see PumpGameThread). Tests can
- * use IngestSampleNow/BuildGeometry directly without starting the worker.
+ * The game thread only uploads finished arrays (see DrainArrays). Tests can
+ * use IngestSampleNow/BuildArrays directly without starting the worker.
  *
  * Threading contract: the point-cloud and LUT arguments are copied into the
  * work item. FJUSYNCPointCloudData is treated as immutable after enqueue.
@@ -93,7 +140,7 @@ public:
 	void Reset();
 
 	// Drops all retained state for one canonical element. Called when the last
-	// point-cloud rank for that element is retired; PumpGameThread removes the
+	// point-cloud rank for that element is retired; the spawner removes the
 	// matching actor on its next pass.
 	void RemoveElement(const FString& ElementName);
 
@@ -102,10 +149,10 @@ public:
 	void IngestSampleNow(const FString& ElementName, const FJUSYNCPointCloudRef& Cloud,
 		int32 Rank, uint64 SampleId, const TArray<FColor>& Lut);
 
-	// Builds geometry for one canonical element at a sample cutoff.
+	// Builds ribbon arrays for one canonical element at a sample cutoff.
 	// MAX_uint64 means "live". Returns false when the element has no state.
-	bool BuildGeometry(const FString& ElementName, uint64 CutoffSampleId,
-		FJUSYNCCompactMeshData& OutMesh, int32& OutVisibleTracks);
+	bool BuildArrays(const FString& ElementName, uint64 CutoffSampleId,
+		FJUSYNCPathlineArrays& OutArrays, int32& OutVisibleTracks);
 
 	void SetDisplaySampleId(uint64 SampleId);
 	uint64 GetDisplaySampleId() const;
@@ -113,10 +160,19 @@ public:
 	// Queue a rebuild from retained state (playback scrub or visual change).
 	void RequestRebuild();
 
-	// Drains worker results and uploads them to pathline actors through the
-	// spawner. The manager never touches UObjects off the game thread.
-	void PumpGameThread(UWorld* World, FJUSYNCPointCloudSpawner* Spawner,
-		UMaterialInterface* Material);
+	/**
+	 * One finished array set, handed to the game thread for upload. Purely
+	 * data: the manager never touches UObjects, the caller owns the Niagara
+	 * components.
+	 */
+	struct FCompletedArrays
+	{
+		FString ElementName;
+		TSharedPtr<FJUSYNCPathlineArrays, ESPMode::ThreadSafe> Arrays;
+	};
+
+	/** Drains arrays finished by the worker since the last call. */
+	void DrainArrays(TArray<FCompletedArrays>& OutArrays);
 
 	FJUSYNCPathlineStats GetStats() const;
 

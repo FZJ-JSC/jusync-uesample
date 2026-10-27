@@ -44,6 +44,28 @@ void FJUSYNCAnimationController::ShowAll()
     }
 }
 
+void FJUSYNCAnimationController::MarkActorLive(AActor* Actor)
+{
+    if (Actor)
+    {
+        LiveActors.Add(Actor);
+    }
+}
+
+void FJUSYNCAnimationController::UnmarkActorLive(AActor* Actor)
+{
+    LiveActors.Remove(Actor);
+}
+
+bool FJUSYNCAnimationController::IsActorLive(const AActor* Actor) const
+{
+    if (!Actor)
+    {
+        return false;
+    }
+    return LiveActors.Contains(const_cast<AActor*>(Actor));
+}
+
 void FJUSYNCAnimationController::AddActor(const FString& Filename, AActor* Actor, const FString& InElementName)
 {
     if (!Actor)
@@ -90,6 +112,8 @@ void FJUSYNCAnimationController::RemoveActor(AActor* Actor)
         return;
     }
 
+    LiveActors.Remove(Actor);
+
     if (FActorSlot* Slot = ActorSlots.Find(Actor))
     {
         FTimeStep* Step = TimeSteps.Find(Slot->Order);
@@ -124,6 +148,7 @@ void FJUSYNCAnimationController::Clear()
     TimeSteps.Empty();
     SortedOrders.Empty();
     ActorSlots.Empty();
+    LiveActors.Empty();
     NextSeq = 0;
     CurrentIndex = 0;
     Accumulator = 0.0f;
@@ -304,6 +329,10 @@ void FJUSYNCAnimationController::ApplyVisibility()
         {
             if (Pair.Key && Pair.Key->IsValidLowLevel())
             {
+                if (IsActorLive(Pair.Key))
+                {
+                    continue;
+                }
                 Pair.Key->SetActorHiddenInGame(!Winners.Contains(Pair.Key));
             }
         }
@@ -318,6 +347,14 @@ void FJUSYNCAnimationController::ApplyVisibility()
     {
         if (Pair.Key && Pair.Key->IsValidLowLevel())
         {
+            if (IsActorLive(Pair.Key))
+            {
+                // Live streams own their visibility (the point cloud spawner
+                // hides/shows them from bPointCloudsHidden); the election would
+                // hide the newest cloud as soon as CurrentOrder moves past the
+                // order its slot was registered with.
+                continue;
+            }
             const bool bVisible = (Pair.Value.Order == CurrentOrder) && Winners.Contains(Pair.Key);
             Pair.Key->SetActorHiddenInGame(!bVisible);
         }

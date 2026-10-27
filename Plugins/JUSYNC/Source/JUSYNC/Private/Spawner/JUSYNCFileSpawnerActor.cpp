@@ -1,4 +1,4 @@
-#include "JUSYNCFileSpawnerActor.h"
+﻿#include "JUSYNCFileSpawnerActor.h"
 #include <atomic>
 #include "JUSYNCSubsystem.h"
 #include "RawGeo/JUSYNCRawGeoCurves.h"
@@ -21,6 +21,9 @@
 #include "Serialization/JsonSerializer.h"
 #include "TimerManager.h"
 #include "Components/BoxComponent.h"
+#include "NiagaraComponent.h"
+#include "NiagaraDataInterfaceArrayFunctionLibrary.h"
+#include "NiagaraSystem.h"
 
 #if !WITH_ANARI_USD_MIDDLEWARE
 extern "C"
@@ -111,9 +114,9 @@ static TAutoConsoleVariable<float> CVarJusyncPathlineRadius(
 
 static TAutoConsoleVariable<int32> CVarJusyncPathlineTubeSides(
     TEXT("jusync.Pathlines.TubeSides"), 8,
-    TEXT("Overrides PathlineTubeSides on every spawner when >= 3. The\n")
-    TEXT("4-sided default reads as a bent square; 8 looks cylindrical at\n")
-    TEXT("trail radii. 0 = use the spawner's details-panel value."),
+    TEXT("Legacy: trail geometry is now tessellated on the GPU by the Niagara\n")
+    TEXT("ribbon renderer, so tube sides no longer change the geometry. Kept so\n")
+    TEXT("the in-game pathline panel's SIDES control stays harmless."),
     ECVF_Default);
 
 // Rolling clip streams delete a timestep's clip file one commit before the
@@ -614,7 +617,7 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     PathlineHistorySamples = 128;
     PathlineMaxNodes = 524288;
     PathlineTrackExpirySamples = 64;
-    PathlineTubeSides = 4;
+    PathlineNiagaraSystem = nullptr;
     PathlineRadius = 0.02f;
     PathlineRadiusScale = 1.0f;
     bPathlineUsePointWidth = false;
@@ -1197,11 +1200,7 @@ FJUSYNCPathlineSettings AJUSYNCFileSpawnerActor::BuildPathlineSettings() const
         Settings.MaxNodes = NodeCap;
     }
     Settings.TrackExpirySamples = FMath::Max(0, PathlineTrackExpirySamples);
-    Settings.TubeSides = FMath::Clamp(PathlineTubeSides, 3, 16);
-    if (const int32 SidesOverride = CVarJusyncPathlineTubeSides.GetValueOnGameThread(); SidesOverride >= 3)
-    {
-        Settings.TubeSides = FMath::Clamp(SidesOverride, 3, 16);
-    }
+    Settings.NiagaraSystem = PathlineNiagaraSystem;
     Settings.Radius = FMath::Max(0.001f, PathlineRadius);
     if (const float RadiusOverride = CVarJusyncPathlineRadius.GetValueOnGameThread(); RadiusOverride > 0.0f)
     {
@@ -1226,6 +1225,175 @@ FJUSYNCPathlineSettings AJUSYNCFileSpawnerActor::BuildPathlineSettings() const
     Settings.Material = PathlineMaterial;
     return Settings;
 }
+
+namespace
+{
+	// Mirrors the user parameters of the assigned Niagara system. Renaming a
+	// parameter on either side means renaming it on the other.
+	const FName GStreamlinePositions(TEXT("User.Positions"));
+	const FName GStreamlineLinkOrders(TEXT("User.LinkOrders"));
+	const FName GStreamlineWidths(TEXT("User.Widths"));
+	const FName GStreamlineColors(TEXT("User.Colors"));
+	const FName GStreamlineScalars(TEXT("User.Scalars"));
+	const FName GStreamlineSpawnCount(TEXT("User.SpawnCount"));
+
+	/** Uploads one element's ribbon arrays and restarts the spawn. */
+	void PushStreamlineArrays(UNiagaraComponent* Component, const FJUSYNCPathlineArrays& Arrays)
+	{
+		// Ribbons are culled by particle bounds, and world-space trails are far
+		// larger than the default heuristic assumes: pin fixed bounds so they
+		// cannot disappear at an awkward camera angle.
+		FBox Bounds(ForceInit);
+		for (const FVector& Position : Arrays.Positions)
+		{
+			Bounds += Position;
+		}
+		if (Bounds.IsValid)
+		{
+			const double Extent = Bounds.GetExtent().GetMax();
+			Component->SetSystemFixedBounds(
+				Bounds.ExpandBy(FMath::Max(1.0, Extent * 0.1)));
+		}
+
+		UNiagaraDataInterfaceArrayFunctionLibrary::SetNiagaraArrayPosition(
+			Component, GStreamlinePositions, Arrays.Positions);
+		UNiagaraDataInterfaceArrayFunctionLibrary::SetNiagaraArrayFloat(
+			Component, GStreamlineLinkOrders, Arrays.LinkOrders);
+		UNiagaraDataInterfaceArrayFunctionLibrary::SetNiagaraArrayFloat(
+			Component, GStreamlineWidths, Arrays.Widths);
+		UNiagaraDataInterfaceArrayFunctionLibrary::SetNiagaraArrayFloat(
+			Component, GStreamlineScalars, Arrays.Scalars);
+		UNiagaraDataInterfaceArrayFunctionLibrary::SetNiagaraArrayColor(
+			Component, GStreamlineColors, Arrays.Colors);
+
+		// The burst count is a user parameter, so the arrays must be in place
+		// before the system re-runs its spawn.
+		Component->SetVariableInt(GStreamlineSpawnCount, Arrays.Num());
+		Component->ReinitializeSystem();
+		Component->Activate(false);
+	}
+}
+
+void AJUSYNCFileSpawnerActor::DestroyPathlineComponent(const FString& ElementName)
+{
+	if (TObjectPtr<UNiagaraComponent>* Found = PathlineComponents.Find(ElementName))
+	{
+		if (UNiagaraComponent* Component = Found->Get())
+		{
+			Component->Deactivate();
+			Component->DestroyComponent();
+		}
+		PathlineComponents.Remove(ElementName);
+	}
+}
+
+void AJUSYNCFileSpawnerActor::DestroyAllPathlineComponents()
+{
+	for (TPair<FString, TObjectPtr<UNiagaraComponent>>& Pair : PathlineComponents)
+	{
+		if (UNiagaraComponent* Component = Pair.Value.Get())
+		{
+			Component->Deactivate();
+			Component->DestroyComponent();
+		}
+	}
+	PathlineComponents.Empty();
+}
+
+void AJUSYNCFileSpawnerActor::SyncPathlineComponents()
+{
+	if (!bEnablePathlines || !PathlineManager)
+	{
+		DestroyAllPathlineComponents();
+		return;
+	}
+
+	TArray<FJUSYNCPathlineManager::FCompletedArrays> Completed;
+	PathlineManager->DrainArrays(Completed);
+
+	UNiagaraSystem* System = PathlineNiagaraSystem.LoadSynchronous();
+	if (!System && !bPathlineSystemWarned)
+	{
+		bPathlineSystemWarned = true;
+		if (Completed.Num() > 0)
+		{
+			UE_LOG(LogTemp, Warning,
+				TEXT("[Spawner] bEnablePathlines is on but PathlineNiagaraSystem is unset - ")
+				TEXT("trails are not drawn. Assign NS_JusyncStreamlines."));
+		}
+	}
+
+	// Prune components whose element was retired (RemoveElement / Reset).
+	const TSet<FString> LiveElements(PathlineManager->GetElementKeys());
+	for (auto It = PathlineComponents.CreateIterator(); It; ++It)
+	{
+		UNiagaraComponent* Component = It.Value().Get();
+		if (!Component || !LiveElements.Contains(It.Key()))
+		{
+			if (Component)
+			{
+				Component->Deactivate();
+				Component->DestroyComponent();
+			}
+			It.RemoveCurrent();
+		}
+	}
+
+	if (Completed.Num() == 0)
+	{
+		return;
+	}
+
+	UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
+	FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr;
+	const FVector PathlineSpawnLocation = PCSpawner ? PCSpawner->GetSpawnLocation() : FVector::ZeroVector;
+	const float PathlineSpawnScale = PCSpawner ? PCSpawner->GetSpawnScale() : 1.0f;
+
+	for (const FJUSYNCPathlineManager::FCompletedArrays& Result : Completed)
+	{
+		if (!Result.Arrays.IsValid())
+		{
+			continue;
+		}
+
+		TObjectPtr<UNiagaraComponent>& Slot = PathlineComponents.FindOrAdd(Result.ElementName);
+		UNiagaraComponent* Component = Slot.Get();
+		if (!Component)
+		{
+			Component = NewObject<UNiagaraComponent>(this);
+			Component->SetAsset(System);
+			Component->SetAllowScalability(false);
+			Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+			// Nothing runs until real data arrives.
+			Component->bAutoActivate = false;
+			Component->SetupAttachment(GetRootComponent());
+			AddInstanceComponent(Component);
+			Component->RegisterComponent();
+			Slot = Component;
+		}
+		else if (Component->GetAsset() != System)
+		{
+			Component->SetAsset(System);
+		}
+
+		Component->SetWorldLocation(PathlineSpawnLocation);
+		Component->SetWorldScale3D(FVector(PathlineSpawnScale));
+
+		if (Result.Arrays->Num() == 0)
+		{
+			// Everything was filtered out: hide rather than leave stale trails.
+			Component->Deactivate();
+			continue;
+		}
+		if (!System)
+		{
+			continue;
+		}
+
+		PushStreamlineArrays(Component, *Result.Arrays);
+	}
+}
+
 
 UMaterialInterface* AJUSYNCFileSpawnerActor::CreateEmissiveVertexColorMaterial()
 {
@@ -1293,7 +1461,7 @@ void AJUSYNCFileSpawnerActor::SyncPathlineManager()
         }
         UE_LOG(LogTemp, Display, TEXT("[Spawner] Pathline material: %s"),
             PathlineMaterial ? *PathlineMaterial->GetName()
-                             : TEXT("none — trails keep the default material and lose vertex colours"));
+                             : TEXT("none â€” trails keep the default material and lose vertex colours"));
     }
 
     // Live emission retune: the panel writes PathlineEmissiveStrength; push
@@ -1320,9 +1488,7 @@ void AJUSYNCFileSpawnerActor::SyncPathlineManager()
         RebuildPathlinesFromSampleCache();
     }
 
-    UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
-    FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr;
-    PathlineManager->PumpGameThread(GetWorld(), PCSpawner, PathlineMaterial);
+    SyncPathlineComponents();
 
     const FJUSYNCPathlineStats Stats = PathlineManager->GetStats();
     PathlineActiveTracks = Stats.ActiveTracks;
@@ -1562,7 +1728,7 @@ void AJUSYNCFileSpawnerActor::ClearSpawnedActors()
     if (PathlineManager)
     {
         PathlineManager->Reset();
-        PathlineManager->PumpGameThread(GetWorld(), nullptr, nullptr);
+        DestroyAllPathlineComponents();
         PathlineActiveTracks = 0;
         PathlineNodeCount = 0;
         PathlineVisibleTracks = 0;
@@ -1885,7 +2051,7 @@ void AJUSYNCFileSpawnerActor::OnFileListReceived_Internal(const TArray<FString>&
         if (InitialFileListRetryCount < MaxInitialFileListRetries)
         {
             ++InitialFileListRetryCount;
-            UE_LOG(LogTemp, Display, TEXT("JUSYNC Spawner: file list %s (retry %d/%d in 3s) — broker may still be prepping scene"),
+            UE_LOG(LogTemp, Display, TEXT("JUSYNC Spawner: file list %s (retry %d/%d in 3s) â€” broker may still be prepping scene"),
                    bSuccess ? TEXT("empty") : TEXT("request failed"), InitialFileListRetryCount, MaxInitialFileListRetries);
             GEngine->AddOnScreenDebugMessage(-1, 4.0f, FColor::Yellow, FString::Printf(TEXT("[Spawner] Waiting for broker scene (retry %d/%d)..."), InitialFileListRetryCount, MaxInitialFileListRetries));
             CurrentState = EJUSYNCSpawnerState::FetchingList;
@@ -2624,7 +2790,7 @@ void AJUSYNCFileSpawnerActor::ApplyParsedFileData(FJUSYNCParsedFileResult&& Resu
         }
         else
         {
-            UE_LOG(LogTemp, Warning, TEXT("[LiveUpdate] Parse returned no data for: '%s' — keeping existing actors"), *Filename);
+            UE_LOG(LogTemp, Warning, TEXT("[LiveUpdate] Parse returned no data for: '%s' â€” keeping existing actors"), *Filename);
         }
     }
     else if (!bIsInitial)
@@ -4656,7 +4822,7 @@ void AJUSYNCFileSpawnerActor::LoadMeshTextureAsync(UJUSYNCSubsystem* Subsystem)
                 if (Decoded.Filename.IsEmpty() || Decoded.Pixels.Num() == 0)
                 {
                     T->bMeshTextureLoading.store(false);
-                    UE_LOG(LogTemp, Log, TEXT("[Spawner] No full-texture PNG found (only gradients / none) — meshes keep spawn material"));
+                    UE_LOG(LogTemp, Log, TEXT("[Spawner] No full-texture PNG found (only gradients / none) â€” meshes keep spawn material"));
                     return;
                 }
 
@@ -5279,6 +5445,16 @@ void AJUSYNCFileSpawnerActor::OnPointCloudSpawnedHandler(const FString& EleName,
 
     AActor* Existing = FileToActorMap.FindRef(EleName);
 
+    if (AnimationController && Spawned)
+    {
+        // Point clouds are one actor per element, updated in place by the live
+        // RawGeo stream. Keep them out of the time-step visibility election:
+        // the slot order stays at the first clip's order, so a scrub through
+        // buffered clips would otherwise hide the cloud that is still
+        // receiving data and leave the viewport empty.
+        AnimationController->MarkActorLive(Spawned);
+    }
+
     if (Spawned && Existing && Existing == Spawned)
     {
         if (!FileName.IsEmpty())
@@ -5604,7 +5780,7 @@ void AJUSYNCFileSpawnerActor::OnBrokerNotification(const FJUSYNCNotification& No
             bInitialKickInFlight = true;
             GetWorldTimerManager().ClearTimer(InitialFileListRetryTimerHandle);
             InitialFileListRetryCount = 0;
-            UE_LOG(LogTemp, Display, TEXT("[V2HANDLER] Broker signaled scene ready (%s for '%s') — fetching file list now"),
+            UE_LOG(LogTemp, Display, TEXT("[V2HANDLER] Broker signaled scene ready (%s for '%s') â€” fetching file list now"),
                    ANSI_TO_TCHAR(TypeStr), *Notification.Filename);
             RequestFileList();
         }
@@ -5613,7 +5789,7 @@ void AJUSYNCFileSpawnerActor::OnBrokerNotification(const FJUSYNCNotification& No
 
     if (!bEnableLiveUpdates)
     {
-        UE_LOG(LogTemp, Warning, TEXT("[SIGNAL] DROPPED — 'Enable Live Updates' is FALSE in spawner Details panel"));
+        UE_LOG(LogTemp, Warning, TEXT("[SIGNAL] DROPPED â€” 'Enable Live Updates' is FALSE in spawner Details panel"));
         return;
     }
 
@@ -6939,3 +7115,94 @@ void AJUSYNCFileSpawnerActor::SetTimeStepIndex(int32 NewIndex)
         AnimationController->SetCurrentTimeStepIndex(NewIndex);
     }
 }
+
+#if WITH_EDITOR
+// ---------------------------------------------------------------------------
+// Asset authoring helper for NS_JusyncStreamlines.
+//
+// The streamline renderer feeds Niagara through data interface arrays, so the
+// system must expose User.Positions / LinkOrders / Widths / Colors / Scalars as
+// array user parameters. Data interface user parameters need a live
+// UNiagaraDataInterface instance, which cannot be created from an asset
+// authoring tool, so this command creates them once and saves the package.
+//
+// Run with:  UnrealEditor-Cmd.exe <project> -ExecCmds="JUSYNC.AddStreamlineNiagaraParams"
+// ---------------------------------------------------------------------------
+#include "NiagaraDataInterfaceArrayFloat.h"
+#include "Misc/PackageName.h"
+#include "UObject/Package.h"
+#include "UObject/SavePackage.h"
+
+namespace
+{
+	struct FJUSYNCStreamlineParamDef
+	{
+		const TCHAR* Name;
+		UClass* Class;
+	};
+
+	void JUSYNCAddStreamlineNiagaraParameters()
+	{
+		const TCHAR* AssetPath = TEXT("/Game/FX/NS_JusyncStreamlines.NS_JusyncStreamlines");
+		UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, AssetPath);
+		if (!System)
+		{
+			UE_LOG(LogTemp, Error, TEXT("[JUSYNC] Could not load %s"), AssetPath);
+			return;
+		}
+
+		const FJUSYNCStreamlineParamDef Defs[] =
+		{
+			{ TEXT("User.Positions"),  UNiagaraDataInterfaceArrayPosition::StaticClass() },
+			{ TEXT("User.LinkOrders"), UNiagaraDataInterfaceArrayFloat::StaticClass() },
+			{ TEXT("User.Widths"),     UNiagaraDataInterfaceArrayFloat::StaticClass() },
+			{ TEXT("User.Colors"),     UNiagaraDataInterfaceArrayColor::StaticClass() },
+			{ TEXT("User.Scalars"),    UNiagaraDataInterfaceArrayFloat::StaticClass() },
+		};
+
+		FNiagaraUserRedirectionParameterStore& Store = System->GetExposedParameters();
+
+		bool bChanged = false;
+		for (const FJUSYNCStreamlineParamDef& Def : Defs)
+		{
+			const FName ParamName(Def.Name);
+			FNiagaraVariable Var(FNiagaraTypeDefinition(Def.Class), ParamName);
+			if (Store.GetDataInterface(Var) != nullptr)
+			{
+				UE_LOG(LogTemp, Log, TEXT("[JUSYNC] %s already present"), Def.Name);
+				continue;
+			}
+
+			int32 Offset = INDEX_NONE;
+			Store.AddParameter(Var, /*bInitialize*/ false, /*bTriggerRebind*/ true, &Offset);
+			UNiagaraDataInterface* DataInterface = NewObject<UNiagaraDataInterface>(
+				System, Def.Class, FName(ParamName.ToString().RightChop(5)), RF_Public | RF_Transactional);
+			Store.SetDataInterface(DataInterface, Var);
+			bChanged = true;
+			UE_LOG(LogTemp, Log, TEXT("[JUSYNC] Added data interface parameter %s"), Def.Name);
+		}
+
+		if (!bChanged)
+		{
+			return;
+		}
+
+		System->RequestCompile(false);
+		System->MarkPackageDirty();
+
+		UPackage* Package = System->GetOutermost();
+		Package->MarkPackageDirty();
+		FSavePackageArgs SaveArgs;
+		SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+		const FString Filename = FPackageName::LongPackageNameToFilename(
+			Package->GetName(), FPackageName::GetAssetPackageExtension());
+		const bool bSaved = UPackage::SavePackage(Package, System, *Filename, SaveArgs);
+		UE_LOG(LogTemp, Log, TEXT("[JUSYNC] Saved %s: %s"), AssetPath, bSaved ? TEXT("true") : TEXT("false"));
+	}
+}
+
+static FAutoConsoleCommand GJUSYNCAddStreamlineParams(
+	TEXT("JUSYNC.AddStreamlineNiagaraParams"),
+	TEXT("Adds the streamline renderer's data interface user parameters to NS_JusyncStreamlines and saves it."),
+	FConsoleCommandDelegate::CreateStatic(&JUSYNCAddStreamlineNiagaraParameters));
+#endif

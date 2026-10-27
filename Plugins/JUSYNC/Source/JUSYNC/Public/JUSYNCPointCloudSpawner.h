@@ -73,6 +73,11 @@ public:
 
     bool IsElementFiltered(const FString& ElementName) const;
 
+    /** True only if this exact (file, hash) pair was actually swapped into a cloud.
+     *  Distinct from FileHashLo/Hi on the file spawner, which only record what the
+     *  broker told us: a hash can be tracked there without ever being applied. */
+    bool HasAppliedFileHash(const FString& Filename, uint64 HashLo, uint64 HashHi) const;
+
     // Cached-sample scrubbing wants the selected frame on screen now, not a
     // 200 ms morph from the live frame. Playback mode also lets the spawner
     // discard live builds that were already in flight when the user scrubbed.
@@ -236,6 +241,11 @@ private:
 
     TMap<FString, AActor*> ElementToActor;
     TMap<AActor*, FString> ActorToElement;
+
+    /** (hashLo, hashHi) last actually applied per source broker file. Empty until
+     *  the enqueue path starts carrying SourceFile/SourceHashLo/HashHi: queries then
+     *  conservatively report "not applied" so a refresh is always queued. */
+    TMap<FString, TPair<uint64, uint64>> AppliedFileHashes;
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     struct FInFlightCloudBuild

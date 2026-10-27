@@ -610,3 +610,6 @@ Plugins/JUSYNC/JUSYNC/
 
 # End of https://www.toptal.com/developers/gitignore/api/unrealengine,visualstudio,visualstudiocode,rider
 graphify-out/
+
+# Scratch intermediate produced by bisect builds
+Intermediate_as_bisect/
