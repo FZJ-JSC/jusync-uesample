@@ -84,6 +84,14 @@ private:
 	/** Pull count / index / sender time out of the spawner and repaint. */
 	void Refresh();
 
+	/**
+	 * Plays the cached window at the transport's rate, one cached sample per
+	 * step. Lives on the widget clock because the plugin's playback entry
+	 * points would need a full rebuild, and this only re-applies samples that
+	 * are already in the ring - it never requests or rebuilds a frame.
+	 */
+	void TickCachedPlayback(float DeltaSeconds);
+
 	UPROPERTY(Transient)
 	TObjectPtr<AJUSYNCFileSpawnerActor> Spawner;
 
@@ -152,6 +160,10 @@ private:
 	bool bApplyingFromCode = false;
 	bool bDraggingSlider = false;
 	bool bLayoutBuilt = false;
+
+	/** Transport playback state (drives the PLAY/PAUSE and LOOP controls). */
+	bool bCachedPlaybackRunning = false;
+	float CachedPlaybackAccumulator = 0.0f;
 
 	float RefreshAccumulator = 0.0f;
 

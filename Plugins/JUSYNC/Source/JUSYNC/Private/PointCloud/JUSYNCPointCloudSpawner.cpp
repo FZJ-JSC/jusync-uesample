@@ -242,10 +242,20 @@ bool FJUSYNCPointCloudSpawner::EnqueuePointCloudForPlayback(FJUSYNCPointCloudRef
     }
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
+    // Playback morph handshake: the playback HUD holds jusync.Morph.CloudBlendMs
+    // at most of one playback frame while it animates the cached window, and 0
+    // for every scrub or single-step jump. With a window set consecutive cached
+    // frames glide into each other; with it clear every frame stays an exact
+    // snapshot.
+    const bool bMorphPlayback = CVarJusyncCloudBlendMs.GetValueOnGameThread() > 0;
+
     // Instant revisit: the sample cache hands back the SAME payload shared ref
     // for the same sample, so if we already built and displayed this exact
     // payload once, swap that cloud straight in - no conversion, no async
-    // build, no morph. A->B->A scrubs must not rebuild A.
+    // build, no morph. A->B->A scrubs must not rebuild A. Skipped while the
+    // playback morph window is open: a hard swap would cut the very frame that
+    // was asked to glide (looped playback revisits every sample).
+    if (!bMorphPlayback)
     {
         const JUSYNCElementNames::FVariant ReplayVariant =
             JUSYNCElementNames::ParseElement(PCRef->ElementName);
@@ -282,13 +292,14 @@ bool FJUSYNCPointCloudSpawner::EnqueuePointCloudForPlayback(FJUSYNCPointCloudRef
     Entry.PointSize = PointSize;
     Entry.bSpawned = false;
     Entry.bNeedsRecolor = false;
-    // No morph on scrub: the smooth-morph path always lost correspondence
-    // against the just-swapped replay cloud (300/300 unmatched), fell into
-    // the ramp chain and rebuilt intermediate clouds that the next scrub
-    // step superseded -> visible despawn/respawn flicker lagging the
-    // streamlines. Scrub must show EXACTLY the selected sample: build and
-    // swap in place. (Live streaming keeps its own morph path.)
-    Entry.bPlaybackMorph = false;
+    // Morph only while the playback HUD is animating (window set). A scrub must
+    // show EXACTLY the selected sample, so with the window clear this stays a
+    // build-and-swap in place. The old failure mode - correspondence lost
+    // against the just-swapped replay cloud (300/300 unmatched), ramp-chain
+    // fallback, resync flicker - came from re-matching moved points every
+    // selection; PreparePointCloudForPlayback now keeps the walk->payload map
+    // while the window is open, so consecutive frames retarget instead.
+    Entry.bPlaybackMorph = bMorphPlayback;
     Entry.SourcePayload = PCRef;
 
     if (PCData.HasLidarPoints())
@@ -1136,7 +1147,12 @@ void FJUSYNCPointCloudSpawner::PreparePointCloudForPlayback(const FString& Key)
     // map so a mid-morph snapshot gets a fresh mapping.
     RampChains.Remove(Key);
     SmoothMorphs.Remove(Key);
-    CloudWalkInputIdx.Remove(Key);
+    // Keep the walk -> payload correspondence: cached frames of one element
+    // share the same point order, so the map built for the live stream (or by
+    // an earlier selection) retargets cleanly across a scrub or a playback
+    // step. Dropping it forced a fresh quantized match against points that had
+    // moved since the previous sample, which is what produced the
+    // 300/300-unmatched ramp fallbacks and killed playback morphing.
     CloudLastArrival.Remove(Key);
 
     // Seed the morph anchor from the cloud currently on screen. Without this,
@@ -2548,8 +2564,11 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
                 const int32 ForcedMs = CVarJusyncCloudBlendMs.GetValueOnGameThread();
                 const double MaxBlend = FMath::Max(CVarJusyncCloudMaxBlendMs.GetValueOnGameThread(), 8) / 1000.0;
                 const bool bPlaybackMorph = bPlaybackMode && Entry.bPlaybackMorph;
+                // Playback ignores the CloudMaxBlendMs cap on purpose: at 1 fps
+                // the window is most of a second, so the frame glides for its
+                // whole duration instead of finishing in 200 ms and freezing.
                 const double BlendSeconds = bPlaybackMorph
-                    ? (ForcedMs > 0 ? ForcedMs / 1000.0 : MaxBlend)
+                    ? FMath::Max(ForcedMs, 8) / 1000.0
                     : (ForcedMs > 0
                         ? ForcedMs / 1000.0
                         : FMath::Clamp(NowSeconds - CloudLastArrival.FindRef(Key), 0.008, MaxBlend));

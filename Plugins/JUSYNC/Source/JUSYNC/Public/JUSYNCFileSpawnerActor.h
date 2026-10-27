@@ -977,6 +977,9 @@ private:
     void ApplyCachedSample(float NormalizedPosition);
     int32 GetMaxSampleCacheCount() const;
     void GetSampleTimeline(TArray<uint64>& OutSampleIds) const;
+    // Sender animation time for one sample id, -1 when unknown. Shared by the
+    // timeline (ordering) and GetCachedSampleTime (display).
+    double LookupSampleTime(uint64 InSampleId) const;
     void RefreshPlaybackWindow();
     const FJUSYNCSampleCacheEntry* FindSampleForPlayback(
         const TArray<FJUSYNCSampleCacheEntry>& List, uint64 SelectedSampleId) const;

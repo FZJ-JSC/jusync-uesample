@@ -20,6 +20,7 @@
 #include "Components/VerticalBox.h"
 #include "Components/VerticalBoxSlot.h"
 #include "Components/Widget.h"
+#include "HAL/IConsoleManager.h"
 #include "Styling/SlateTypes.h"
 
 #define LOCTEXT_NAMESPACE "JusyncPlaybackWidget"
@@ -134,6 +135,24 @@ namespace
         Box->AddChild(Child);
         return Box;
     }
+
+    /**
+     * Scrub position for a cached timeline index. The spawner treats any
+     * position at or above 0.999 as "live edge" and leaves playback mode, so
+     * the newest cached frame is requested just under that threshold and the
+     * spawner rounds it back to the same index.
+     */
+    float ScrubPositionForIndex(int32 Index, int32 Count)
+    {
+        if (Count <= 1)
+        {
+            return 0.0f;
+        }
+        const int32 Last = Count - 1;
+        return Index >= Last
+            ? 0.9989f
+            : static_cast<float>(Index) / static_cast<float>(Last);
+    }
 }
 
 void UJusyncPlaybackWidget::BindSpawner(AJUSYNCFileSpawnerActor* InSpawner)
@@ -158,6 +177,40 @@ namespace
         }
         Widget->SetNavigationRuleBase(EUINavigation::Next, EUINavigationRule::Escape);
         Widget->SetNavigationRuleBase(EUINavigation::Previous, EUINavigationRule::Escape);
+    }
+
+    /** Last window this panel pushed, so the idle guard in NativeTick does not
+     *  write the console variable on every frame. */
+    int32 GPlaybackMorphWindowMs = 0;
+
+    /**
+     * Playback morph handshake. jusync.Morph.CloudBlendMs is the window the
+     * streamer morphs the displayed cloud over; the panel opens it while the
+     * cached animation runs so consecutive frames glide into each other, and
+     * closes it (0) for scrubs, single steps and LIVE, where a hard snapshot is
+     * what the user asked for. 800/FPS leaves the tail of the frame for the
+     * deferred cloud swap to land before the next frame starts.
+     */
+    void SetPlaybackMorphWindow(float FramesPerSecond)
+    {
+        if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(
+                TEXT("jusync.Morph.CloudBlendMs")))
+        {
+            const float Fps = FMath::Clamp(FramesPerSecond, 1.0f, 240.0f);
+            const int32 BlendMs = FMath::Clamp(FMath::RoundToInt(800.0f / Fps), 8, 4000);
+            CVar->Set(BlendMs, ECVF_SetByConsole);
+            GPlaybackMorphWindowMs = BlendMs;
+        }
+    }
+
+    void ClearPlaybackMorphWindow()
+    {
+        GPlaybackMorphWindowMs = 0;
+        if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(
+                TEXT("jusync.Morph.CloudBlendMs")))
+        {
+            CVar->Set(0, ECVF_SetByConsole);
+        }
     }
 }
 
@@ -236,6 +289,16 @@ void UJusyncPlaybackWidget::NativeTick(const FGeometry& MyGeometry, float InDelt
 {
     Super::NativeTick(MyGeometry, InDeltaTime);
 
+    TickCachedPlayback(InDeltaTime);
+
+    // The morph window belongs to the running animation only: if playback was
+    // stopped from anywhere we did not route through (panel closed, PIE ending,
+    // frame count collapsing), restore exact per-frame snapshots for live data.
+    if (!bCachedPlaybackRunning && GPlaybackMorphWindowMs != 0)
+    {
+        ClearPlaybackMorphWindow();
+    }
+
     RefreshAccumulator += InDeltaTime;
     if (RefreshAccumulator < RefreshIntervalSeconds)
     {
@@ -244,6 +307,56 @@ void UJusyncPlaybackWidget::NativeTick(const FGeometry& MyGeometry, float InDelt
 
     RefreshAccumulator = 0.0f;
     Refresh();
+}
+
+void UJusyncPlaybackWidget::TickCachedPlayback(float DeltaSeconds)
+{
+    if (!bCachedPlaybackRunning || !Spawner)
+    {
+        return;
+    }
+
+    const int32 Count = Spawner->GetCachedSampleCount();
+    if (Count <= 1)
+    {
+        bCachedPlaybackRunning = false;
+        ClearPlaybackMorphWindow();
+        return;
+    }
+
+    const float FrameTime = 1.0f / FMath::Clamp(Spawner->TimeStepPlaybackFPS, 1.0f, 240.0f);
+    int32 Index = FMath::Clamp(Spawner->GetPlaybackSampleIndex(), 0, Count - 1);
+    bool bAdvanced = false;
+
+    CachedPlaybackAccumulator += DeltaSeconds;
+    while (CachedPlaybackAccumulator >= FrameTime)
+    {
+        CachedPlaybackAccumulator -= FrameTime;
+        ++Index;
+        if (Index >= Count)
+        {
+            if (Spawner->bLoopTimeStepAnimation)
+            {
+                Index = 0;
+            }
+            else
+            {
+                Index = Count - 1;
+                bCachedPlaybackRunning = false;
+                ClearPlaybackMorphWindow();
+            }
+        }
+        bAdvanced = true;
+        if (!bCachedPlaybackRunning)
+        {
+            break;
+        }
+    }
+
+    if (bAdvanced)
+    {
+        Spawner->SetPlaybackPosition(ScrubPositionForIndex(Index, Count));
+    }
 }
 
 FReply UJusyncPlaybackWidget::NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
@@ -342,9 +455,9 @@ void UJusyncPlaybackWidget::BuildLayout()
     UHorizontalBoxSlot* ButtonsSlot = Bar->AddChildToHorizontalBox(Buttons);
     ButtonsSlot->SetVerticalAlignment(VAlign_Center);
 
-    auto AddTransportButton = [this, Buttons](UButton* Button, bool bLast)
+    auto AddTransportButton = [this, Buttons](UButton* Button, bool bLast, float Width = Theme::Z1)
     {
-        USizeBox* Box = MakeSizeBox(WidgetTree, Button, Theme::Z1, Theme::Z1);
+        USizeBox* Box = MakeSizeBox(WidgetTree, Button, Width, Theme::Z1);
         UHorizontalBoxSlot* Slot = Buttons->AddChildToHorizontalBox(Box);
         Slot->SetPadding(FMargin(0.0f, 0.0f, bLast ? 0.0f : 8.0f, 0.0f));
         Slot->SetVerticalAlignment(VAlign_Center);
@@ -355,15 +468,16 @@ void UJusyncPlaybackWidget::BuildLayout()
     NextButton = MakeButton(TEXT("NextButton"), FText::FromString(TEXT("\u25B6")),
         LOCTEXT("NextTip", "Step one cached sample forwards"), nullptr, Theme::IconSize);
     PlayPauseButton = MakeButton(TEXT("PlayPauseButton"), FText::FromString(TEXT("||")),
-        LOCTEXT("PlayPauseTip", "Freeze the stream on the newest frame, or resume following it"),
+        LOCTEXT("PlayPauseTip", "Play the cached samples at the current rate, or pause on the frame shown"),
         &PlayPauseCaption, Theme::IconSize);
-    LiveButton = MakeButton(TEXT("LiveButton"), FText::FromString(TEXT("\u25A0")),
-        LOCTEXT("LiveTip", "Return to the live edge of the stream"), nullptr, Theme::IconSize);
+    LiveButton = MakeButton(TEXT("LiveButton"), FText::FromString(TEXT("LIVE")),
+        LOCTEXT("LiveTip", "Stop the playback and follow the live edge of the stream"),
+        nullptr, 10.0f);
 
     AddTransportButton(PrevButton, false);
     AddTransportButton(PlayPauseButton, false);
     AddTransportButton(NextButton, false);
-    AddTransportButton(LiveButton, true);
+    AddTransportButton(LiveButton, true, 56.0f);
 
     // Middle: step label + sender time over the scrubber.
     UVerticalBox* Middle = WidgetTree->ConstructWidget<UVerticalBox>(
@@ -458,7 +572,7 @@ void UJusyncPlaybackWidget::BuildLayout()
     UVerticalBox* LoopStack = WidgetTree->ConstructWidget<UVerticalBox>(
         UVerticalBox::StaticClass(), TEXT("LoopStack"));
     LoopSwitch = MakeSwitch(TEXT("LoopSwitch"),
-        LOCTEXT("LoopTip", "Loop the time-step animation at the end of the stream"),
+        LOCTEXT("LoopTip", "Loop the cached playback when it reaches the newest cached frame"),
         LoopThumb);
     USizeBox* LoopBox = MakeSizeBox(WidgetTree, LoopSwitch, 36.0f, 20.0f);
     UVerticalBoxSlot* LoopSlot = LoopStack->AddChildToVerticalBox(LoopBox);
@@ -583,6 +697,7 @@ void UJusyncPlaybackWidget::Refresh()
         ? FMath::Clamp(Spawner->GetPlaybackSampleIndex(), 0, FMath::Max(0, Count - 1))
         : 0;
     const bool bLive = Spawner && !Spawner->IsPlayingCachedSample();
+    const bool bPlayingCached = bCachedPlaybackRunning;
     const double SampleTime = (Count > 0 && Spawner) ? Spawner->GetCachedSampleTime(Index) : -1.0;
 
     FString StateLabel = TEXT("OFFLINE");
@@ -593,6 +708,11 @@ void UJusyncPlaybackWidget::Refresh()
         {
             StateLabel = TEXT("ERROR");
             StateColor = Theme::Error;
+        }
+        else if (bPlayingCached)
+        {
+            StateLabel = TEXT("PLAYING");
+            StateColor = Theme::Accent;
         }
         else if (Spawner->IsPlayingCachedSample())
         {
@@ -705,11 +825,11 @@ void UJusyncPlaybackWidget::Refresh()
         const bool bCanFreeze = Spawner && Spawner->bEnableSampleCache && Count > 0;
         PlayPauseButton->SetIsEnabled(bCanFreeze);
         PlayPauseButton->SetRenderOpacity(bCanFreeze ? 1.0f : 0.45f);
-        PlayPauseButton->SetColorAndOpacity(bLive ? FLinearColor::White : Theme::Paused);
+        PlayPauseButton->SetColorAndOpacity(bPlayingCached ? Theme::Live : FLinearColor::White);
     }
     if (PlayPauseCaption)
     {
-        PlayPauseCaption->SetText(FText::FromString(bLive ? TEXT("||") : TEXT("\u25B6")));
+        PlayPauseCaption->SetText(FText::FromString(bPlayingCached ? TEXT("||") : TEXT("\u25B6")));
     }
 
     bApplyingFromCode = true;
@@ -727,7 +847,11 @@ void UJusyncPlaybackWidget::HandleSliderChanged(float Value)
         return;
     }
 
+    // A drag is a scrub: snap to the exact cached frame, no glide.
+    ClearPlaybackMorphWindow();
     Spawner->SetPlaybackPosition(Value);
+    bCachedPlaybackRunning = false;
+    CachedPlaybackAccumulator = 0.0f;
     Refresh();
 }
 
@@ -745,6 +869,9 @@ void UJusyncPlaybackWidget::HandlePrevClicked()
 {
     if (Spawner)
     {
+        bCachedPlaybackRunning = false;
+        CachedPlaybackAccumulator = 0.0f;
+        ClearPlaybackMorphWindow();
         Spawner->PlaybackPreviousSample();
         Refresh();
     }
@@ -754,6 +881,9 @@ void UJusyncPlaybackWidget::HandleNextClicked()
 {
     if (Spawner)
     {
+        bCachedPlaybackRunning = false;
+        CachedPlaybackAccumulator = 0.0f;
+        ClearPlaybackMorphWindow();
         Spawner->PlaybackNextSample();
         Refresh();
     }
@@ -763,6 +893,9 @@ void UJusyncPlaybackWidget::HandleLiveClicked()
 {
     if (Spawner)
     {
+        bCachedPlaybackRunning = false;
+        CachedPlaybackAccumulator = 0.0f;
+        ClearPlaybackMorphWindow();
         Spawner->FollowLatestSample();
         Refresh();
     }
@@ -775,14 +908,37 @@ void UJusyncPlaybackWidget::HandlePlayPauseClicked()
         return;
     }
 
-    if (Spawner->IsPlayingCachedSample())
+    if (bCachedPlaybackRunning)
     {
-        Spawner->FollowLatestSample();
+        bCachedPlaybackRunning = false;
+        CachedPlaybackAccumulator = 0.0f;
+        ClearPlaybackMorphWindow();
+        Refresh();
+        return;
     }
-    else
+
+    const int32 Count = Spawner->GetCachedSampleCount();
+    if (Count <= 1)
     {
-        Spawner->SetPlaybackPosition(FJusyncPlaybackHUDModel::LiveEdgeFreezePosition());
+        return;
     }
+
+    // Following live, or parked on the newest frame, restarts at the oldest
+    // cached sample; anywhere else the playback resumes from the frame shown.
+    const int32 Index = FMath::Clamp(Spawner->GetPlaybackSampleIndex(), 0, Count - 1);
+    if (!Spawner->IsPlayingCachedSample() || Index >= Count - 1)
+    {
+        // Jumping back to the oldest frame is a cut, not a transition.
+        ClearPlaybackMorphWindow();
+        Spawner->SetPlaybackPosition(0.0f);
+    }
+
+    // Frames advance on the morph window from here on: the cloud glides for
+    // most of the frame and the deferred swap lands in the tail.
+    SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
+
+    CachedPlaybackAccumulator = 0.0f;
+    bCachedPlaybackRunning = true;
     Refresh();
 }
 
@@ -792,6 +948,10 @@ void UJusyncPlaybackWidget::HandleRateMinus()
     {
         const int32 Current = FMath::RoundToInt(Spawner->TimeStepPlaybackFPS);
         Spawner->TimeStepPlaybackFPS = static_cast<float>(FMath::Clamp(Current - 1, 1, 240));
+        if (bCachedPlaybackRunning)
+        {
+            SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
+        }
         Refresh();
     }
 }
@@ -802,6 +962,10 @@ void UJusyncPlaybackWidget::HandleRatePlus()
     {
         const int32 Current = FMath::RoundToInt(Spawner->TimeStepPlaybackFPS);
         Spawner->TimeStepPlaybackFPS = static_cast<float>(FMath::Clamp(Current + 1, 1, 240));
+        if (bCachedPlaybackRunning)
+        {
+            SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
+        }
         Refresh();
     }
 }
@@ -810,6 +974,8 @@ void UJusyncPlaybackWidget::HandleLoopClicked()
 {
     if (Spawner)
     {
+        // The playback loop reads this flag on every step, so flipping it
+        // takes effect at the next frame boundary.
         Spawner->bLoopTimeStepAnimation = !Spawner->bLoopTimeStepAnimation;
         Refresh();
     }

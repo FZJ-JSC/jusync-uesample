@@ -698,7 +698,10 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     bSamplePlaybackActive = false;
 
     bEnableTimeStepAnimation = true;
-    TimeStepPlaybackFPS = 30.0f;
+    // 1 fps matches the ~1.5 Hz sender cadence: a cached window replayed at
+    // 1 frame/s reads as real time instead of a 20x fast-forward flipbook, and
+    // the playback morph window (see jusync.Morph.CloudBlendMs) fills the frame.
+    TimeStepPlaybackFPS = 1.0f;
     bLoopTimeStepAnimation = true;
 
     MeshCache = MakeUnique<FJUSYNCMeshCache>();
@@ -2820,9 +2823,30 @@ void AJUSYNCFileSpawnerActor::ApplyParsedFileData(FJUSYNCParsedFileResult&& Resu
     }
 }
 
+double AJUSYNCFileSpawnerActor::LookupSampleTime(uint64 InSampleId) const
+{
+    for (const TPair<FString, TArray<FJUSYNCSampleCacheEntry>>& Pair : SampleCache)
+    {
+        for (const FJUSYNCSampleCacheEntry& Entry : Pair.Value)
+        {
+            if (Entry.SampleId == InSampleId && Entry.SampleTime >= 0.0)
+            {
+                return Entry.SampleTime;
+            }
+        }
+    }
+
+    if (const double* SenderTime = SampleTimeById.Find(InSampleId))
+    {
+        return *SenderTime;
+    }
+    return -1.0;
+}
+
 void AJUSYNCFileSpawnerActor::GetSampleTimeline(TArray<uint64>& OutSampleIds) const
 {
     TSet<uint64> Seen;
+    TMap<uint64, double> Times;
     for (const TPair<FString, TArray<FJUSYNCSampleCacheEntry>>& Pair : SampleCache)
     {
         for (const FJUSYNCSampleCacheEntry& Entry : Pair.Value)
@@ -2830,6 +2854,10 @@ void AJUSYNCFileSpawnerActor::GetSampleTimeline(TArray<uint64>& OutSampleIds) co
             if (Entry.SampleId != 0)
             {
                 Seen.Add(Entry.SampleId);
+                if (Entry.SampleTime >= 0.0)
+                {
+                    Times.FindOrAdd(Entry.SampleId, Entry.SampleTime);
+                }
             }
         }
     }
@@ -2838,8 +2866,36 @@ void AJUSYNCFileSpawnerActor::GetSampleTimeline(TArray<uint64>& OutSampleIds) co
     for (uint64 SampleId : Seen)
     {
         OutSampleIds.Add(SampleId);
+        if (!Times.Contains(SampleId))
+        {
+            if (const double* SenderTime = SampleTimeById.Find(SampleId))
+            {
+                Times.Add(SampleId, *SenderTime);
+            }
+        }
     }
-    OutSampleIds.Sort();
+
+    // Order by the sender's animation time, not by sample id. Ids are handed
+    // out when a payload is parsed, so a backlog (initial file list, a stalled
+    // download, an out-of-order commit) makes arrival order differ from the
+    // order the sender actually streamed. Sorting by id therefore walked the
+    // scrubber through time out of sequence. Untimed frames sort last, by id.
+    OutSampleIds.Sort([&Times](uint64 A, uint64 B)
+    {
+        const double* TimeA = Times.Find(A);
+        const double* TimeB = Times.Find(B);
+        const bool bTimedA = TimeA && *TimeA >= 0.0;
+        const bool bTimedB = TimeB && *TimeB >= 0.0;
+        if (bTimedA != bTimedB)
+        {
+            return bTimedA;
+        }
+        if (bTimedA && !FMath::IsNearlyEqual(*TimeA, *TimeB))
+        {
+            return *TimeA < *TimeB;
+        }
+        return A < B;
+    });
 }
 
 int32 AJUSYNCFileSpawnerActor::GetMaxSampleCacheCount() const
@@ -2858,23 +2914,7 @@ double AJUSYNCFileSpawnerActor::GetCachedSampleTime(int32 Index) const
         return -1.0;
     }
 
-    const uint64 SampleId = Timeline[Index];
-    for (const TPair<FString, TArray<FJUSYNCSampleCacheEntry>>& Pair : SampleCache)
-    {
-        for (const FJUSYNCSampleCacheEntry& Entry : Pair.Value)
-        {
-            if (Entry.SampleId == SampleId && Entry.SampleTime >= 0.0)
-            {
-                return Entry.SampleTime;
-            }
-        }
-    }
-
-    if (const double* SenderTime = SampleTimeById.Find(SampleId))
-    {
-        return *SenderTime;
-    }
-    return -1.0;
+    return LookupSampleTime(Timeline[Index]);
 }
 
 const AJUSYNCFileSpawnerActor::FJUSYNCSampleCacheEntry* AJUSYNCFileSpawnerActor::FindSampleForPlayback(
