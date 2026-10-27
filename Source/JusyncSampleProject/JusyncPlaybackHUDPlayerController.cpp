@@ -4,9 +4,11 @@
 #include "JusyncPathlineWidget.h"
 #include "JUSYNCFileSpawnerActor.h"
 
+#include "Engine/GameViewportClient.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "Framework/Application/SlateApplication.h"
+#include "Widgets/SViewport.h"
 
 namespace
 {
@@ -141,23 +143,90 @@ void AJusyncPlaybackHUDPlayerController::BeginPlay()
 	{
 		UE_LOG(LogTemp, Warning, TEXT("JUSYNC pathline panel: widget creation failed"));
 	}
+
+	if (FSlateApplication::IsInitialized())
+	{
+		PreInputKeyHandle = FSlateApplication::Get()
+			.OnApplicationPreInputKeyDownListener()
+			.AddUObject(this, &AJusyncPlaybackHUDPlayerController::HandlePreInputKey);
+	}
 }
 
-bool AJusyncPlaybackHUDPlayerController::HandlePanelToggleKey(const FKey& Key)
+void AJusyncPlaybackHUDPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	if (FSlateApplication::IsInitialized() && PreInputKeyHandle.IsValid())
+	{
+		FSlateApplication::Get()
+			.OnApplicationPreInputKeyDownListener()
+			.Remove(PreInputKeyHandle);
+		PreInputKeyHandle.Reset();
+	}
+
+	Super::EndPlay(EndPlayReason);
+}
+
+bool AJusyncPlaybackHUDPlayerController::IsGameViewportFocused() const
+{
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		return false;
+	}
+
+	const UGameViewportClient* GameViewport = World->GetGameViewport();
+	if (!GameViewport)
+	{
+		return false;
+	}
+
+	const TSharedPtr<SViewport> ViewportWidget = GameViewport->GetGameViewportWidget();
+	return ViewportWidget.IsValid()
+		&& (ViewportWidget->HasKeyboardFocus() || ViewportWidget->HasFocusedDescendants());
+}
+
+void AJusyncPlaybackHUDPlayerController::HandlePreInputKey(const FKeyEvent& KeyEvent)
+{
+	if (KeyEvent.IsRepeat() || !IsGameViewportFocused())
+	{
+		return;
+	}
+
+	HandlePanelToggleKey(KeyEvent.GetKey(), true);
+}
+
+bool AJusyncPlaybackHUDPlayerController::HandlePanelToggleKey(const FKey& Key, bool bFromPreInput)
+{
+	if (Key != ToggleKey && Key != PathlineToggleKey)
+	{
+		return false;
+	}
+
+	// The pre-input hook, the focused widget and the controller input path can
+	// all see one physical key press. The pre-input hook runs first and records
+	// the frame; the later paths acknowledge that same press without toggling
+	// again. A fresh press on a later frame still toggles normally.
+	if (!bFromPreInput
+		&& Key == PreInputHandledKey
+		&& GFrameCounter == PreInputHandledFrame)
+	{
+		return true;
+	}
+
+	if (bFromPreInput)
+	{
+		PreInputHandledKey = Key;
+		PreInputHandledFrame = GFrameCounter;
+	}
+
 	if (Key == ToggleKey)
 	{
 		TogglePanel();
-		return true;
 	}
-
-	if (Key == PathlineToggleKey)
+	else
 	{
 		TogglePathlinePanel();
-		return true;
 	}
-
-	return false;
+	return true;
 }
 
 bool AJusyncPlaybackHUDPlayerController::InputKey(const FInputKeyEventArgs& Params)

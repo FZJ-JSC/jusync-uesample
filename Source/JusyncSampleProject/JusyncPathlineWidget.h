@@ -2,26 +2,27 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
-#include "Containers/Array.h"
 #include "Types/SlateEnums.h"
 #include "JusyncPathlineWidget.generated.h"
 
 class AJUSYNCFileSpawnerActor;
 class UBorder;
 class UButton;
-class UEditableTextBox;
-class UHorizontalBox;
+class UComboBoxString;
+class USlider;
 class UTextBlock;
+class UVerticalBox;
 
 /**
- * Dedicated in-game control surface for pathlines, separate from the
- * transport panel: enable, per-sample colouring, colour (hue) filtering,
- * track-budget stepping and trail thickness.
+ * The right-hand LAYERS panel from the dimensional drawing: one 360 x 620
+ * frame with a 60 px header and two 260 px cards. The PATHLINES card controls
+ * the Niagara trail model; the POINT CLOUD card mirrors the spawner's point
+ * properties. The geometry is fixed at the 1920x1080 reference; the panel is
+ * anchored to the top-right at V1 = 24.
  *
- * Same construction rules as UJusyncPlaybackWidget: layout built in code
- * (works in Shipping, no .uasset), state maths in FJusyncPathlineHUDModel.
- * MAX TRACKS and RADIUS write the matching jusync.Pathlines.* cvars because
- * those cvars intentionally override the spawner properties.
+ * As with UJusyncPlaybackWidget the tree is built in C++ (no .uasset), so it
+ * works in Shipping. The card slots are placeholders in the drawing; the
+ * controls here are the real pathline / point-cloud properties.
  */
 UCLASS()
 class UJusyncPathlineWidget : public UUserWidget
@@ -45,108 +46,84 @@ private:
 	void HandleEnableClicked();
 
 	UFUNCTION()
-	void HandleColorClicked();
-
-	UFUNCTION()
-	void HandleHueToggle();
-
-	UFUNCTION()
-	void HandleToleranceMinus();
-
-	UFUNCTION()
-	void HandleTolerancePlus();
-
-	/** Typed overrides: committed on Enter / focus-loss, clamped hard. */
-	UFUNCTION()
-	void HandleMaxInputCommitted(const FText& Text, ETextCommit::Type CommitType);
-
-	UFUNCTION()
-	void HandleRadiusInputCommitted(const FText& Text, ETextCommit::Type CommitType);
-
-	UFUNCTION()
-	void HandlePointSizeInputCommitted(const FText& Text, ETextCommit::Type CommitType);
-
-	UFUNCTION()
-	void HandleEmissiveInputCommitted(const FText& Text, ETextCommit::Type CommitType);
-
-	UFUNCTION()
-	void HandleSidesInputCommitted(const FText& Text, ETextCommit::Type CommitType);
-
-	// ± steppers beside the R / PT / EM / SIDES boxes. OnClicked is
-	// dynamic-only in 5.8, so each needs its own UFUNCTION.
-	UFUNCTION() void HandleRadiusMinus() { StepRadiusBy(-1); }
-	UFUNCTION() void HandleRadiusPlus() { StepRadiusBy(+1); }
-	UFUNCTION() void HandlePointSizeMinus() { StepPointSizeBy(-1); }
-	UFUNCTION() void HandlePointSizePlus() { StepPointSizeBy(+1); }
-	UFUNCTION() void HandleEmissiveMinus() { StepEmissiveBy(-1); }
-	UFUNCTION() void HandleEmissivePlus() { StepEmissiveBy(+1); }
-	UFUNCTION() void HandleSidesMinus() { StepSidesBy(-1); }
-	UFUNCTION() void HandleSidesPlus() { StepSidesBy(+1); }
-
-	void StepRadiusBy(int32 Direction);
-	void StepPointSizeBy(int32 Direction);
-	void StepEmissiveBy(int32 Direction);
-	void StepSidesBy(int32 Direction);
-
-	/** Hand keyboard back to the game after an Enter-commit, so P/Tab work again. */
-	void ReleaseInputFocus();
-
-	// OnClicked is dynamic-only in 5.8, so each chip needs its own UFUNCTION.
-	UFUNCTION() void HandleHueChipRed() { ApplyHueChip(0); }
-	UFUNCTION() void HandleHueChipYellow() { ApplyHueChip(1); }
-	UFUNCTION() void HandleHueChipGreen() { ApplyHueChip(2); }
-	UFUNCTION() void HandleHueChipCyan() { ApplyHueChip(3); }
-	UFUNCTION() void HandleHueChipBlue() { ApplyHueChip(4); }
-	UFUNCTION() void HandleHueChipMagenta() { ApplyHueChip(5); }
-
-	/** Chip click: select that hue (or clear it when clicked again). */
-	void ApplyHueChip(int32 ChipIndex);
-
-	// ---- POINTS section: point-cloud visibility, glow and hue filter ----
-
-	UFUNCTION()
 	void HandlePointsEnableClicked();
 
 	UFUNCTION()
-	void HandlePointHueToggle();
+	void HandleHistoryChanged(float Value);
 
 	UFUNCTION()
-	void HandlePointToleranceMinus();
+	void HandleWidthChanged(float Value);
 
 	UFUNCTION()
-	void HandlePointTolerancePlus();
+	void HandlePointSizeChanged(float Value);
 
 	UFUNCTION()
-	void HandlePointGlowInputCommitted(const FText& Text, ETextCommit::Type CommitType);
+	void HandlePointGlowChanged(float Value);
 
-	UFUNCTION() void HandlePointGlowMinus() { StepPointGlowBy(-1); }
-	UFUNCTION() void HandlePointGlowPlus() { StepPointGlowBy(+1); }
+	UFUNCTION()
+	void HandleColorSelected(FString SelectedItem, ESelectInfo::Type SelectionType);
 
-	void StepPointGlowBy(int32 Direction);
+	UFUNCTION()
+	void HandleHueSelected(FString SelectedItem, ESelectInfo::Type SelectionType);
 
-	UFUNCTION() void HandlePointHueChipRed() { ApplyPointHueChip(0); }
-	UFUNCTION() void HandlePointHueChipYellow() { ApplyPointHueChip(1); }
-	UFUNCTION() void HandlePointHueChipGreen() { ApplyPointHueChip(2); }
-	UFUNCTION() void HandlePointHueChipCyan() { ApplyPointHueChip(3); }
-	UFUNCTION() void HandlePointHueChipBlue() { ApplyPointHueChip(4); }
-	UFUNCTION() void HandlePointHueChipMagenta() { ApplyPointHueChip(5); }
+	UFUNCTION()
+	void HandleShapeSquareClicked();
 
-	/** Point chip click: filter the clouds to that hue (again = clear). */
-	void ApplyPointHueChip(int32 ChipIndex);
+	UFUNCTION()
+	void HandleShapeCircleClicked();
+
+	UFUNCTION()
+	void HandleScalingSelected(FString SelectedItem, ESelectInfo::Type SelectionType);
+
+	UFUNCTION()
+	void HandleOrientationSelected(FString SelectedItem, ESelectInfo::Type SelectionType);
+
+	UFUNCTION()
+	void HandlePointHueSelected(FString SelectedItem, ESelectInfo::Type SelectionType);
+
+	UFUNCTION()
+	void HandleNormalsClicked();
+
+	UFUNCTION() void HandleMaxMinus() { StepMaxBy(-1); }
+	UFUNCTION() void HandleMaxPlus() { StepMaxBy(+1); }
+	UFUNCTION() void HandleExpiryMinus() { StepExpiryBy(-1); }
+	UFUNCTION() void HandleExpiryPlus() { StepExpiryBy(+1); }
+	UFUNCTION() void HandleQualityMinus() { StepQualityBy(-1); }
+	UFUNCTION() void HandleQualityPlus() { StepQualityBy(+1); }
+
+	/** The POINTS panel owns sizing: only the SCREEN option keeps the
+	 *  fixed-screen-size override on. Every other scaling mode must be able to
+	 *  change the component's ScalingMethod. */
+	void SyncPointCloudFixedSizeMode();
+
+	void StepMaxBy(int32 Direction);
+	void StepExpiryBy(int32 Direction);
+	void StepQualityBy(int32 Direction);
 
 	void BuildLayout();
 	UTextBlock* MakeLabel(const FName Name, const FText& Label);
 	UButton* MakeButton(const FName Name, const FText& Label, const FText& Tooltip,
-		TObjectPtr<UTextBlock>* OutCaption = nullptr, bool bMini = false);
-	/** Appends "[minus] [caption] [plus]" to a row. */
-	void AddStepperWidgets(UHorizontalBox* Row, UButton* MinusButton, UTextBlock* Caption,
-		UButton* PlusButton);
+		TObjectPtr<UTextBlock>* OutCaption = nullptr, float FontSize = 10.0f);
+	UBorder* MakeRoundedBorder(const FName Name, const FLinearColor& Fill,
+		const FLinearColor& Outline, float Radius, float OutlineWidth,
+		const FMargin& InPadding = FMargin(0.0f));
+	UButton* MakeSwitch(const FName Name, const FText& Tooltip, TObjectPtr<UBorder>& OutThumb);
+	void SetSwitchState(UButton* Button, UBorder* Thumb, bool bOn);
+	USlider* MakeSlider(const FName Name, float Min, float Max, float Step);
+	UComboBoxString* MakeCombo(const FName Name, const TArray<FString>& Options, int32 DefaultIndex);
+	void AddSliderRow(UVerticalBox* Parent, const FText& Label, const FName SliderName,
+		float Min, float Max, float Step, TObjectPtr<USlider>& OutSlider,
+		TObjectPtr<UTextBlock>& OutValue);
+	void AddColumnLabel(UVerticalBox* Column, const FText& Label);
+	UWidget* MakeStepper(const FName BaseName, float Width, TObjectPtr<UButton>& OutMinus,
+		TObjectPtr<UButton>& OutPlus, TObjectPtr<UTextBlock>& OutValue);
 
 	void Refresh();
 
-	/** Effective values respect the cvar-overrides-property precedence. */
+	int32 EffectiveHistorySamples() const;
 	int32 EffectiveMaxTracks() const;
-	float EffectiveRadius() const;
+	static int32 CurrentIntCvar(const TCHAR* Name, int32 Default);
+	static void SetIntCvar(const TCHAR* Name, int32 Value);
 	static float CurrentFloatCvar(const TCHAR* Name, float Default);
 	static void SetFloatCvar(const TCHAR* Name, float Value);
 
@@ -157,91 +134,107 @@ private:
 	TObjectPtr<UBorder> Panel;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UTextBlock> StatusText;
+	TObjectPtr<UTextBlock> ActiveText;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UButton> EnableButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UTextBlock> EnableCaption;
+	TObjectPtr<UTextBlock> PathlineStatusText;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UButton> ColorButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UTextBlock> ColorCaption;
+	TObjectPtr<UTextBlock> PointStatusText;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UButton> HueButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UTextBlock> HueCaption;
-
-	/** One chip per hue in FJusyncPathlineHUDModel::HueChipAngles(). */
-	UPROPERTY(Transient)
-	TArray<TObjectPtr<UButton>> HueChipButtons;
+	TObjectPtr<UButton> EnableSwitch;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UButton> ToleranceMinusButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UButton> TolerancePlusButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UTextBlock> ToleranceCaption;
+	TObjectPtr<UBorder> EnableThumb;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UEditableTextBox> MaxInput;
-	UPROPERTY(Transient)
-	TObjectPtr<UEditableTextBox> RadiusInput;
-	UPROPERTY(Transient)
-	TObjectPtr<UEditableTextBox> PointSizeInput;
-	UPROPERTY(Transient)
-	TObjectPtr<UEditableTextBox> EmissiveInput;
-	UPROPERTY(Transient)
-	TObjectPtr<UEditableTextBox> SidesInput;
+	TObjectPtr<UButton> PointsSwitch;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UButton> RadiusMinusButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UButton> RadiusPlusButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UButton> PointSizeMinusButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UButton> PointSizePlusButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UButton> EmissiveMinusButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UButton> EmissivePlusButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UButton> SidesMinusButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UButton> SidesPlusButton;
-
-	// POINTS section widgets.
-	UPROPERTY(Transient)
-	TObjectPtr<UButton> PointsEnableButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UTextBlock> PointsEnableCaption;
+	TObjectPtr<UBorder> PointsThumb;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UButton> PointHueButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UTextBlock> PointHueCaption;
-
-	/** One chip per hue in FJusyncPathlineHUDModel::HueChipAngles(). */
-	UPROPERTY(Transient)
-	TArray<TObjectPtr<UButton>> PointHueChipButtons;
+	TObjectPtr<USlider> HistorySlider;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UButton> PointToleranceMinusButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UButton> PointTolerancePlusButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UTextBlock> PointToleranceCaption;
+	TObjectPtr<UTextBlock> HistoryValueText;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UEditableTextBox> PointGlowInput;
-	UPROPERTY(Transient)
-	TObjectPtr<UButton> PointGlowMinusButton;
-	UPROPERTY(Transient)
-	TObjectPtr<UButton> PointGlowPlusButton;
+	TObjectPtr<USlider> WidthSlider;
 
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> WidthValueText;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UComboBoxString> ColorCombo;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UComboBoxString> HueCombo;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> MaxValueText;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> ExpiryValueText;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UButton> MaxMinusButton;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UButton> MaxPlusButton;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UButton> ExpiryMinusButton;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UButton> ExpiryPlusButton;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UButton> QualityMinusButton;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UButton> QualityPlusButton;
+
+	UPROPERTY(Transient)
+	TObjectPtr<USlider> PointSizeSlider;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> PointSizeValueText;
+
+	/** jusync.Spawner.CloudEmissiveFloor: the cloud's self-glow. Owns both the
+	 *  "too dark" and "washed out" endpoints, so it sits beside POINT SIZE. */
+	UPROPERTY(Transient)
+	TObjectPtr<USlider> PointGlowSlider;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> PointGlowValueText;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UButton> ShapeSquareButton;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UButton> ShapeCircleButton;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UComboBoxString> ScalingCombo;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UComboBoxString> OrientationCombo;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UComboBoxString> PointHueCombo;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UButton> NormalsSwitch;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UBorder> NormalsThumb;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> QualityValueText;
+
+	bool bApplyingFromCode = false;
 	bool bLayoutBuilt = false;
 	float RefreshAccumulator = 0.0f;
 

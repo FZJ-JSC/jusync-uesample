@@ -134,6 +134,11 @@ public:
 
     void ApplySizingToActiveActors();
     void RequestNormalCalculation(ULidarPointCloud* Cloud, AActor* Actor, int32 PointCount) { MaybeCalculateNormals(Cloud, Actor, PointCount); }
+
+    /** Re-run normal generation for every displayed cloud. Used when the
+     *  POINTS panel toggles NORMALS or changes QUALITY after the clouds have
+     *  already been built. */
+    void ApplyNormalCalculationToActiveActors();
 #endif
 
     void ClearAllActors();
@@ -153,6 +158,12 @@ public:
      *  points are dimmed to near-black in place; originals are restored when
      *  the filter is cleared. Re-applied automatically on every cloud swap. */
     void SetPointHueFilter(bool bEnabled, float HueDeg, float ToleranceDeg);
+
+    /** POINTS panel: true shows the baked/gradient colours, false repaints
+     *  every displayed cloud in grayscale. Applies to active clouds now and
+     *  to clouds swapped in later. */
+    void SetGradientColorsEnabled(bool bEnabled);
+    bool AreGradientColorsEnabled() const { return bGradientColorsEnabled; }
 
     void DestroyTrackedActor(AActor* Actor);
 
@@ -198,6 +209,7 @@ private:
     // POINTS panel state (see SetPointCloudsHidden / SetPointHueFilter).
     bool bPointCloudsHidden = false;
     bool bPointHueFilter = false;
+    bool bGradientColorsEnabled = true;
     float PointHue = 0.0f;
     float PointHueTolerance = 30.0f;
     void ApplyPointCloudsHiddenToActors();
@@ -209,6 +221,13 @@ private:
     void PrunePointColorOriginals();
     /** cloud -> untouched build-time colours; only populated while filtering. */
     TMap<TWeakObjectPtr<UObject>, TArray<FColor>> PointColorOriginals;
+
+    /** Grayscale/gradient pass used by the POINTS panel's GRADIENT switch.
+     *  Originals are captured while grayscale is active so toggling back
+     *  restores the baked/gradient colours exactly. */
+    void ApplyGradientColorsToCloud(ULidarPointCloud* Cloud);
+    void PruneGradientColorOriginals();
+    TMap<TWeakObjectPtr<UObject>, TArray<FColor>> GradientColorOriginals;
 #endif
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     ELidarPointCloudSpriteShape PointShape = ELidarPointCloudSpriteShape::Circle;
@@ -370,5 +389,9 @@ private:
     ULidarPointCloud* GetOrCreateCloudForComponent(ULidarPointCloudComponent* Comp);
     void ApplyVisualSettings(ULidarPointCloudComponent* Comp);
     void ApplyVisualSettingsToActor(AActor* Actor);
+    /** Re-asserts jusync.Spawner.CloudEmissiveFloor on every live cloud MID.
+     *  Scrubbing swaps in clouds whose MID is rebuilt from the material default,
+     *  so a one-shot push on CVar change loses the panel value. */
+    void EnsureCloudEmissiveFloor();
 #endif
 };

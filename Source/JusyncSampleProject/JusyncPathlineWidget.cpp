@@ -5,19 +5,22 @@
 #include "JUSYNCFileSpawnerActor.h"
 
 #include "Blueprint/WidgetTree.h"
+#include "Brushes/SlateRoundedBoxBrush.h"
 #include "Components/Border.h"
 #include "Components/Button.h"
 #include "Components/ButtonSlot.h"
 #include "Components/CanvasPanel.h"
 #include "Components/CanvasPanelSlot.h"
-#include "Components/EditableTextBox.h"
+#include "Components/ComboBoxString.h"
 #include "Components/HorizontalBox.h"
 #include "Components/HorizontalBoxSlot.h"
 #include "Components/SizeBox.h"
+#include "Components/Slider.h"
+#include "Components/Spacer.h"
 #include "Components/TextBlock.h"
 #include "Components/VerticalBox.h"
 #include "Components/VerticalBoxSlot.h"
-#include "Framework/Application/SlateApplication.h"
+#include "Components/Widget.h"
 #include "HAL/IConsoleManager.h"
 #include "Styling/SlateTypes.h"
 
@@ -25,11 +28,21 @@
 
 namespace
 {
-    /** Same visual language as the playback panel; see its note on brushes. */
+    /**
+     * Geometry codes from the drawing:
+     *   V1=24  W=360  H=620  H1=60  H2=52  H3=28  H4=40  H6=40
+     *   R1=12  R2=7  R3=6  S1=16  S2=12  S3=8
+     * Every runtime measurement below is one of those values, not a new
+     * one-off, so the panel can be checked against the sheet.
+     */
     namespace Theme
     {
-        const FLinearColor PanelEdge(1.0f, 1.0f, 1.0f, 0.10f);
-        const FLinearColor PanelFill(0.035f, 0.040f, 0.050f, 0.88f);
+        const FLinearColor PanelEdge(1.0f, 1.0f, 1.0f, 0.11f);
+        const FLinearColor PanelFill(0.035f, 0.040f, 0.050f, 0.92f);
+        const FLinearColor PanelHeaderFill(0.070f, 0.080f, 0.098f, 0.95f);
+        const FLinearColor CardFill(0.050f, 0.057f, 0.070f, 0.94f);
+        const FLinearColor CardHeaderFill(0.080f, 0.090f, 0.108f, 0.96f);
+        const FLinearColor CardEdge(1.0f, 1.0f, 1.0f, 0.08f);
         const FLinearColor Divider(1.0f, 1.0f, 1.0f, 0.09f);
 
         const FLinearColor TextPrimary(0.94f, 0.95f, 0.97f, 1.0f);
@@ -38,24 +51,39 @@ namespace
 
         const FLinearColor Live(0.35f, 0.85f, 0.45f, 1.0f);
         const FLinearColor Paused(1.0f, 0.72f, 0.24f, 1.0f);
+        const FLinearColor Accent(0.28f, 0.62f, 1.00f, 1.0f);
 
         const FLinearColor ChipIdle(0.150f, 0.170f, 0.205f, 0.92f);
         const FLinearColor ChipHover(0.220f, 0.250f, 0.295f, 1.00f);
         const FLinearColor ChipPressed(0.200f, 0.450f, 0.850f, 1.00f);
         const FLinearColor ChipDisabled(0.100f, 0.110f, 0.130f, 0.45f);
+        const FLinearColor WellFill(0.025f, 0.030f, 0.040f, 0.92f);
+        const FLinearColor WellEdge(1.0f, 1.0f, 1.0f, 0.07f);
+        const FLinearColor SliderTrack(1.0f, 1.0f, 1.0f, 0.18f);
+        const FLinearColor SliderThumb(0.88f, 0.92f, 1.00f, 1.0f);
 
-        // Original narrow box: rows stack vertically (the panel grows TALLER,
-        // never wider) - see the POINTS section, whose SIZE=/GLOW= inputs got
-        // their own row instead of overflowing the right edge.
-        constexpr float PanelWidth = 480.0f;
-        constexpr float TitleSize = 11.0f;
-        constexpr float StatusSize = 13.0f;
-        constexpr float ChipSize = 12.0f;
-        constexpr float HintSize = 10.0f;
-        constexpr float StepperInputWidth = 68.0f;
-        const FMargin ChipPadding(10.0f, 4.0f);
-        const FMargin MiniPadding(5.0f, 1.0f);
-        const FMargin HueChipPadding(12.0f, 4.0f);
+        constexpr float V1 = 24.0f;
+        constexpr float W = 360.0f;
+        // 620 on the sheet held two 207 px cards. The POINT CLOUD card gained a
+        // GLOW row (40 px + 8 px gap), so the frame grows by exactly that much
+        // and the drawing stays additive rather than re-flowed.
+        constexpr float H = 668.0f;
+        constexpr float H1 = 60.0f;
+        constexpr float H2 = 52.0f;
+        constexpr float H3 = 28.0f;
+        constexpr float H4 = 40.0f;
+        constexpr float H6 = 40.0f;
+        constexpr float R1 = 12.0f;
+        constexpr float R2 = 7.0f;
+        constexpr float R3 = 6.0f;
+        constexpr float S1 = 16.0f;
+        constexpr float S2 = 12.0f;
+        constexpr float S3 = 8.0f;
+        constexpr float S4 = 20.0f;
+        constexpr float LabelWidth = 92.0f;
+        constexpr float ValueWidth = 48.0f;
+        constexpr float CardContentHeight = 207.0f;
+        constexpr float PointCardContentHeight = 255.0f;
     }
 
     void StyleLabel(UTextBlock* Text, float Size, const FLinearColor& Color)
@@ -68,25 +96,117 @@ namespace
         Text->SetShadowOffset(FVector2D(1.0f, 1.0f));
     }
 
-    FButtonStyle MakeChipStyle()
+    FButtonStyle MakeButtonStyle(const FLinearColor& Fill, const FLinearColor& Hover,
+        const FLinearColor& Pressed, const FLinearColor& Disabled, float Radius)
     {
         FButtonStyle Style = FButtonStyle::GetDefault();
-        Style.Normal.TintColor = FSlateColor(Theme::ChipIdle);
-        Style.Hovered.TintColor = FSlateColor(Theme::ChipHover);
-        Style.Pressed.TintColor = FSlateColor(Theme::ChipPressed);
-        Style.Disabled.TintColor = FSlateColor(Theme::ChipDisabled);
+        Style.Normal = FSlateRoundedBoxBrush(Fill, Radius);
+        Style.Hovered = FSlateRoundedBoxBrush(Hover, Radius);
+        Style.Pressed = FSlateRoundedBoxBrush(Pressed, Radius);
+        Style.Disabled = FSlateRoundedBoxBrush(Disabled, Radius);
+        Style.NormalPadding = FMargin(0.0f);
+        Style.PressedPadding = FMargin(0.0f);
         return Style;
     }
 
-    /** Hue chips paint their own colour, so the state tints stay light. */
-    FButtonStyle MakeHueChipStyle()
+    FSliderStyle MakeSliderStyle()
     {
-        FButtonStyle Style = FButtonStyle::GetDefault();
-        Style.Normal.TintColor = FSlateColor(FLinearColor::White);
-        Style.Hovered.TintColor = FSlateColor(FLinearColor(1.25f, 1.25f, 1.25f));
-        Style.Pressed.TintColor = FSlateColor(FLinearColor(0.75f, 0.75f, 0.75f));
-        Style.Disabled.TintColor = FSlateColor(FLinearColor(1.0f, 1.0f, 1.0f, 0.35f));
+        FSliderStyle Style = FSliderStyle::GetDefault();
+        const FSlateRoundedBoxBrush Track(Theme::SliderTrack, 3.0f, FLinearColor::Transparent, 0.0f,
+            FVector2D(0.0f, 6.0f));
+        const FSlateRoundedBoxBrush TrackHover(Theme::SliderTrack * 1.35f, 3.0f,
+            FLinearColor::Transparent, 0.0f, FVector2D(0.0f, 6.0f));
+        const FSlateRoundedBoxBrush TrackDisabled(Theme::SliderTrack * 0.5f, 3.0f,
+            FLinearColor::Transparent, 0.0f, FVector2D(0.0f, 6.0f));
+        const FSlateRoundedBoxBrush Thumb(Theme::SliderThumb, 7.0f,
+            FLinearColor(0.0f, 0.0f, 0.0f, 0.25f), 1.0f, FVector2D(14.0f, 14.0f));
+        const FSlateRoundedBoxBrush ThumbHover(FLinearColor(1.0f, 1.0f, 1.0f, 1.0f), 7.0f,
+            FLinearColor(0.0f, 0.0f, 0.0f, 0.25f), 1.0f, FVector2D(14.0f, 14.0f));
+        const FSlateRoundedBoxBrush ThumbDisabled(FLinearColor(0.55f, 0.58f, 0.62f, 0.5f), 7.0f,
+            FLinearColor::Transparent, 0.0f, FVector2D(14.0f, 14.0f));
+
+        Style.NormalBarImage = Track;
+        Style.HoveredBarImage = TrackHover;
+        Style.DisabledBarImage = TrackDisabled;
+        Style.NormalThumbImage = Thumb;
+        Style.HoveredThumbImage = ThumbHover;
+        Style.DisabledThumbImage = ThumbDisabled;
+        Style.BarThickness = 6.0f;
         return Style;
+    }
+
+    FComboBoxStyle MakeComboStyle()
+    {
+        FComboBoxStyle Style = FComboBoxStyle::GetDefault();
+
+        FButtonStyle Button;
+        Button.Normal = FSlateRoundedBoxBrush(Theme::WellFill, 6.0f, Theme::WellEdge, 1.0f);
+        Button.Hovered = FSlateRoundedBoxBrush(Theme::ChipHover, 6.0f,
+            FLinearColor(1.0f, 1.0f, 1.0f, 0.16f), 1.0f);
+        Button.Pressed = FSlateRoundedBoxBrush(Theme::ChipPressed, 6.0f,
+            FLinearColor(1.0f, 1.0f, 1.0f, 0.20f), 1.0f);
+        Button.Disabled = FSlateRoundedBoxBrush(Theme::ChipDisabled, 6.0f,
+            FLinearColor::Transparent, 0.0f);
+        Button.NormalPadding = FMargin(0.0f);
+        Button.PressedPadding = FMargin(0.0f);
+
+        Style.ComboButtonStyle.ButtonStyle = Button;
+        Style.ComboButtonStyle.ContentPadding = FMargin(10.0f, 0.0f, 6.0f, 0.0f);
+        Style.ComboButtonStyle.DownArrowPadding = FMargin(0.0f, 0.0f, 8.0f, 0.0f);
+        Style.ComboButtonStyle.MenuBorderBrush = FSlateRoundedBoxBrush(
+            Theme::PanelHeaderFill, 6.0f, Theme::PanelEdge, 1.0f);
+        Style.ComboButtonStyle.MenuBorderPadding = FMargin(1.0f);
+        Style.ContentPadding = FMargin(10.0f, 0.0f, 6.0f, 0.0f);
+        Style.MenuRowPadding = FMargin(8.0f, 4.0f, 8.0f, 4.0f);
+        return Style;
+    }
+
+    FTableRowStyle MakeComboItemStyle()
+    {
+        FTableRowStyle Style = FTableRowStyle::GetDefault();
+        Style.TextColor = FSlateColor(Theme::TextPrimary);
+        Style.SelectedTextColor = FSlateColor(FLinearColor(1.0f, 1.0f, 1.0f, 1.0f));
+        Style.ActiveBrush = FSlateRoundedBoxBrush(Theme::Accent, 4.0f);
+        Style.ActiveHoveredBrush = FSlateRoundedBoxBrush(Theme::Accent * 1.15f, 4.0f);
+        Style.InactiveBrush = FSlateRoundedBoxBrush(FLinearColor::Transparent, 0.0f);
+        Style.InactiveHoveredBrush = FSlateRoundedBoxBrush(Theme::ChipHover, 4.0f);
+        Style.EvenRowBackgroundBrush = FSlateRoundedBoxBrush(FLinearColor::Transparent, 0.0f);
+        Style.OddRowBackgroundBrush = FSlateRoundedBoxBrush(FLinearColor::Transparent, 0.0f);
+        Style.EvenRowBackgroundHoveredBrush = FSlateRoundedBoxBrush(Theme::ChipHover, 0.0f);
+        Style.OddRowBackgroundHoveredBrush = FSlateRoundedBoxBrush(Theme::ChipHover, 0.0f);
+        return Style;
+    }
+
+    USizeBox* MakeSizeBox(UWidgetTree* Tree, UWidget* Child, float Width, float Height)
+    {
+        USizeBox* Box = Tree->ConstructWidget<USizeBox>(USizeBox::StaticClass(), NAME_None);
+        if (Width >= 0.0f)
+        {
+            Box->SetWidthOverride(Width);
+        }
+        if (Height >= 0.0f)
+        {
+            Box->SetHeightOverride(Height);
+        }
+        Box->AddChild(Child);
+        return Box;
+    }
+
+    /**
+     * Slate uses Tab and Shift+Tab for focus navigation. While a control in
+     * this panel owns focus, that navigation consumes the key before the
+     * widget's NativeOnKeyDown can pass it to the transport toggle. Escape
+     * keeps the key bubbling instead, so Tab still toggles the transport bar
+     * no matter which HUD control was last clicked.
+     */
+    void DisableTabNavigation(UWidget* Widget)
+    {
+        if (!Widget)
+        {
+            return;
+        }
+        Widget->SetNavigationRuleBase(EUINavigation::Next, EUINavigationRule::Escape);
+        Widget->SetNavigationRuleBase(EUINavigation::Previous, EUINavigationRule::Escape);
     }
 }
 
@@ -94,6 +214,17 @@ void UJusyncPathlineWidget::BindSpawner(AJUSYNCFileSpawnerActor* InSpawner)
 {
     Spawner = InSpawner;
     EnsureLayoutBuilt();
+
+    // The spawner defaults to fixed screen size, but older levels can carry a
+    // scaling enum of PerNodeAdaptive alongside that override. The combo must
+    // show the mode that actually drives the renderer, otherwise selecting the
+    // mode already displayed looks like a no-op.
+    if (Spawner && Spawner->bCloudFixedSize)
+    {
+        Spawner->PointScaling = EJUSYNCPointScaling::FixedScreenSize;
+    }
+    SyncPointCloudFixedSizeMode();
+
     Refresh();
 }
 
@@ -111,42 +242,111 @@ void UJusyncPathlineWidget::EnsureLayoutBuilt()
 
     BuildLayout();
 
-    EnableButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleEnableClicked);
-    ColorButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleColorClicked);
-    HueButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleHueToggle);
-    ToleranceMinusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleToleranceMinus);
-    TolerancePlusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleTolerancePlus);
+    for (UWidget* Control : {
+             static_cast<UWidget*>(EnableSwitch.Get()),
+             static_cast<UWidget*>(PointsSwitch.Get()),
+             static_cast<UWidget*>(HistorySlider.Get()),
+             static_cast<UWidget*>(WidthSlider.Get()),
+             static_cast<UWidget*>(PointSizeSlider.Get()),
+             static_cast<UWidget*>(PointGlowSlider.Get()),
+             static_cast<UWidget*>(ColorCombo.Get()),
+             static_cast<UWidget*>(HueCombo.Get()),
+             static_cast<UWidget*>(ShapeSquareButton.Get()),
+             static_cast<UWidget*>(ShapeCircleButton.Get()),
+             static_cast<UWidget*>(ScalingCombo.Get()),
+             static_cast<UWidget*>(OrientationCombo.Get()),
+             static_cast<UWidget*>(PointHueCombo.Get()),
+             static_cast<UWidget*>(NormalsSwitch.Get()),
+             static_cast<UWidget*>(MaxMinusButton.Get()),
+             static_cast<UWidget*>(MaxPlusButton.Get()),
+             static_cast<UWidget*>(ExpiryMinusButton.Get()),
+             static_cast<UWidget*>(ExpiryPlusButton.Get()),
+             static_cast<UWidget*>(QualityMinusButton.Get()),
+             static_cast<UWidget*>(QualityPlusButton.Get())})
+    {
+        DisableTabNavigation(Control);
+    }
 
-    RadiusMinusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleRadiusMinus);
-    RadiusPlusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleRadiusPlus);
-    PointSizeMinusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointSizeMinus);
-    PointSizePlusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointSizePlus);
-    EmissiveMinusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleEmissiveMinus);
-    EmissivePlusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleEmissivePlus);
-    SidesMinusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleSidesMinus);
-    SidesPlusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleSidesPlus);
-
-    PointsEnableButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointsEnableClicked);
-    PointHueButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointHueToggle);
-    PointToleranceMinusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointToleranceMinus);
-    PointTolerancePlusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointTolerancePlus);
-    PointGlowMinusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointGlowMinus);
-    PointGlowPlusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointGlowPlus);
-
-    // OnClicked is a dynamic-only delegate in 5.8: one UFUNCTION per chip.
-    if (HueChipButtons.Num() > 0) HueChipButtons[0]->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleHueChipRed);
-    if (HueChipButtons.Num() > 1) HueChipButtons[1]->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleHueChipYellow);
-    if (HueChipButtons.Num() > 2) HueChipButtons[2]->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleHueChipGreen);
-    if (HueChipButtons.Num() > 3) HueChipButtons[3]->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleHueChipCyan);
-    if (HueChipButtons.Num() > 4) HueChipButtons[4]->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleHueChipBlue);
-    if (HueChipButtons.Num() > 5) HueChipButtons[5]->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleHueChipMagenta);
-
-    if (PointHueChipButtons.Num() > 0) PointHueChipButtons[0]->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointHueChipRed);
-    if (PointHueChipButtons.Num() > 1) PointHueChipButtons[1]->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointHueChipYellow);
-    if (PointHueChipButtons.Num() > 2) PointHueChipButtons[2]->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointHueChipGreen);
-    if (PointHueChipButtons.Num() > 3) PointHueChipButtons[3]->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointHueChipCyan);
-    if (PointHueChipButtons.Num() > 4) PointHueChipButtons[4]->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointHueChipBlue);
-    if (PointHueChipButtons.Num() > 5) PointHueChipButtons[5]->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointHueChipMagenta);
+    if (EnableSwitch)
+    {
+        EnableSwitch->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleEnableClicked);
+    }
+    if (PointsSwitch)
+    {
+        PointsSwitch->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandlePointsEnableClicked);
+    }
+    if (HistorySlider)
+    {
+        HistorySlider->OnValueChanged.AddDynamic(this, &UJusyncPathlineWidget::HandleHistoryChanged);
+    }
+    if (WidthSlider)
+    {
+        WidthSlider->OnValueChanged.AddDynamic(this, &UJusyncPathlineWidget::HandleWidthChanged);
+    }
+    if (PointSizeSlider)
+    {
+        PointSizeSlider->OnValueChanged.AddDynamic(this, &UJusyncPathlineWidget::HandlePointSizeChanged);
+    }
+    if (PointGlowSlider)
+    {
+        PointGlowSlider->OnValueChanged.AddDynamic(this, &UJusyncPathlineWidget::HandlePointGlowChanged);
+    }
+    if (ColorCombo)
+    {
+        ColorCombo->OnSelectionChanged.AddDynamic(this, &UJusyncPathlineWidget::HandleColorSelected);
+    }
+    if (HueCombo)
+    {
+        HueCombo->OnSelectionChanged.AddDynamic(this, &UJusyncPathlineWidget::HandleHueSelected);
+    }
+    if (ShapeSquareButton)
+    {
+        ShapeSquareButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleShapeSquareClicked);
+    }
+    if (ShapeCircleButton)
+    {
+        ShapeCircleButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleShapeCircleClicked);
+    }
+    if (ScalingCombo)
+    {
+        ScalingCombo->OnSelectionChanged.AddDynamic(this, &UJusyncPathlineWidget::HandleScalingSelected);
+    }
+    if (OrientationCombo)
+    {
+        OrientationCombo->OnSelectionChanged.AddDynamic(this, &UJusyncPathlineWidget::HandleOrientationSelected);
+    }
+    if (PointHueCombo)
+    {
+        PointHueCombo->OnSelectionChanged.AddDynamic(this, &UJusyncPathlineWidget::HandlePointHueSelected);
+    }
+    if (NormalsSwitch)
+    {
+        NormalsSwitch->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleNormalsClicked);
+    }
+    if (MaxMinusButton)
+    {
+        MaxMinusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleMaxMinus);
+    }
+    if (MaxPlusButton)
+    {
+        MaxPlusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleMaxPlus);
+    }
+    if (ExpiryMinusButton)
+    {
+        ExpiryMinusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleExpiryMinus);
+    }
+    if (ExpiryPlusButton)
+    {
+        ExpiryPlusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleExpiryPlus);
+    }
+    if (QualityMinusButton)
+    {
+        QualityMinusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleQualityMinus);
+    }
+    if (QualityPlusButton)
+    {
+        QualityPlusButton->OnClicked.AddDynamic(this, &UJusyncPathlineWidget::HandleQualityPlus);
+    }
 
     Refresh();
 }
@@ -170,306 +370,466 @@ void UJusyncPathlineWidget::NativeTick(const FGeometry& MyGeometry, float InDelt
     Refresh();
 }
 
+FReply UJusyncPathlineWidget::NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
+{
+    if (!InKeyEvent.IsRepeat())
+    {
+        if (AJusyncPlaybackHUDPlayerController* Controller =
+            Cast<AJusyncPlaybackHUDPlayerController>(GetOwningPlayer()))
+        {
+            if (Controller->HandlePanelToggleKey(InKeyEvent.GetKey()))
+            {
+                return FReply::Handled();
+            }
+        }
+    }
+    return Super::NativeOnKeyDown(InGeometry, InKeyEvent);
+}
+
 void UJusyncPathlineWidget::BuildLayout()
 {
     UCanvasPanel* Root = WidgetTree->ConstructWidget<UCanvasPanel>(
         UCanvasPanel::StaticClass(), TEXT("Root"));
     WidgetTree->RootWidget = Root;
 
-    UBorder* Edge = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass(), NAME_None);
-    Edge->SetBrushColor(Theme::PanelEdge);
-    Edge->SetPadding(FMargin(1.0f));
-
-    // Top-right, so the panel never stacks on the bottom-centre transport.
-    UCanvasPanelSlot* EdgeSlot = Root->AddChildToCanvas(Edge);
-    EdgeSlot->SetAnchors(FAnchors(1.0f, 0.0f, 1.0f, 0.0f));
-    EdgeSlot->SetAlignment(FVector2D(1.0f, 0.0f));
-    EdgeSlot->SetPosition(FVector2D(-20.0f, 20.0f));
-    EdgeSlot->SetAutoSize(true);
-
-    Panel = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass(), TEXT("Panel"));
-    Panel->SetBrushColor(Theme::PanelFill);
-    Panel->SetPadding(FMargin(14.0f, 10.0f, 14.0f, 10.0f));
-    Edge->AddChild(Panel);
-
-    USizeBox* Width = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass(), TEXT("Width"));
-    Width->SetWidthOverride(Theme::PanelWidth);
-    Panel->AddChild(Width);
+    Panel = MakeRoundedBorder(TEXT("Panel"), Theme::PanelFill, Theme::PanelEdge,
+        Theme::R1, 1.0f);
+    UCanvasPanelSlot* PanelSlot = Root->AddChildToCanvas(Panel);
+    PanelSlot->SetAnchors(FAnchors(1.0f, 0.0f, 1.0f, 0.0f));
+    PanelSlot->SetAlignment(FVector2D(1.0f, 0.0f));
+    PanelSlot->SetPosition(FVector2D(-Theme::V1, Theme::V1));
+    PanelSlot->SetSize(FVector2D(Theme::W, Theme::H));
 
     UVerticalBox* Stack = WidgetTree->ConstructWidget<UVerticalBox>(
-        UVerticalBox::StaticClass(), TEXT("Stack"));
-    Width->AddChild(Stack);
+        UVerticalBox::StaticClass(), TEXT("PanelStack"));
+    Panel->AddChild(Stack);
 
-    UHorizontalBox* Header = WidgetTree->ConstructWidget<UHorizontalBox>(
-        UHorizontalBox::StaticClass(), NAME_None);
-    Stack->AddChildToVerticalBox(Header);
+    // Outer header: LAYERS + active-card count + chevron.
+    UBorder* Header = MakeRoundedBorder(NAME_None, Theme::PanelHeaderFill,
+        FLinearColor::Transparent, Theme::R1, 0.0f, FMargin(Theme::S1, 0.0f, Theme::S1, 0.0f));
+    USizeBox* HeaderBox = MakeSizeBox(WidgetTree, Header, -1.0f, Theme::H1);
+    Stack->AddChildToVerticalBox(HeaderBox);
 
-    UTextBlock* Title = MakeLabel(NAME_None, LOCTEXT("PanelTitle", "PATHLINES"));
-    StyleLabel(Title, Theme::TitleSize, Theme::TextMuted);
-    Header->AddChildToHorizontalBox(Title);
+    UHorizontalBox* HeaderRow = WidgetTree->ConstructWidget<UHorizontalBox>(
+        UHorizontalBox::StaticClass(), TEXT("LayersHeader"));
+    Header->AddChild(HeaderRow);
 
-    UTextBlock* Hint = MakeLabel(NAME_None, LOCTEXT("PanelHint", "P hides  ·  click a colour to filter"));
-    StyleLabel(Hint, Theme::HintSize, Theme::TextMuted);
-    UHorizontalBoxSlot* HintSlot = Header->AddChildToHorizontalBox(Hint);
-    HintSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
-    HintSlot->SetHorizontalAlignment(HAlign_Right);
+    UTextBlock* HeaderTitle = MakeLabel(TEXT("LayersTitle"), FText::FromString(TEXT("LAYERS")));
+    StyleLabel(HeaderTitle, 13.0f, Theme::TextPrimary);
+    HeaderRow->AddChildToHorizontalBox(HeaderTitle)->SetVerticalAlignment(VAlign_Center);
 
-    UBorder* Rule = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass(), NAME_None);
-    Rule->SetBrushColor(Theme::Divider);
-    USizeBox* RuleHeight = WidgetTree->ConstructWidget<USizeBox>(USizeBox::StaticClass(), NAME_None);
-    RuleHeight->SetHeightOverride(1.0f);
-    RuleHeight->AddChild(Rule);
-    UVerticalBoxSlot* RuleSlot = Stack->AddChildToVerticalBox(RuleHeight);
-    RuleSlot->SetPadding(FMargin(0.0f, 5.0f, 0.0f, 7.0f));
+    USpacer* HeaderSpacer = WidgetTree->ConstructWidget<USpacer>(
+        USpacer::StaticClass(), NAME_None);
+    UHorizontalBoxSlot* HeaderSpacerSlot = HeaderRow->AddChildToHorizontalBox(HeaderSpacer);
+    HeaderSpacerSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
 
-    StatusText = MakeLabel(TEXT("StatusText"), FText::GetEmpty());
-    StyleLabel(StatusText, Theme::StatusSize, Theme::TextPrimary);
-    Stack->AddChildToVerticalBox(StatusText)->SetPadding(FMargin(0.0f, 0.0f, 0.0f, 7.0f));
+    ActiveText = MakeLabel(TEXT("ActiveText"), FText::FromString(TEXT("2 ACTIVE")));
+    StyleLabel(ActiveText, 10.0f, Theme::TextMuted);
+    ActiveText->SetJustification(ETextJustify::Right);
+    UHorizontalBoxSlot* ActiveSlot = HeaderRow->AddChildToHorizontalBox(ActiveText);
+    ActiveSlot->SetVerticalAlignment(VAlign_Center);
 
-    // Row: state toggles.
-    UHorizontalBox* Toggles = WidgetTree->ConstructWidget<UHorizontalBox>(
-        UHorizontalBox::StaticClass(), TEXT("Toggles"));
-    Stack->AddChildToVerticalBox(Toggles)->SetPadding(FMargin(0.0f, 0.0f, 0.0f, 6.0f));
+    UTextBlock* Chevron = MakeLabel(TEXT("LayersChevron"), FText::FromString(TEXT("v")));
+    StyleLabel(Chevron, 12.0f, Theme::TextMuted);
+    UHorizontalBoxSlot* ChevronSlot = HeaderRow->AddChildToHorizontalBox(Chevron);
+    ChevronSlot->SetPadding(FMargin(10.0f, 0.0f, 0.0f, 0.0f));
+    ChevronSlot->SetVerticalAlignment(VAlign_Center);
 
-    EnableButton = MakeButton(TEXT("EnableButton"),
-        LOCTEXT("EnableOn", "TRAILS ON"),
-        LOCTEXT("EnableTip", "Show or hide the particle trail tubes"),
-        &EnableCaption);
-    ColorButton = MakeButton(TEXT("ColorButton"),
-        FJusyncPathlineHUDModel::MakeColorLabel(true),
-        LOCTEXT("ColorTip", "Colour trails per sample by the scalar attribute, or flat"),
-        &ColorCaption);
-    HueButton = MakeButton(TEXT("HueButton"),
-        FJusyncPathlineHUDModel::MakeHueLabel(false, 0.0f, 30.0f),
-        LOCTEXT("HueTip", "Turn the colour filter on or off; the chips below pick the colour"),
-        &HueCaption);
+    USizeBox* HeaderRuleBox = MakeSizeBox(WidgetTree,
+        MakeRoundedBorder(NAME_None, Theme::Divider, FLinearColor::Transparent, 0.0f, 0.0f),
+        -1.0f, 1.0f);
+    Stack->AddChildToVerticalBox(HeaderRuleBox);
 
-    auto AddChip = [Toggles](UButton* Chip)
+    // --------------------------------------------------- PATHLINES CARD
+    UBorder* PathlineCard = MakeRoundedBorder(NAME_None, Theme::CardFill, Theme::CardEdge,
+        Theme::R2, 1.0f);
+    UVerticalBox* PathlineCardStack = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("PathlineCardStack"));
+    PathlineCard->AddChild(PathlineCardStack);
+
+    UBorder* PathlineHeader = MakeRoundedBorder(NAME_None, Theme::CardHeaderFill,
+        FLinearColor::Transparent, Theme::R2, 0.0f, FMargin(Theme::S2, 0.0f, Theme::S2, 0.0f));
+    USizeBox* PathlineHeaderBox = MakeSizeBox(WidgetTree, PathlineHeader, -1.0f, Theme::H2);
+    PathlineCardStack->AddChildToVerticalBox(PathlineHeaderBox);
+
+    UHorizontalBox* PathlineHeaderRow = WidgetTree->ConstructWidget<UHorizontalBox>(
+        UHorizontalBox::StaticClass(), TEXT("PathlineHeaderRow"));
+    PathlineHeader->AddChild(PathlineHeaderRow);
+
+    UTextBlock* PathlineTitle = MakeLabel(TEXT("PathlineTitle"),
+        FText::FromString(TEXT("PATHLINES")));
+    StyleLabel(PathlineTitle, 11.0f, Theme::TextPrimary);
+    PathlineHeaderRow->AddChildToHorizontalBox(PathlineTitle)->SetVerticalAlignment(VAlign_Center);
+
+    USpacer* PathlineSpacer = WidgetTree->ConstructWidget<USpacer>(
+        USpacer::StaticClass(), NAME_None);
+    UHorizontalBoxSlot* PathlineSpacerSlot = PathlineHeaderRow->AddChildToHorizontalBox(PathlineSpacer);
+    PathlineSpacerSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+
+    PathlineStatusText = MakeLabel(TEXT("PathlineStatus"), FText::FromString(TEXT("0 TRACKS")));
+    StyleLabel(PathlineStatusText, 10.0f, Theme::TextMuted);
+    PathlineStatusText->SetJustification(ETextJustify::Right);
+    UHorizontalBoxSlot* PathlineStatusSlot = PathlineHeaderRow->AddChildToHorizontalBox(PathlineStatusText);
+    PathlineStatusSlot->SetPadding(FMargin(8.0f, 0.0f, 10.0f, 0.0f));
+    PathlineStatusSlot->SetVerticalAlignment(VAlign_Center);
+
+    EnableSwitch = MakeSwitch(TEXT("EnableSwitch"),
+        LOCTEXT("EnableTip", "Show or hide the Niagara pathline ribbons"), EnableThumb);
+    USizeBox* EnableSwitchBox = MakeSizeBox(WidgetTree, EnableSwitch, 36.0f, 20.0f);
+    UHorizontalBoxSlot* EnableSwitchSlot = PathlineHeaderRow->AddChildToHorizontalBox(EnableSwitchBox);
+    EnableSwitchSlot->SetVerticalAlignment(VAlign_Center);
+
+    USizeBox* PathlineRuleBox = MakeSizeBox(WidgetTree,
+        MakeRoundedBorder(NAME_None, Theme::Divider, FLinearColor::Transparent, 0.0f, 0.0f),
+        -1.0f, 1.0f);
+    PathlineCardStack->AddChildToVerticalBox(PathlineRuleBox);
+
+    UBorder* PathlineContent = MakeRoundedBorder(NAME_None, FLinearColor::Transparent,
+        FLinearColor::Transparent, 0.0f, 0.0f, FMargin(Theme::S2, 6.0f, Theme::S2, 6.0f));
+    USizeBox* PathlineContentBox = MakeSizeBox(WidgetTree, PathlineContent, -1.0f,
+        Theme::CardContentHeight);
+    PathlineCardStack->AddChildToVerticalBox(PathlineContentBox);
+
+    UVerticalBox* PathlineRows = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("PathlineRows"));
+    PathlineContent->AddChild(PathlineRows);
+
+    auto AddGap = [this](UVerticalBox* Rows)
     {
-        UHorizontalBoxSlot* ChipSlot = Toggles->AddChildToHorizontalBox(Chip);
-        ChipSlot->SetPadding(FMargin(0.0f, 0.0f, 4.0f, 0.0f));
-        ChipSlot->SetVerticalAlignment(VAlign_Center);
-    };
-    AddChip(EnableButton);
-    AddChip(ColorButton);
-    AddChip(HueButton);
-
-    // Row: colour picker. Each chip IS the colour it filters for; clicking
-    // again clears back to no filter.
-    UHorizontalBox* HueRow = WidgetTree->ConstructWidget<UHorizontalBox>(
-        UHorizontalBox::StaticClass(), TEXT("HueRow"));
-    Stack->AddChildToVerticalBox(HueRow)->SetPadding(FMargin(0.0f, 0.0f, 0.0f, 6.0f));
-
-    const TArray<FLinearColor>& ChipColors = FJusyncPathlineHUDModel::HueChipColors();
-    for (int32 Index = 0; Index < ChipColors.Num(); ++Index)
-    {
-        static const TCHAR* ChipGlyphs[] = { TEXT("R"), TEXT("Y"), TEXT("G"),
-                                             TEXT("C"), TEXT("B"), TEXT("M") };
-        UButton* Chip = MakeButton(FName(*FString::Printf(TEXT("HueChip%d"), Index)),
-            FText::FromString(ChipGlyphs[Index % UE_ARRAY_COUNT(ChipGlyphs)]),
-            LOCTEXT("HueChipTip", "Filter trails to this colour (click again to clear)"),
-            nullptr);
-        Chip->SetStyle(MakeHueChipStyle());
-        Chip->SetBackgroundColor(ChipColors[Index]);
-        if (UTextBlock* ChipCaption = Cast<UTextBlock>(Chip->GetChildAt(0)))
-        {
-            ChipCaption->SetShadowColorAndOpacity(FLinearColor(0.0f, 0.0f, 0.0f, 0.9f));
-        }
-        HueChipButtons.Add(Chip);
-
-        UHorizontalBoxSlot* ChipSlot = HueRow->AddChildToHorizontalBox(Chip);
-        ChipSlot->SetPadding(FMargin(0.0f, 0.0f, 4.0f, 0.0f));
-        ChipSlot->SetVerticalAlignment(VAlign_Center);
-    }
-
-    ToleranceMinusButton = MakeButton(TEXT("TolMinus"), FText::FromString(TEXT("-")),
-        LOCTEXT("TolMinusTip", "Wider colour match (adds tolerance in degrees)"));
-    TolerancePlusButton = MakeButton(TEXT("TolPlus"), FText::FromString(TEXT("+")),
-        LOCTEXT("TolPlusTip", "Narrower colour match (removes tolerance in degrees)"));
-    // NOTE on direction: minus WIDENS (see handler), plus NARROWS - the
-    // caption reads "± 30" so more tolerance = more colours.
-    ToleranceCaption = MakeLabel(TEXT("ToleranceCaption"),
-        FJusyncPathlineHUDModel::MakeHueLabel(true, 0.0f, 30.0f));
-    StyleLabel(ToleranceCaption, Theme::ChipSize, Theme::TextPrimary);
-    AddStepperWidgets(HueRow, ToleranceMinusButton, ToleranceCaption, TolerancePlusButton);
-
-    // Row: budget + thickness typed inputs (values shown live in the boxes).
-    UHorizontalBox* Budget = WidgetTree->ConstructWidget<UHorizontalBox>(
-        UHorizontalBox::StaticClass(), TEXT("Budget"));
-    Stack->AddChildToVerticalBox(Budget);
-
-    // Typed overrides: type an exact value, press Enter or click away.
-    // With stepper buttons the row reads "R= [box] [-] [+]".
-    auto AddInput = [this](UHorizontalBox* Row, TObjectPtr<UEditableTextBox>& Input,
-        const FName Name, const FText& Label, const FText& Tooltip,
-        TObjectPtr<UButton>* Minus = nullptr, TObjectPtr<UButton>* Plus = nullptr,
-        float InputWidth = 84.0f)
-    {
-        UTextBlock* Caption = MakeLabel(NAME_None, Label);
-        StyleLabel(Caption, Theme::ChipSize, Theme::TextMuted);
-        UHorizontalBoxSlot* CaptionSlot = Row->AddChildToHorizontalBox(Caption);
-        CaptionSlot->SetPadding(FMargin(14.0f, 0.0f, 0.0f, 0.0f));
-        CaptionSlot->SetVerticalAlignment(VAlign_Center);
-
-        Input = WidgetTree->ConstructWidget<UEditableTextBox>(
-            UEditableTextBox::StaticClass(), Name);
-        Input->SetToolTipText(Tooltip);
-        Input->SetForegroundColor(Theme::TextPrimary);
-        Input->SetJustification(ETextJustify::Right);
-
-        USizeBox* Box = WidgetTree->ConstructWidget<USizeBox>(
-            USizeBox::StaticClass(), NAME_None);
-        Box->SetWidthOverride(InputWidth);
-        Box->AddChild(Input);
-        UHorizontalBoxSlot* Slot = Row->AddChildToHorizontalBox(Box);
-        Slot->SetPadding(FMargin(2.0f, 0.0f, 0.0f, 0.0f));
-        Slot->SetVerticalAlignment(VAlign_Center);
-
-        auto AddMini = [this, Row](TObjectPtr<UButton>& Button, const FName ButtonName,
-            const TCHAR* Glyph, const FText& MiniTooltip)
-        {
-            Button = MakeButton(ButtonName, FText::FromString(Glyph), MiniTooltip, nullptr, true);
-            UHorizontalBoxSlot* MiniSlot = Row->AddChildToHorizontalBox(Button);
-            MiniSlot->SetPadding(FMargin(2.0f, 0.0f, 0.0f, 0.0f));
-            MiniSlot->SetVerticalAlignment(VAlign_Center);
-        };
-        if (Minus)
-        {
-            AddMini(*Minus, FName(*FString::Printf(TEXT("%sMinus"), *Name.ToString())),
-                TEXT("-"), LOCTEXT("StepMinusTip", "Step this value down"));
-        }
-        if (Plus)
-        {
-            AddMini(*Plus, FName(*FString::Printf(TEXT("%sPlus"), *Name.ToString())),
-                TEXT("+"), LOCTEXT("StepPlusTip", "Step this value up"));
-        }
+        USpacer* Gap = WidgetTree->ConstructWidget<USpacer>(USpacer::StaticClass(), NAME_None);
+        Gap->SetSize(FVector2D(0.0f, Theme::S3));
+        Rows->AddChildToVerticalBox(Gap);
     };
 
-    AddInput(Budget, MaxInput, TEXT("MaxInput"), LOCTEXT("MaxInputLabel", "MAX="),
-        LOCTEXT("MaxInputTip", "Exact track budget (1 to 1000). Enter to apply."));
-    MaxInput->OnTextCommitted.AddDynamic(this, &UJusyncPathlineWidget::HandleMaxInputCommitted);
+    AddSliderRow(PathlineRows, FText::FromString(TEXT("TRAIL LIFE")), TEXT("HistorySlider"),
+        2.0f, 512.0f, 1.0f, HistorySlider, HistoryValueText);
+    AddGap(PathlineRows);
+    AddSliderRow(PathlineRows, FText::FromString(TEXT("WIDTH")), TEXT("WidthSlider"),
+        0.1f, 5.0f, 0.05f, WidthSlider, WidthValueText);
+    AddGap(PathlineRows);
 
-    AddInput(Budget, RadiusInput, TEXT("RadiusInput"), LOCTEXT("RadiusInputLabel", "R="),
-        LOCTEXT("RadiusInputTip", "Exact trail radius in cm (0.02 to 50). Enter to apply."),
-        &RadiusMinusButton, &RadiusPlusButton, Theme::StepperInputWidth);
-    RadiusInput->OnTextCommitted.AddDynamic(this, &UJusyncPathlineWidget::HandleRadiusInputCommitted);
+    UHorizontalBox* PathlineRow3 = WidgetTree->ConstructWidget<UHorizontalBox>(
+        UHorizontalBox::StaticClass(), TEXT("PathlineRow3"));
+    PathlineRows->AddChildToVerticalBox(PathlineRow3);
 
-    // Row: trail emission + tube sides. (Point size/glow live in the POINTS
-    // section below, together with their own colour filter.)
-    UHorizontalBox* Visual = WidgetTree->ConstructWidget<UHorizontalBox>(
-        UHorizontalBox::StaticClass(), TEXT("Visual"));
-    Stack->AddChildToVerticalBox(Visual)->SetPadding(FMargin(0.0f, 4.0f, 0.0f, 0.0f));
+    UVerticalBox* ColorColumn = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("ColorColumn"));
+    USizeBox* ColorColumnBox = MakeSizeBox(WidgetTree, ColorColumn, 144.0f, Theme::H4);
+    UHorizontalBoxSlot* ColorColumnSlot = PathlineRow3->AddChildToHorizontalBox(ColorColumnBox);
+    ColorColumnSlot->SetVerticalAlignment(VAlign_Top);
 
-    AddInput(Visual, EmissiveInput, TEXT("EmissiveInput"), LOCTEXT("EmissiveLabel", "EM="),
-        LOCTEXT("EmissiveTip", "Trail glow strength (0 to 4). Enter to apply."),
-        &EmissiveMinusButton, &EmissivePlusButton, Theme::StepperInputWidth);
-    EmissiveInput->OnTextCommitted.AddDynamic(this, &UJusyncPathlineWidget::HandleEmissiveInputCommitted);
+    AddColumnLabel(ColorColumn, FText::FromString(TEXT("COLOR")));
+    ColorCombo = MakeCombo(TEXT("ColorCombo"), { TEXT("SCALAR"), TEXT("FLAT") }, 0);
+    ColorColumn->AddChildToVerticalBox(MakeSizeBox(WidgetTree, ColorCombo, 144.0f, Theme::H3));
 
-    AddInput(Visual, SidesInput, TEXT("SidesInput"), LOCTEXT("SidesLabel", "SIDES="),
-        LOCTEXT("SidesTip", "Tube sides per trail (3 to 16). Enter to apply."),
-        &SidesMinusButton, &SidesPlusButton, Theme::StepperInputWidth);
-    SidesInput->OnTextCommitted.AddDynamic(this, &UJusyncPathlineWidget::HandleSidesInputCommitted);
+    USpacer* PathlineGap3 = WidgetTree->ConstructWidget<USpacer>(
+        USpacer::StaticClass(), NAME_None);
+    PathlineGap3->SetSize(FVector2D(Theme::S4, 0.0f));
+    PathlineRow3->AddChildToHorizontalBox(PathlineGap3);
 
-    // ---- POINTS section: same control language, aimed at the LiDAR clouds.
-    UBorder* PointsRule = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass(), NAME_None);
-    PointsRule->SetBrushColor(Theme::Divider);
-    USizeBox* PointsRuleHeight = WidgetTree->ConstructWidget<USizeBox>(
-        USizeBox::StaticClass(), NAME_None);
-    PointsRuleHeight->SetHeightOverride(1.0f);
-    PointsRuleHeight->AddChild(PointsRule);
-    UVerticalBoxSlot* PointsRuleSlot = Stack->AddChildToVerticalBox(PointsRuleHeight);
-    PointsRuleSlot->SetPadding(FMargin(0.0f, 8.0f, 0.0f, 5.0f));
+    UVerticalBox* HueColumn = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("HueColumn"));
+    USizeBox* HueColumnBox = MakeSizeBox(WidgetTree, HueColumn, 172.0f, Theme::H4);
+    PathlineRow3->AddChildToHorizontalBox(HueColumnBox)->SetVerticalAlignment(VAlign_Top);
 
-    UTextBlock* PointsTitle = MakeLabel(TEXT("PointsTitle"), LOCTEXT("PointsTitle", "POINTS"));
-    StyleLabel(PointsTitle, Theme::TitleSize, Theme::TextMuted);
-    Stack->AddChildToVerticalBox(PointsTitle)->SetPadding(FMargin(0.0f, 0.0f, 0.0f, 5.0f));
+    AddColumnLabel(HueColumn, FText::FromString(TEXT("HUE")));
+    HueCombo = MakeCombo(TEXT("HueCombo"),
+        { TEXT("OFF"), TEXT("RED"), TEXT("YELLOW"), TEXT("GREEN"), TEXT("CYAN"),
+          TEXT("BLUE"), TEXT("MAGENTA") }, 0);
+    HueColumn->AddChildToVerticalBox(MakeSizeBox(WidgetTree, HueCombo, 172.0f, Theme::H3));
 
-    // Row: cloud visibility, point hue toggle, point size and glow inputs.
-    UHorizontalBox* PointsRow = WidgetTree->ConstructWidget<UHorizontalBox>(
-        UHorizontalBox::StaticClass(), TEXT("PointsRow"));
-    Stack->AddChildToVerticalBox(PointsRow)->SetPadding(FMargin(0.0f, 0.0f, 0.0f, 6.0f));
+    AddGap(PathlineRows);
 
-    PointsEnableButton = MakeButton(TEXT("PointsEnableButton"),
-        LOCTEXT("PointsOn", "POINTS ON"),
-        LOCTEXT("PointsOnTip", "Show or hide the streamed point clouds (applies to future frames too)"),
-        &PointsEnableCaption);
-    UHorizontalBoxSlot* PointsEnableSlot = PointsRow->AddChildToHorizontalBox(PointsEnableButton);
-    PointsEnableSlot->SetPadding(FMargin(0.0f, 0.0f, 4.0f, 0.0f));
-    PointsEnableSlot->SetVerticalAlignment(VAlign_Center);
+    UHorizontalBox* PathlineRow4 = WidgetTree->ConstructWidget<UHorizontalBox>(
+        UHorizontalBox::StaticClass(), TEXT("PathlineRow4"));
+    PathlineRows->AddChildToVerticalBox(PathlineRow4);
 
-    PointHueButton = MakeButton(TEXT("PointHueButton"),
-        FJusyncPathlineHUDModel::MakeHueLabel(false, 0.0f, 30.0f),
-        LOCTEXT("PointHueTip", "Colour-filter the points; chips below pick the colour"),
-        &PointHueCaption);
-    UHorizontalBoxSlot* PointHueSlot = PointsRow->AddChildToHorizontalBox(PointHueButton);
-    PointHueSlot->SetPadding(FMargin(0.0f, 0.0f, 4.0f, 0.0f));
-    PointHueSlot->SetVerticalAlignment(VAlign_Center);
+    UVerticalBox* MaxColumn = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("MaxColumn"));
+    USizeBox* MaxColumnBox = MakeSizeBox(WidgetTree, MaxColumn, 144.0f, Theme::H4);
+    UHorizontalBoxSlot* MaxColumnSlot = PathlineRow4->AddChildToHorizontalBox(MaxColumnBox);
+    MaxColumnSlot->SetVerticalAlignment(VAlign_Top);
 
-    // Row: point size and glow inputs, on their own line so nothing clips.
-    UHorizontalBox* PointsVisual = WidgetTree->ConstructWidget<UHorizontalBox>(
-        UHorizontalBox::StaticClass(), TEXT("PointsVisual"));
-    Stack->AddChildToVerticalBox(PointsVisual)->SetPadding(FMargin(0.0f, 0.0f, 0.0f, 6.0f));
+    AddColumnLabel(MaxColumn, FText::FromString(TEXT("MAX")));
+    MaxColumn->AddChildToVerticalBox(MakeStepper(TEXT("Max"), 144.0f,
+        MaxMinusButton, MaxPlusButton, MaxValueText));
 
-    AddInput(PointsVisual, PointSizeInput, TEXT("PointSizeInput"), LOCTEXT("PointSizeLabel", "SIZE="),
-        LOCTEXT("PointSizeTip", "Point size (screen units, 0.01 to 10). Enter to apply."),
-        &PointSizeMinusButton, &PointSizePlusButton, Theme::StepperInputWidth);
-    PointSizeInput->OnTextCommitted.AddDynamic(this, &UJusyncPathlineWidget::HandlePointSizeInputCommitted);
+    USpacer* PathlineGap4 = WidgetTree->ConstructWidget<USpacer>(
+        USpacer::StaticClass(), NAME_None);
+    PathlineGap4->SetSize(FVector2D(Theme::S4, 0.0f));
+    PathlineRow4->AddChildToHorizontalBox(PathlineGap4);
 
-    AddInput(PointsVisual, PointGlowInput, TEXT("PointGlowInput"), LOCTEXT("PointGlowLabel", "GLOW="),
-        LOCTEXT("PointGlowTip", "Point self-glow (0 to 1). Enter to apply."),
-        &PointGlowMinusButton, &PointGlowPlusButton, Theme::StepperInputWidth);
-    PointGlowInput->OnTextCommitted.AddDynamic(this, &UJusyncPathlineWidget::HandlePointGlowInputCommitted);
+    UVerticalBox* ExpiryColumn = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("ExpiryColumn"));
+    USizeBox* ExpiryColumnBox = MakeSizeBox(WidgetTree, ExpiryColumn, 172.0f, Theme::H4);
+    PathlineRow4->AddChildToHorizontalBox(ExpiryColumnBox)->SetVerticalAlignment(VAlign_Top);
 
-    // Row: point colour picker - mirrors the trail chips above.
-    UHorizontalBox* PointHueRow = WidgetTree->ConstructWidget<UHorizontalBox>(
-        UHorizontalBox::StaticClass(), TEXT("PointHueRow"));
-    Stack->AddChildToVerticalBox(PointHueRow);
+    AddColumnLabel(ExpiryColumn, FText::FromString(TEXT("EXPIRY")));
+    ExpiryColumn->AddChildToVerticalBox(MakeStepper(TEXT("Expiry"), 172.0f,
+        ExpiryMinusButton, ExpiryPlusButton, ExpiryValueText));
 
-    for (int32 Index = 0; Index < ChipColors.Num(); ++Index)
-    {
-        static const TCHAR* PChipGlyphs[] = { TEXT("R"), TEXT("Y"), TEXT("G"),
-                                              TEXT("C"), TEXT("B"), TEXT("M") };
-        UButton* Chip = MakeButton(FName(*FString::Printf(TEXT("PointHueChip%d"), Index)),
-            FText::FromString(PChipGlyphs[Index % UE_ARRAY_COUNT(PChipGlyphs)]),
-            LOCTEXT("PointHueChipTip", "Filter points to this colour (click again to clear)"),
-            nullptr);
-        Chip->SetStyle(MakeHueChipStyle());
-        Chip->SetBackgroundColor(ChipColors[Index]);
-        if (UTextBlock* ChipCaption = Cast<UTextBlock>(Chip->GetChildAt(0)))
-        {
-            ChipCaption->SetShadowColorAndOpacity(FLinearColor(0.0f, 0.0f, 0.0f, 0.9f));
-        }
-        PointHueChipButtons.Add(Chip);
+    UVerticalBoxSlot* PathlineCardSlot = Stack->AddChildToVerticalBox(PathlineCard);
+    PathlineCardSlot->SetPadding(FMargin(0.0f, 11.0f, 0.0f, 0.0f));
 
-        UHorizontalBoxSlot* ChipSlot = PointHueRow->AddChildToHorizontalBox(Chip);
-        ChipSlot->SetPadding(FMargin(0.0f, 0.0f, 4.0f, 0.0f));
-        ChipSlot->SetVerticalAlignment(VAlign_Center);
-    }
+    // ------------------------------------------------- POINT CLOUD CARD
+    UBorder* PointCard = MakeRoundedBorder(NAME_None, Theme::CardFill, Theme::CardEdge,
+        Theme::R2, 1.0f);
+    UVerticalBox* PointCardStack = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("PointCardStack"));
+    PointCard->AddChild(PointCardStack);
 
-    PointToleranceMinusButton = MakeButton(TEXT("PointTolMinus"), FText::FromString(TEXT("-")),
-        LOCTEXT("PointTolMinusTip", "Wider point colour match (adds tolerance in degrees)"));
-    PointTolerancePlusButton = MakeButton(TEXT("PointTolPlus"), FText::FromString(TEXT("+")),
-        LOCTEXT("PointTolPlusTip", "Narrower point colour match (removes tolerance in degrees)"));
-    PointToleranceCaption = MakeLabel(TEXT("PointToleranceCaption"),
-        FJusyncPathlineHUDModel::MakeHueLabel(true, 0.0f, 30.0f));
-    StyleLabel(PointToleranceCaption, Theme::ChipSize, Theme::TextPrimary);
-    AddStepperWidgets(PointHueRow, PointToleranceMinusButton, PointToleranceCaption,
-        PointTolerancePlusButton);
+    UBorder* PointHeader = MakeRoundedBorder(NAME_None, Theme::CardHeaderFill,
+        FLinearColor::Transparent, Theme::R2, 0.0f, FMargin(Theme::S2, 0.0f, Theme::S2, 0.0f));
+    USizeBox* PointHeaderBox = MakeSizeBox(WidgetTree, PointHeader, -1.0f, Theme::H2);
+    PointCardStack->AddChildToVerticalBox(PointHeaderBox);
+
+    UHorizontalBox* PointHeaderRow = WidgetTree->ConstructWidget<UHorizontalBox>(
+        UHorizontalBox::StaticClass(), TEXT("PointHeaderRow"));
+    PointHeader->AddChild(PointHeaderRow);
+
+    UTextBlock* PointTitle = MakeLabel(TEXT("PointTitle"),
+        FText::FromString(TEXT("POINT CLOUD")));
+    StyleLabel(PointTitle, 11.0f, Theme::TextPrimary);
+    PointHeaderRow->AddChildToHorizontalBox(PointTitle)->SetVerticalAlignment(VAlign_Center);
+
+    USpacer* PointSpacer = WidgetTree->ConstructWidget<USpacer>(
+        USpacer::StaticClass(), NAME_None);
+    UHorizontalBoxSlot* PointSpacerSlot = PointHeaderRow->AddChildToHorizontalBox(PointSpacer);
+    PointSpacerSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+
+    PointStatusText = MakeLabel(TEXT("PointStatus"), FText::FromString(TEXT("0 ACTORS")));
+    StyleLabel(PointStatusText, 10.0f, Theme::TextMuted);
+    PointStatusText->SetJustification(ETextJustify::Right);
+    UHorizontalBoxSlot* PointStatusSlot = PointHeaderRow->AddChildToHorizontalBox(PointStatusText);
+    PointStatusSlot->SetPadding(FMargin(8.0f, 0.0f, 10.0f, 0.0f));
+    PointStatusSlot->SetVerticalAlignment(VAlign_Center);
+
+    PointsSwitch = MakeSwitch(TEXT("PointsSwitch"),
+        LOCTEXT("PointsTip", "Show or hide the streamed point clouds"), PointsThumb);
+    USizeBox* PointsSwitchBox = MakeSizeBox(WidgetTree, PointsSwitch, 36.0f, 20.0f);
+    UHorizontalBoxSlot* PointsSwitchSlot = PointHeaderRow->AddChildToHorizontalBox(PointsSwitchBox);
+    PointsSwitchSlot->SetVerticalAlignment(VAlign_Center);
+
+    USizeBox* PointRuleBox = MakeSizeBox(WidgetTree,
+        MakeRoundedBorder(NAME_None, Theme::Divider, FLinearColor::Transparent, 0.0f, 0.0f),
+        -1.0f, 1.0f);
+    PointCardStack->AddChildToVerticalBox(PointRuleBox);
+
+    UBorder* PointContent = MakeRoundedBorder(NAME_None, FLinearColor::Transparent,
+        FLinearColor::Transparent, 0.0f, 0.0f, FMargin(Theme::S2, 6.0f, Theme::S2, 6.0f));
+    USizeBox* PointContentBox = MakeSizeBox(WidgetTree, PointContent, -1.0f,
+        Theme::PointCardContentHeight);
+    PointCardStack->AddChildToVerticalBox(PointContentBox);
+
+    UVerticalBox* PointRows = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("PointRows"));
+    PointContent->AddChild(PointRows);
+
+    AddSliderRow(PointRows, FText::FromString(TEXT("POINT SIZE")), TEXT("PointSizeSlider"),
+        0.001f, 1.0f, 0.001f, PointSizeSlider, PointSizeValueText);
+    AddGap(PointRows);
+
+    // Self-glow: jusync.Spawner.CloudEmissiveFloor, pushed to the cloud MIDs.
+    // Unlit clouds are lit entirely by this floor, so 0 reads near-black and 1
+    // clips to white; it belongs next to the size it is usually confused with.
+    AddSliderRow(PointRows, FText::FromString(TEXT("GLOW")), TEXT("PointGlowSlider"),
+        0.0f, 1.0f, 0.005f, PointGlowSlider, PointGlowValueText);
+    AddGap(PointRows);
+
+    UHorizontalBox* PointRow2 = WidgetTree->ConstructWidget<UHorizontalBox>(
+        UHorizontalBox::StaticClass(), TEXT("PointRow2"));
+    PointRows->AddChildToVerticalBox(PointRow2);
+
+    UVerticalBox* ShapeColumn = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("ShapeColumn"));
+    USizeBox* ShapeColumnBox = MakeSizeBox(WidgetTree, ShapeColumn, 144.0f, Theme::H4);
+    UHorizontalBoxSlot* ShapeColumnSlot = PointRow2->AddChildToHorizontalBox(ShapeColumnBox);
+    ShapeColumnSlot->SetVerticalAlignment(VAlign_Top);
+    AddColumnLabel(ShapeColumn, FText::FromString(TEXT("SHAPE")));
+
+    UBorder* ShapeWell = MakeRoundedBorder(NAME_None, Theme::WellFill, Theme::WellEdge,
+        4.0f, 1.0f, FMargin(2.0f));
+    UHorizontalBox* ShapeRow = WidgetTree->ConstructWidget<UHorizontalBox>(
+        UHorizontalBox::StaticClass(), TEXT("ShapeRow"));
+    ShapeWell->AddChild(ShapeRow);
+
+    ShapeSquareButton = MakeButton(TEXT("ShapeSquare"), FText::FromString(TEXT("SQ")),
+        LOCTEXT("ShapeSquareTip", "Use square points"), nullptr, 10.0f);
+    ShapeCircleButton = MakeButton(TEXT("ShapeCircle"), FText::FromString(TEXT("CI")),
+        LOCTEXT("ShapeCircleTip", "Use circular points"), nullptr, 10.0f);
+    ShapeSquareButton->SetStyle(MakeButtonStyle(FLinearColor::White, FLinearColor::White,
+        FLinearColor(0.85f, 0.85f, 0.85f, 1.0f), Theme::ChipDisabled, 4.0f));
+    ShapeCircleButton->SetStyle(MakeButtonStyle(FLinearColor::White, FLinearColor::White,
+        FLinearColor(0.85f, 0.85f, 0.85f, 1.0f), Theme::ChipDisabled, 4.0f));
+    ShapeRow->AddChildToHorizontalBox(MakeSizeBox(WidgetTree, ShapeSquareButton, 58.0f, 24.0f))
+        ->SetVerticalAlignment(VAlign_Center);
+    ShapeRow->AddChildToHorizontalBox(MakeSizeBox(WidgetTree, ShapeCircleButton, 58.0f, 24.0f))
+        ->SetVerticalAlignment(VAlign_Center);
+
+    USizeBox* ShapeWellBox = MakeSizeBox(WidgetTree, ShapeWell, 120.0f, Theme::H3);
+    UVerticalBoxSlot* ShapeWellSlot = ShapeColumn->AddChildToVerticalBox(ShapeWellBox);
+    ShapeWellSlot->SetHorizontalAlignment(HAlign_Left);
+
+    USpacer* PointGap2 = WidgetTree->ConstructWidget<USpacer>(
+        USpacer::StaticClass(), NAME_None);
+    PointGap2->SetSize(FVector2D(Theme::S4, 0.0f));
+    PointRow2->AddChildToHorizontalBox(PointGap2);
+
+    UVerticalBox* ScalingColumn = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("ScalingColumn"));
+    USizeBox* ScalingColumnBox = MakeSizeBox(WidgetTree, ScalingColumn, 172.0f, Theme::H4);
+    PointRow2->AddChildToHorizontalBox(ScalingColumnBox)->SetVerticalAlignment(VAlign_Top);
+    AddColumnLabel(ScalingColumn, FText::FromString(TEXT("SCALING")));
+    ScalingCombo = MakeCombo(TEXT("ScalingCombo"),
+        { TEXT("NODE"), TEXT("ADAPT"), TEXT("POINT"), TEXT("SCREEN") }, 1);
+    ScalingColumn->AddChildToVerticalBox(MakeSizeBox(WidgetTree, ScalingCombo, 172.0f, Theme::H3));
+
+    AddGap(PointRows);
+
+    UHorizontalBox* PointRow3 = WidgetTree->ConstructWidget<UHorizontalBox>(
+        UHorizontalBox::StaticClass(), TEXT("PointRow3"));
+    PointRows->AddChildToVerticalBox(PointRow3);
+
+    UVerticalBox* OrientationColumn = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("OrientationColumn"));
+    USizeBox* OrientationColumnBox = MakeSizeBox(WidgetTree, OrientationColumn, 144.0f, Theme::H4);
+    UHorizontalBoxSlot* OrientationColumnSlot = PointRow3->AddChildToHorizontalBox(OrientationColumnBox);
+    OrientationColumnSlot->SetVerticalAlignment(VAlign_Top);
+    AddColumnLabel(OrientationColumn, FText::FromString(TEXT("ORIENT")));
+    OrientationCombo = MakeCombo(TEXT("OrientationCombo"),
+        { TEXT("CAMERA"), TEXT("NORMAL") }, 0);
+    OrientationColumn->AddChildToVerticalBox(MakeSizeBox(WidgetTree, OrientationCombo, 144.0f, Theme::H3));
+
+    USpacer* PointGap3 = WidgetTree->ConstructWidget<USpacer>(
+        USpacer::StaticClass(), NAME_None);
+    PointGap3->SetSize(FVector2D(Theme::S4, 0.0f));
+    PointRow3->AddChildToHorizontalBox(PointGap3);
+
+    UVerticalBox* PointHueColumn = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("PointHueColumn"));
+    USizeBox* PointHueColumnBox = MakeSizeBox(WidgetTree, PointHueColumn, 172.0f, Theme::H4);
+    PointRow3->AddChildToHorizontalBox(PointHueColumnBox)->SetVerticalAlignment(VAlign_Top);
+    AddColumnLabel(PointHueColumn, FText::FromString(TEXT("FILTER")));
+
+    PointHueCombo = MakeCombo(TEXT("PointHueCombo"),
+        { TEXT("OFF"), TEXT("RED"), TEXT("YELLOW"), TEXT("GREEN"), TEXT("CYAN"),
+          TEXT("BLUE"), TEXT("MAGENTA") }, 0);
+    PointHueColumn->AddChildToVerticalBox(MakeSizeBox(WidgetTree, PointHueCombo, 172.0f, Theme::H3));
+
+    AddGap(PointRows);
+
+    UHorizontalBox* PointRow4 = WidgetTree->ConstructWidget<UHorizontalBox>(
+        UHorizontalBox::StaticClass(), TEXT("PointRow4"));
+    PointRows->AddChildToVerticalBox(PointRow4);
+
+    UVerticalBox* NormalsColumn = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("NormalsColumn"));
+    USizeBox* NormalsColumnBox = MakeSizeBox(WidgetTree, NormalsColumn, 144.0f, Theme::H4);
+    UHorizontalBoxSlot* NormalsColumnSlot = PointRow4->AddChildToHorizontalBox(NormalsColumnBox);
+    NormalsColumnSlot->SetVerticalAlignment(VAlign_Top);
+    AddColumnLabel(NormalsColumn, FText::FromString(TEXT("NORMALS")));
+    NormalsSwitch = MakeSwitch(TEXT("NormalsSwitch"),
+        LOCTEXT("NormalsTip", "Calculate point-cloud normals"), NormalsThumb);
+    USizeBox* NormalsSwitchBox = MakeSizeBox(WidgetTree, NormalsSwitch, 36.0f, 20.0f);
+    UVerticalBoxSlot* NormalsSwitchSlot = NormalsColumn->AddChildToVerticalBox(NormalsSwitchBox);
+    NormalsSwitchSlot->SetHorizontalAlignment(HAlign_Left);
+
+    USpacer* PointGap4 = WidgetTree->ConstructWidget<USpacer>(
+        USpacer::StaticClass(), NAME_None);
+    PointGap4->SetSize(FVector2D(Theme::S4, 0.0f));
+    PointRow4->AddChildToHorizontalBox(PointGap4);
+
+    UVerticalBox* QualityColumn = WidgetTree->ConstructWidget<UVerticalBox>(
+        UVerticalBox::StaticClass(), TEXT("QualityColumn"));
+    USizeBox* QualityColumnBox = MakeSizeBox(WidgetTree, QualityColumn, 172.0f, Theme::H4);
+    PointRow4->AddChildToHorizontalBox(QualityColumnBox)->SetVerticalAlignment(VAlign_Top);
+    AddColumnLabel(QualityColumn, FText::FromString(TEXT("QUALITY")));
+    QualityColumn->AddChildToVerticalBox(MakeStepper(TEXT("Quality"), 172.0f,
+        QualityMinusButton, QualityPlusButton, QualityValueText));
+
+    UVerticalBoxSlot* PointCardSlot = Stack->AddChildToVerticalBox(PointCard);
+    PointCardSlot->SetPadding(FMargin(0.0f, 12.0f, 0.0f, 16.0f));
 }
 
-void UJusyncPathlineWidget::AddStepperWidgets(UHorizontalBox* Row, UButton* MinusButton,
-    UTextBlock* Caption, UButton* PlusButton)
+void UJusyncPathlineWidget::AddSliderRow(UVerticalBox* Parent, const FText& Label,
+    const FName SliderName, float Min, float Max, float Step,
+    TObjectPtr<USlider>& OutSlider, TObjectPtr<UTextBlock>& OutValue)
 {
-    auto Pad = [Row](UWidget* Widget, const FMargin& InMargin)
-    {
-        UHorizontalBoxSlot* Slot = Row->AddChildToHorizontalBox(Widget);
-        Slot->SetPadding(InMargin);
-        Slot->SetVerticalAlignment(VAlign_Center);
-    };
+    USizeBox* RowBox = WidgetTree->ConstructWidget<USizeBox>(
+        USizeBox::StaticClass(), NAME_None);
+    RowBox->SetHeightOverride(Theme::H4);
+    Parent->AddChildToVerticalBox(RowBox);
 
-    Pad(Caption, FMargin(6.0f, 0.0f, 2.0f, 0.0f));
-    Pad(MinusButton, FMargin(0.0f, 0.0f, 2.0f, 0.0f));
-    Pad(PlusButton, FMargin(0.0f, 0.0f, 12.0f, 0.0f));
+    UHorizontalBox* Row = WidgetTree->ConstructWidget<UHorizontalBox>(
+        UHorizontalBox::StaticClass(), NAME_None);
+    RowBox->AddChild(Row);
+
+    UTextBlock* LabelText = MakeLabel(NAME_None, Label);
+    StyleLabel(LabelText, 10.0f, Theme::TextMuted);
+    USizeBox* LabelBox = MakeSizeBox(WidgetTree, LabelText, Theme::LabelWidth, -1.0f);
+    UHorizontalBoxSlot* LabelSlot = Row->AddChildToHorizontalBox(LabelBox);
+    LabelSlot->SetVerticalAlignment(VAlign_Center);
+
+    USlider* Slider = MakeSlider(SliderName, Min, Max, Step);
+    UHorizontalBoxSlot* SliderSlot = Row->AddChildToHorizontalBox(Slider);
+    SliderSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+    SliderSlot->SetVerticalAlignment(VAlign_Center);
+
+    OutValue = MakeLabel(NAME_None, FText::GetEmpty());
+    StyleLabel(OutValue, 11.0f, Theme::TextPrimary);
+    OutValue->SetJustification(ETextJustify::Right);
+    USizeBox* ValueBox = MakeSizeBox(WidgetTree, OutValue, Theme::ValueWidth, -1.0f);
+    UHorizontalBoxSlot* ValueSlot = Row->AddChildToHorizontalBox(ValueBox);
+    ValueSlot->SetVerticalAlignment(VAlign_Center);
+
+    OutSlider = Slider;
+}
+
+void UJusyncPathlineWidget::AddColumnLabel(UVerticalBox* Column, const FText& Label)
+{
+    UTextBlock* LabelText = MakeLabel(NAME_None, Label);
+    StyleLabel(LabelText, 10.0f, Theme::TextMuted);
+    UVerticalBoxSlot* LabelSlot = Column->AddChildToVerticalBox(LabelText);
+    LabelSlot->SetPadding(FMargin(0.0f, 0.0f, 0.0f, 1.0f));
+}
+
+UWidget* UJusyncPathlineWidget::MakeStepper(const FName BaseName, float Width,
+    TObjectPtr<UButton>& OutMinus, TObjectPtr<UButton>& OutPlus, TObjectPtr<UTextBlock>& OutValue)
+{
+    UBorder* Well = MakeRoundedBorder(NAME_None, Theme::WellFill, Theme::WellEdge,
+        4.0f, 1.0f);
+    UHorizontalBox* Row = WidgetTree->ConstructWidget<UHorizontalBox>(
+        UHorizontalBox::StaticClass(), NAME_None);
+    Well->AddChild(Row);
+
+    const FName MinusName(*FString::Printf(TEXT("%sMinus"), *BaseName.ToString()));
+    const FName PlusName(*FString::Printf(TEXT("%sPlus"), *BaseName.ToString()));
+    OutMinus = MakeButton(MinusName, FText::FromString(TEXT("-")),
+        LOCTEXT("StepMinusTip", "Step this value down"), nullptr, 12.0f);
+    OutPlus = MakeButton(PlusName, FText::FromString(TEXT("+")),
+        LOCTEXT("StepPlusTip", "Step this value up"), nullptr, 12.0f);
+    OutMinus->SetStyle(MakeButtonStyle(FLinearColor::Transparent,
+        FLinearColor(1.0f, 1.0f, 1.0f, 0.08f), FLinearColor(1.0f, 1.0f, 1.0f, 0.14f),
+        FLinearColor::Transparent, 4.0f));
+    OutPlus->SetStyle(MakeButtonStyle(FLinearColor::Transparent,
+        FLinearColor(1.0f, 1.0f, 1.0f, 0.08f), FLinearColor(1.0f, 1.0f, 1.0f, 0.14f),
+        FLinearColor::Transparent, 4.0f));
+
+    USizeBox* MinusBox = MakeSizeBox(WidgetTree, OutMinus, 24.0f, Theme::H3);
+    Row->AddChildToHorizontalBox(MinusBox)->SetVerticalAlignment(VAlign_Center);
+
+    OutValue = MakeLabel(NAME_None, FText::FromString(TEXT("0")));
+    StyleLabel(OutValue, 11.0f, Theme::TextPrimary);
+    OutValue->SetJustification(ETextJustify::Center);
+    UHorizontalBoxSlot* ValueSlot = Row->AddChildToHorizontalBox(OutValue);
+    ValueSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+    ValueSlot->SetHorizontalAlignment(HAlign_Center);
+    ValueSlot->SetVerticalAlignment(VAlign_Center);
+
+    USizeBox* PlusBox = MakeSizeBox(WidgetTree, OutPlus, 24.0f, Theme::H3);
+    Row->AddChildToHorizontalBox(PlusBox)->SetVerticalAlignment(VAlign_Center);
+
+    return MakeSizeBox(WidgetTree, Well, Width, Theme::H3);
 }
 
 UTextBlock* UJusyncPathlineWidget::MakeLabel(const FName Name, const FText& Label)
@@ -479,18 +839,17 @@ UTextBlock* UJusyncPathlineWidget::MakeLabel(const FName Name, const FText& Labe
     return Text;
 }
 
-UButton* UJusyncPathlineWidget::MakeButton(const FName Name, const FText& Label, const FText& Tooltip,
-    TObjectPtr<UTextBlock>* OutCaption, bool bMini)
+UButton* UJusyncPathlineWidget::MakeButton(const FName Name, const FText& Label,
+    const FText& Tooltip, TObjectPtr<UTextBlock>* OutCaption, float FontSize)
 {
     UButton* Button = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass(), Name);
     Button->SetToolTipText(Tooltip);
-    Button->SetStyle(MakeChipStyle());
+    Button->SetStyle(MakeButtonStyle(Theme::ChipIdle, Theme::ChipHover, Theme::ChipPressed,
+        Theme::ChipDisabled, 6.0f));
     Button->SetClickMethod(EButtonClickMethod::Type::PreciseClick);
 
-    // NAME_None on purpose (see UJusyncPlaybackWidget::MakeButton): reusing the
-    // button's name for the caption would replace it in the WidgetTree.
     UTextBlock* Caption = MakeLabel(NAME_None, Label);
-    StyleLabel(Caption, Theme::ChipSize, Theme::TextPrimary);
+    StyleLabel(Caption, FontSize, Theme::TextPrimary);
     Caption->SetJustification(ETextJustify::Center);
     Button->AddChild(Caption);
     if (OutCaption)
@@ -500,39 +859,122 @@ UButton* UJusyncPathlineWidget::MakeButton(const FName Name, const FText& Label,
 
     if (UButtonSlot* CaptionSlot = Cast<UButtonSlot>(Caption->Slot))
     {
-        CaptionSlot->SetPadding(bMini ? Theme::MiniPadding : Theme::ChipPadding);
+        CaptionSlot->SetPadding(FMargin(0.0f));
         CaptionSlot->SetHorizontalAlignment(HAlign_Center);
         CaptionSlot->SetVerticalAlignment(VAlign_Center);
     }
     return Button;
 }
 
-int32 UJusyncPathlineWidget::EffectiveMaxTracks() const
+UBorder* UJusyncPathlineWidget::MakeRoundedBorder(const FName Name, const FLinearColor& Fill,
+    const FLinearColor& Outline, float Radius, float OutlineWidth, const FMargin& InPadding)
 {
-    if (const IConsoleVariable* CVar =
-        IConsoleManager::Get().FindConsoleVariable(TEXT("jusync.Pathlines.MaxTracks")))
-    {
-        const int32 Override = CVar->GetInt();
-        if (Override > 0)
-        {
-            return Override;
-        }
-    }
-    return Spawner ? Spawner->PathlineMaxTracks : 0;
+    UBorder* Border = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass(), Name);
+    Border->SetBrush(FSlateRoundedBoxBrush(Fill, Radius, Outline, OutlineWidth));
+    Border->SetPadding(InPadding);
+    return Border;
 }
 
-float UJusyncPathlineWidget::EffectiveRadius() const
+UButton* UJusyncPathlineWidget::MakeSwitch(const FName Name, const FText& Tooltip,
+    TObjectPtr<UBorder>& OutThumb)
 {
-    if (const IConsoleVariable* CVar =
-        IConsoleManager::Get().FindConsoleVariable(TEXT("jusync.Pathlines.Radius")))
+    UButton* Button = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass(), Name);
+    Button->SetToolTipText(Tooltip);
+    Button->SetStyle(MakeButtonStyle(FLinearColor::White, FLinearColor::White,
+        FLinearColor(0.85f, 0.85f, 0.85f, 1.0f), FLinearColor(0.3f, 0.3f, 0.3f, 0.5f), 10.0f));
+    Button->SetClickMethod(EButtonClickMethod::Type::PreciseClick);
+
+    UCanvasPanel* Canvas = WidgetTree->ConstructWidget<UCanvasPanel>(
+        UCanvasPanel::StaticClass(), NAME_None);
+    Canvas->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+    Button->AddChild(Canvas);
+    if (UButtonSlot* CanvasSlot = Cast<UButtonSlot>(Canvas->Slot))
     {
-        const float Override = CVar->GetFloat();
-        if (Override > 0.0f)
+        CanvasSlot->SetPadding(FMargin(0.0f));
+        CanvasSlot->SetHorizontalAlignment(HAlign_Fill);
+        CanvasSlot->SetVerticalAlignment(VAlign_Fill);
+    }
+
+    UBorder* Thumb = MakeRoundedBorder(NAME_None, FLinearColor::White,
+        FLinearColor(0.0f, 0.0f, 0.0f, 0.12f), 7.0f, 1.0f);
+    Thumb->SetVisibility(ESlateVisibility::HitTestInvisible);
+    UCanvasPanelSlot* ThumbSlot = Canvas->AddChildToCanvas(Thumb);
+    ThumbSlot->SetAnchors(FAnchors(0.0f, 0.0f, 0.0f, 0.0f));
+    ThumbSlot->SetAlignment(FVector2D(0.0f, 0.0f));
+    ThumbSlot->SetPosition(FVector2D(2.0f, 3.0f));
+    ThumbSlot->SetSize(FVector2D(14.0f, 14.0f));
+
+    OutThumb = Thumb;
+    return Button;
+}
+
+void UJusyncPathlineWidget::SetSwitchState(UButton* Button, UBorder* Thumb, bool bOn)
+{
+    if (Button)
+    {
+        Button->SetBackgroundColor(bOn ? Theme::Accent : Theme::ChipIdle);
+    }
+    if (Thumb)
+    {
+        if (UCanvasPanelSlot* ThumbSlot = Cast<UCanvasPanelSlot>(Thumb->Slot))
         {
-            return Override;
+            ThumbSlot->SetPosition(FVector2D(bOn ? 20.0f : 2.0f, 3.0f));
         }
     }
-    return Spawner ? Spawner->PathlineRadius : 0.0f;
+}
+
+USlider* UJusyncPathlineWidget::MakeSlider(const FName Name, float Min, float Max, float Step)
+{
+    USlider* Slider = WidgetTree->ConstructWidget<USlider>(USlider::StaticClass(), Name);
+    Slider->SetMinValue(Min);
+    Slider->SetMaxValue(Max);
+    Slider->SetStepSize(Step);
+    Slider->SetIndentHandle(false);
+    Slider->SetWidgetStyle(MakeSliderStyle());
+    return Slider;
+}
+
+UComboBoxString* UJusyncPathlineWidget::MakeCombo(const FName Name,
+    const TArray<FString>& Options, int32 DefaultIndex)
+{
+    UComboBoxString* Combo = WidgetTree->ConstructWidget<UComboBoxString>(
+        UComboBoxString::StaticClass(), Name);
+    Combo->SetWidgetStyle(MakeComboStyle());
+    Combo->SetItemStyle(MakeComboItemStyle());
+    Combo->SetContentPadding(FMargin(10.0f, 0.0f, 8.0f, 0.0f));
+    Combo->SetMaxListHeight(220.0f);
+    Combo->SetHasDownArrow(true);
+    // The UMG API only exposes the foreground through InitForegroundColor,
+    // which is protected. Set the backing property before the Slate widget is
+    // built so the selected value uses the same light ink as the rest of the
+    // deck instead of the editor's near-black default.
+    PRAGMA_DISABLE_DEPRECATION_WARNINGS
+    Combo->ForegroundColor = FSlateColor(Theme::TextPrimary);
+    Combo->Font.Size = 10;
+    PRAGMA_ENABLE_DEPRECATION_WARNINGS
+    for (const FString& Option : Options)
+    {
+        Combo->AddOption(Option);
+    }
+    Combo->SetSelectedIndex(FMath::Clamp(DefaultIndex, 0, FMath::Max(0, Options.Num() - 1)));
+    return Combo;
+}
+
+int32 UJusyncPathlineWidget::CurrentIntCvar(const TCHAR* Name, int32 Default)
+{
+    if (const IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(Name))
+    {
+        return CVar->GetInt();
+    }
+    return Default;
+}
+
+void UJusyncPathlineWidget::SetIntCvar(const TCHAR* Name, int32 Value)
+{
+    if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(Name))
+    {
+        CVar->Set(Value, ECVF_SetByConsole);
+    }
 }
 
 float UJusyncPathlineWidget::CurrentFloatCvar(const TCHAR* Name, float Default)
@@ -548,72 +990,34 @@ void UJusyncPathlineWidget::SetFloatCvar(const TCHAR* Name, float Value)
 {
     if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(Name))
     {
-        CVar->Set(Value);
+        // Priority matters: ECVF_SetByConsole > ECVF_SetByCode. Any value typed
+        // at the editor console (or pinned in an ini) therefore swallows a
+        // plain Set(value) from here, the CVar never changes, Refresh reads the
+        // old value back and the slider handle snaps home - it reads as a
+        // frozen control. The panel is the authority, so write at console
+        // priority to match.
+        CVar->Set(Value, ECVF_SetByConsole);
     }
 }
 
-FReply UJusyncPathlineWidget::NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent)
+int32 UJusyncPathlineWidget::EffectiveHistorySamples() const
 {
-    // Slate routes keys along the FOCUSED widget's path, so while the caret
-    // sits in one of these text boxes the player controller's InputKey never
-    // runs and Tab/P looked dead ("can't use both panels at once"). Handle
-    // the toggle keys here, before the focus system eats Tab for traversal.
-    if (!InKeyEvent.IsRepeat())
+    const int32 Override = CurrentIntCvar(TEXT("jusync.Pathlines.HistorySamples"), 0);
+    if (Override > 0)
     {
-        if (AJusyncPlaybackHUDPlayerController* Controller =
-            Cast<AJusyncPlaybackHUDPlayerController>(GetOwningPlayer()))
-        {
-            if (Controller->HandlePanelToggleKey(InKeyEvent.GetKey()))
-            {
-                return FReply::Handled();
-            }
-        }
+        return Override;
     }
-    return Super::NativeOnKeyDown(InGeometry, InKeyEvent);
+    return Spawner ? Spawner->PathlineHistorySamples : 128;
 }
 
-void UJusyncPathlineWidget::ReleaseInputFocus()
+int32 UJusyncPathlineWidget::EffectiveMaxTracks() const
 {
-    // Enter means "applied"; give the keyboard back to the game so the next
-    // P/Tab press reaches the controller instead of being typed into the box.
-    if (FSlateApplication::IsInitialized())
+    const int32 Override = CurrentIntCvar(TEXT("jusync.Pathlines.MaxTracks"), 0);
+    if (Override > 0)
     {
-        FSlateApplication::Get().ClearKeyboardFocus(EFocusCause::SetDirectly);
+        return Override;
     }
-}
-
-void UJusyncPathlineWidget::StepRadiusBy(int32 Direction)
-{
-    SetFloatCvar(TEXT("jusync.Pathlines.Radius"),
-        FJusyncPathlineHUDModel::StepRadius(EffectiveRadius(), Direction));
-    Refresh();
-}
-
-void UJusyncPathlineWidget::StepPointSizeBy(int32 Direction)
-{
-    SetFloatCvar(TEXT("jusync.Morph.CloudScreenSize"), FJusyncPathlineHUDModel::StepPointSize(
-        CurrentFloatCvar(TEXT("jusync.Morph.CloudScreenSize"), 2.7f), Direction));
-    Refresh();
-}
-
-void UJusyncPathlineWidget::StepEmissiveBy(int32 Direction)
-{
-    if (Spawner)
-    {
-        Spawner->PathlineEmissiveStrength =
-            FJusyncPathlineHUDModel::StepEmissive(Spawner->PathlineEmissiveStrength, Direction);
-    }
-    Refresh();
-}
-
-void UJusyncPathlineWidget::StepSidesBy(int32 Direction)
-{
-    if (IConsoleVariable* CVar =
-        IConsoleManager::Get().FindConsoleVariable(TEXT("jusync.Pathlines.TubeSides")))
-    {
-        CVar->Set(FJusyncPathlineHUDModel::StepTubeSides(CVar->GetInt(), Direction));
-    }
-    Refresh();
+    return Spawner ? Spawner->PathlineMaxTracks : 1000;
 }
 
 void UJusyncPathlineWidget::Refresh()
@@ -624,375 +1028,489 @@ void UJusyncPathlineWidget::Refresh()
     }
 
     const bool bOn = Spawner && Spawner->bEnablePathlines;
-    const int32 Active = Spawner ? Spawner->PathlineActiveTracks : 0;
-    const int32 VisibleTracks = Spawner ? Spawner->PathlineVisibleTracks : 0;
-    const int64 Nodes = Spawner ? Spawner->PathlineNodeCount : 0;
+    const bool bPoints = Spawner && Spawner->bPointCloudsVisible;
+    const int32 ActiveCount = (bOn ? 1 : 0) + (bPoints ? 1 : 0);
 
-    StatusText->SetText(FJusyncPathlineHUDModel::MakeStatusLabel(Active, VisibleTracks, Nodes));
-    StatusText->SetColorAndOpacity(FSlateColor(
-        !Spawner ? Theme::TextMuted : (bOn ? Theme::Live : Theme::Paused)));
+    if (ActiveText)
+    {
+        ActiveText->SetText(FText::FromString(FString::Printf(TEXT("%d ACTIVE"), ActiveCount)));
+    }
+    if (PathlineStatusText)
+    {
+        PathlineStatusText->SetText(FText::FromString(Spawner
+            ? FString::Printf(TEXT("%d TRACKS"), Spawner->PathlineActiveTracks)
+            : TEXT("-- TRACKS")));
+        PathlineStatusText->SetColorAndOpacity(FSlateColor(bOn ? Theme::TextMuted : Theme::TextMuted * 0.7f));
+    }
+    if (PointStatusText)
+    {
+        PointStatusText->SetText(FText::FromString(Spawner
+            ? FString::Printf(TEXT("%d ACTORS"), Spawner->ActorsSpawned)
+            : TEXT("-- ACTORS")));
+        PointStatusText->SetColorAndOpacity(FSlateColor(bPoints ? Theme::TextMuted : Theme::TextMuted * 0.7f));
+    }
 
-    EnableButton->SetIsEnabled(Spawner != nullptr);
-    EnableCaption->SetText(bOn ? LOCTEXT("TrailsOn", "TRAILS ON")
-                               : LOCTEXT("TrailsOff", "TRAILS OFF"));
-    EnableButton->SetColorAndOpacity(bOn ? FLinearColor::White : Theme::Paused);
+    SetSwitchState(EnableSwitch, EnableThumb, bOn);
+    SetSwitchState(PointsSwitch, PointsThumb, bPoints);
 
+    const int32 History = EffectiveHistorySamples();
+    const float Width = Spawner ? Spawner->PathlineRadiusScale : 1.0f;
+    const int32 MaxTracks = EffectiveMaxTracks();
+    const int32 Expiry = Spawner ? Spawner->PathlineTrackExpirySamples : 64;
+    const float PointSize = Spawner ? Spawner->PointCloudSize : 0.04f;
     const bool bColorScalar = Spawner && Spawner->bPathlineColorByScalar;
-    ColorButton->SetIsEnabled(bOn);
-    ColorButton->SetRenderOpacity(bOn ? 1.0f : 0.45f);
-    ColorCaption->SetText(FJusyncPathlineHUDModel::MakeColorLabel(bColorScalar));
-
     const bool bHue = Spawner && Spawner->bPathlineHueFilterEnabled;
-    const float Hue = Spawner ? Spawner->PathlineHue : 0.0f;
-    const float Tolerance = Spawner ? Spawner->PathlineHueTolerance : 30.0f;
-
-    HueButton->SetIsEnabled(bOn);
-    HueButton->SetRenderOpacity(bOn ? 1.0f : 0.45f);
-    HueCaption->SetText(FJusyncPathlineHUDModel::MakeHueLabel(bHue, Hue, Tolerance));
-    HueButton->SetColorAndOpacity(bHue ? FLinearColor::White : Theme::Paused);
-
-    const TArray<float>& Angles = FJusyncPathlineHUDModel::HueChipAngles();
-    for (int32 Index = 0; Index < HueChipButtons.Num(); ++Index)
-    {
-        const bool bSelected = bHue && Angles.IsValidIndex(Index)
-            && FJusyncPathlineHUDModel::HueDistance(Hue, Angles[Index]) < 1.0f;
-        HueChipButtons[Index]->SetIsEnabled(bOn);
-        HueChipButtons[Index]->SetRenderOpacity(!bOn ? 0.35f : (bSelected ? 1.0f : 0.60f));
-    }
-
-    ToleranceMinusButton->SetIsEnabled(bOn && bHue);
-    TolerancePlusButton->SetIsEnabled(bOn && bHue);
-    const float Dim = (bOn && bHue) ? 1.0f : 0.45f;
-    ToleranceMinusButton->SetRenderOpacity(Dim);
-    TolerancePlusButton->SetRenderOpacity(Dim);
-    ToleranceCaption->SetText(FText::FromString(FString::Printf(TEXT("+/-%d"),
-        FMath::RoundToInt(Tolerance))));
-
-    // Never clobber a value mid-typing; only mirror the live cvar state.
-    if (MaxInput && !MaxInput->HasKeyboardFocus())
-    {
-        MaxInput->SetText(FText::AsNumber(EffectiveMaxTracks()));
-    }
-    if (RadiusInput && !RadiusInput->HasKeyboardFocus())
-    {
-        RadiusInput->SetText(FText::AsNumber(EffectiveRadius()));
-    }
-
-    float PointSize = 2.7f;
-    if (const IConsoleVariable* CVar =
-        IConsoleManager::Get().FindConsoleVariable(TEXT("jusync.Morph.CloudScreenSize")))
-    {
-        PointSize = CVar->GetFloat();
-    }
-    if (PointSizeInput && !PointSizeInput->HasKeyboardFocus())
-    {
-        PointSizeInput->SetText(FText::AsNumber(PointSize));
-    }
-
-    if (EmissiveInput && !EmissiveInput->HasKeyboardFocus())
-    {
-        EmissiveInput->SetText(FText::AsNumber(
-            Spawner ? Spawner->PathlineEmissiveStrength : 0.35f));
-    }
-
-    int32 Sides = 8;
-    if (const IConsoleVariable* CVar =
-        IConsoleManager::Get().FindConsoleVariable(TEXT("jusync.Pathlines.TubeSides")))
-    {
-        Sides = CVar->GetInt();
-    }
-    if (SidesInput && !SidesInput->HasKeyboardFocus())
-    {
-        SidesInput->SetText(FText::AsNumber(Sides));
-    }
-
-    // ---- POINTS section state.
-    const bool bPtsVisible = !Spawner || Spawner->bPointCloudsVisible;
-    PointsEnableButton->SetIsEnabled(Spawner != nullptr);
-    PointsEnableCaption->SetText(bPtsVisible ? LOCTEXT("PointsOnNow", "POINTS ON")
-                                             : LOCTEXT("PointsOffNow", "POINTS OFF"));
-    PointsEnableButton->SetColorAndOpacity(bPtsVisible ? FLinearColor::White : Theme::Paused);
-
+    const bool bSquare = !Spawner || Spawner->PointShape == EJUSYNCPointShape::Square;
     const bool bPointHue = Spawner && Spawner->bPointCloudHueFilterEnabled;
-    const float PointHue = Spawner ? Spawner->PointCloudHue : 0.0f;
-    const float PointTolerance = Spawner ? Spawner->PointCloudHueTolerance : 30.0f;
+    const bool bNormals = Spawner && Spawner->bCalculatePointCloudNormals;
+    const int32 Quality = Spawner ? Spawner->PointCloudNormalsQuality : 10;
 
-    PointHueButton->SetIsEnabled(Spawner != nullptr);
-    PointHueCaption->SetText(FJusyncPathlineHUDModel::MakeHueLabel(bPointHue, PointHue, PointTolerance));
-    PointHueButton->SetColorAndOpacity(bPointHue ? FLinearColor::White : Theme::Paused);
-
-    for (int32 Index = 0; Index < PointHueChipButtons.Num(); ++Index)
+    int32 HueIndex = 0;
+    if (bHue && Spawner)
     {
-        const bool bSelected = bPointHue && Angles.IsValidIndex(Index)
-            && FJusyncPathlineHUDModel::HueDistance(PointHue, Angles[Index]) < 1.0f;
-        PointHueChipButtons[Index]->SetIsEnabled(Spawner != nullptr);
-        PointHueChipButtons[Index]->SetRenderOpacity(
-            Spawner ? (bSelected ? 1.0f : 0.60f) : 0.35f);
+        const TArray<float>& Angles = FJusyncPathlineHUDModel::HueChipAngles();
+        for (int32 Index = 0; Index < Angles.Num(); ++Index)
+        {
+            if (FJusyncPathlineHUDModel::HueDistance(Spawner->PathlineHue, Angles[Index]) < 1.0f)
+            {
+                HueIndex = Index + 1;
+                break;
+            }
+        }
     }
 
-    PointToleranceMinusButton->SetIsEnabled(bPointHue);
-    PointTolerancePlusButton->SetIsEnabled(bPointHue);
-    const float PointDim = bPointHue ? 1.0f : 0.45f;
-    PointToleranceMinusButton->SetRenderOpacity(PointDim);
-    PointTolerancePlusButton->SetRenderOpacity(PointDim);
-    PointToleranceCaption->SetText(FText::FromString(FString::Printf(TEXT("+/-%d"),
-        FMath::RoundToInt(PointTolerance))));
-
-    if (PointGlowInput && !PointGlowInput->HasKeyboardFocus())
+    int32 PointHueIndex = 0;
+    if (bPointHue && Spawner)
     {
-        PointGlowInput->SetText(FText::AsNumber(
-            CurrentFloatCvar(TEXT("jusync.Spawner.CloudEmissiveFloor"), 0.004f)));
+        const TArray<float>& Angles = FJusyncPathlineHUDModel::HueChipAngles();
+        for (int32 Index = 0; Index < Angles.Num(); ++Index)
+        {
+            if (FJusyncPathlineHUDModel::HueDistance(Spawner->PointCloudHue, Angles[Index]) < 1.0f)
+            {
+                PointHueIndex = Index + 1;
+                break;
+            }
+        }
     }
+
+    if (HistoryValueText)
+    {
+        HistoryValueText->SetText(FText::AsNumber(History));
+    }
+    if (WidthValueText)
+    {
+        WidthValueText->SetText(FText::FromString(FString::Printf(TEXT("%.2fx"), Width)));
+    }
+    if (MaxValueText)
+    {
+        MaxValueText->SetText(FText::AsNumber(MaxTracks));
+    }
+    if (ExpiryValueText)
+    {
+        ExpiryValueText->SetText(FText::AsNumber(Expiry));
+    }
+    if (PointSizeValueText)
+    {
+        PointSizeValueText->SetText(FText::FromString(FString::Printf(TEXT("%.3f"), PointSize)));
+    }
+    // The glow lives in a CVar, not on the spawner, so read it back rather than
+    // echoing the slider: typing the command must move the panel too.
+    const float PointGlow = CurrentFloatCvar(TEXT("jusync.Spawner.CloudEmissiveFloor"), 0.004f);
+    if (PointGlowValueText)
+    {
+        PointGlowValueText->SetText(FText::FromString(FString::Printf(TEXT("%.3f"), PointGlow)));
+    }
+    if (QualityValueText)
+    {
+        QualityValueText->SetText(FText::AsNumber(Quality));
+        QualityValueText->SetColorAndOpacity(FSlateColor(bNormals ? Theme::TextPrimary : Theme::TextMuted));
+    }
+
+    if (HistorySlider)
+    {
+        HistorySlider->SetIsEnabled(bOn);
+        HistorySlider->SetRenderOpacity(bOn ? 1.0f : 0.45f);
+    }
+    if (WidthSlider)
+    {
+        WidthSlider->SetIsEnabled(bOn);
+        WidthSlider->SetRenderOpacity(bOn ? 1.0f : 0.45f);
+    }
+    if (PointSizeSlider)
+    {
+        PointSizeSlider->SetIsEnabled(bPoints);
+        PointSizeSlider->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+    }
+    if (PointGlowSlider)
+    {
+        PointGlowSlider->SetIsEnabled(bPoints);
+        PointGlowSlider->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+    }
+    if (ColorCombo)
+    {
+        ColorCombo->SetIsEnabled(bOn);
+        ColorCombo->SetRenderOpacity(bOn ? 1.0f : 0.45f);
+    }
+    if (HueCombo)
+    {
+        HueCombo->SetIsEnabled(bOn);
+        HueCombo->SetRenderOpacity(bOn ? 1.0f : 0.45f);
+    }
+    if (ScalingCombo)
+    {
+        ScalingCombo->SetIsEnabled(bPoints);
+        ScalingCombo->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+    }
+    if (OrientationCombo)
+    {
+        OrientationCombo->SetIsEnabled(bPoints);
+        OrientationCombo->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+    }
+    if (PointHueCombo)
+    {
+        PointHueCombo->SetIsEnabled(bPoints);
+        PointHueCombo->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+    }
+    if (NormalsSwitch)
+    {
+        NormalsSwitch->SetIsEnabled(bPoints);
+        NormalsSwitch->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+    }
+    if (ShapeSquareButton)
+    {
+        ShapeSquareButton->SetIsEnabled(bPoints);
+        ShapeSquareButton->SetBackgroundColor(bSquare ? Theme::Accent : Theme::ChipIdle);
+        ShapeSquareButton->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+    }
+    if (ShapeCircleButton)
+    {
+        ShapeCircleButton->SetIsEnabled(bPoints);
+        ShapeCircleButton->SetBackgroundColor(bSquare ? Theme::ChipIdle : Theme::Accent);
+        ShapeCircleButton->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+    }
+
+    const float PathlineControlOpacity = bOn ? 1.0f : 0.45f;
+    if (MaxMinusButton)
+    {
+        MaxMinusButton->SetIsEnabled(bOn);
+        MaxMinusButton->SetRenderOpacity(PathlineControlOpacity);
+    }
+    if (MaxPlusButton)
+    {
+        MaxPlusButton->SetIsEnabled(bOn);
+        MaxPlusButton->SetRenderOpacity(PathlineControlOpacity);
+    }
+    if (ExpiryMinusButton)
+    {
+        ExpiryMinusButton->SetIsEnabled(bOn);
+        ExpiryMinusButton->SetRenderOpacity(PathlineControlOpacity);
+    }
+    if (ExpiryPlusButton)
+    {
+        ExpiryPlusButton->SetIsEnabled(bOn);
+        ExpiryPlusButton->SetRenderOpacity(PathlineControlOpacity);
+    }
+    if (QualityMinusButton)
+    {
+        QualityMinusButton->SetIsEnabled(bPoints);
+        QualityMinusButton->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+    }
+    if (QualityPlusButton)
+    {
+        QualityPlusButton->SetIsEnabled(bPoints);
+        QualityPlusButton->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+    }
+
+    SetSwitchState(NormalsSwitch, NormalsThumb, bNormals);
+
+    bApplyingFromCode = true;
+    if (HistorySlider)
+    {
+        HistorySlider->SetValue(static_cast<float>(History));
+    }
+    if (WidthSlider)
+    {
+        WidthSlider->SetValue(Width);
+    }
+    if (PointSizeSlider)
+    {
+        PointSizeSlider->SetValue(PointSize);
+    }
+    if (PointGlowSlider)
+    {
+        PointGlowSlider->SetValue(PointGlow);
+    }
+    if (ColorCombo)
+    {
+        ColorCombo->SetSelectedIndex(bColorScalar ? 0 : 1);
+    }
+    if (HueCombo)
+    {
+        HueCombo->SetSelectedIndex(HueIndex);
+    }
+    if (ScalingCombo)
+    {
+        ScalingCombo->SetSelectedIndex(Spawner ? FMath::Clamp(
+            static_cast<int32>(Spawner->PointScaling), 0, 3) : 1);
+    }
+    if (OrientationCombo)
+    {
+        OrientationCombo->SetSelectedIndex(Spawner ? FMath::Clamp(
+            static_cast<int32>(Spawner->PointOrientation), 0, 1) : 0);
+    }
+    if (PointHueCombo)
+    {
+        PointHueCombo->SetSelectedIndex(PointHueIndex);
+    }
+    bApplyingFromCode = false;
 }
 
 void UJusyncPathlineWidget::HandleEnableClicked()
 {
-    if (!Spawner)
+    if (Spawner)
+    {
+        Spawner->bEnablePathlines = !Spawner->bEnablePathlines;
+        Refresh();
+    }
+}
+
+void UJusyncPathlineWidget::HandlePointsEnableClicked()
+{
+    if (Spawner)
+    {
+        Spawner->SetPointCloudsVisible(!Spawner->bPointCloudsVisible);
+        Refresh();
+    }
+}
+
+void UJusyncPathlineWidget::HandleHistoryChanged(float Value)
+{
+    if (bApplyingFromCode || !Spawner)
     {
         return;
     }
-    Spawner->bEnablePathlines = !Spawner->bEnablePathlines;
+    const int32 NewValue = FMath::Clamp(FMath::RoundToInt(Value), 2, 512);
+    Spawner->PathlineHistorySamples = NewValue;
+    SetIntCvar(TEXT("jusync.Pathlines.HistorySamples"), NewValue);
     Refresh();
 }
 
-void UJusyncPathlineWidget::HandleColorClicked()
+void UJusyncPathlineWidget::HandleWidthChanged(float Value)
+{
+    if (bApplyingFromCode || !Spawner)
+    {
+        return;
+    }
+    Spawner->PathlineRadiusScale = FMath::Clamp(Value, 0.1f, 5.0f);
+    Refresh();
+}
+
+void UJusyncPathlineWidget::SyncPointCloudFixedSizeMode()
 {
     if (!Spawner)
     {
         return;
     }
-    Spawner->bPathlineColorByScalar = !Spawner->bPathlineColorByScalar;
+
+    // The spawner's fixed-screen-size CVar is a streamed-cloud safety default,
+    // but it forces ScalingMethod to FixedScreenSize and makes the SCALING
+    // combo inert. Treat the panel as authoritative: keep the override only
+    // while the user has selected SCREEN.
+    const bool bFixedScreenSize =
+        Spawner->PointScaling == EJUSYNCPointScaling::FixedScreenSize;
+    if (Spawner->bCloudFixedSize != bFixedScreenSize)
+    {
+        Spawner->bCloudFixedSize = bFixedScreenSize;
+        Spawner->ApplyMorphSettings();
+    }
+}
+
+void UJusyncPathlineWidget::HandlePointSizeChanged(float Value)
+{
+    if (bApplyingFromCode || !Spawner)
+    {
+        return;
+    }
+    // Upper bound matches ULidarPointCloudComponent's own default (1.0) so the
+    // panel can reach the whole native range instead of stopping at the old
+    // 0.2 ceiling.
+    Spawner->PointCloudSize = FMath::Clamp(Value, 0.001f, 1.0f);
+    SyncPointCloudFixedSizeMode();
+    Spawner->ApplyPointCloudDisplaySettings();
     Refresh();
 }
 
-void UJusyncPathlineWidget::HandleHueToggle()
+void UJusyncPathlineWidget::HandlePointGlowChanged(float Value)
 {
-    if (!Spawner)
+    if (bApplyingFromCode)
     {
         return;
     }
-    Spawner->bPathlineHueFilterEnabled = !Spawner->bPathlineHueFilterEnabled;
+
+    const float Glow = FJusyncPathlineHUDModel::ClampPointGlow(Value);
+    SetFloatCvar(TEXT("jusync.Spawner.CloudEmissiveFloor"), Glow);
+
+    // The spawner pushes the CVar into each cloud's MID on its sizing tick.
+    // Re-apply here as well so a drag changes the picture on the same frame;
+    // without a bound spawner the CVar alone still governs the next cloud.
+    if (Spawner)
+    {
+        Spawner->ApplyPointCloudDisplaySettings();
+    }
     Refresh();
 }
 
-void UJusyncPathlineWidget::ApplyHueChip(int32 ChipIndex)
+void UJusyncPathlineWidget::HandleColorSelected(FString SelectedItem,
+    ESelectInfo::Type SelectionType)
 {
-    if (!Spawner)
+    if (bApplyingFromCode || SelectionType == ESelectInfo::Direct || !Spawner || !ColorCombo)
     {
         return;
     }
-    const TArray<float>& Angles = FJusyncPathlineHUDModel::HueChipAngles();
-    if (!Angles.IsValidIndex(ChipIndex))
+    Spawner->bPathlineColorByScalar = ColorCombo->GetSelectedIndex() == 0;
+    Refresh();
+}
+
+void UJusyncPathlineWidget::HandleHueSelected(FString SelectedItem,
+    ESelectInfo::Type SelectionType)
+{
+    if (bApplyingFromCode || SelectionType == ESelectInfo::Direct || !Spawner || !HueCombo)
     {
         return;
     }
 
-    const float Angle = Angles[ChipIndex];
-    if (Spawner->bPathlineHueFilterEnabled
-        && FJusyncPathlineHUDModel::HueDistance(Spawner->PathlineHue, Angle) < 1.0f)
+    const int32 Index = HueCombo->GetSelectedIndex();
+    if (Index <= 0)
     {
-        // Same chip twice = clear the filter.
         Spawner->bPathlineHueFilterEnabled = false;
     }
     else
     {
-        Spawner->PathlineHue = Angle;
-        Spawner->bPathlineHueFilterEnabled = true;
+        const TArray<float>& Angles = FJusyncPathlineHUDModel::HueChipAngles();
+        if (Angles.IsValidIndex(Index - 1))
+        {
+            Spawner->PathlineHue = Angles[Index - 1];
+            Spawner->PathlineHueTolerance = 30.0f;
+            Spawner->bPathlineHueFilterEnabled = true;
+        }
     }
     Refresh();
 }
 
-void UJusyncPathlineWidget::HandleToleranceMinus()
+void UJusyncPathlineWidget::HandleShapeSquareClicked()
 {
     if (Spawner)
     {
-        Spawner->PathlineHueTolerance =
-            FJusyncPathlineHUDModel::StepHueTolerance(Spawner->PathlineHueTolerance, +1);
+        Spawner->PointShape = EJUSYNCPointShape::Square;
+        Spawner->ApplyPointCloudDisplaySettings();
+        Refresh();
     }
-    Refresh();
 }
 
-void UJusyncPathlineWidget::HandleTolerancePlus()
+void UJusyncPathlineWidget::HandleShapeCircleClicked()
 {
     if (Spawner)
     {
-        Spawner->PathlineHueTolerance =
-            FJusyncPathlineHUDModel::StepHueTolerance(Spawner->PathlineHueTolerance, -1);
+        Spawner->PointShape = EJUSYNCPointShape::Circle;
+        Spawner->ApplyPointCloudDisplaySettings();
+        Refresh();
     }
+}
+
+void UJusyncPathlineWidget::HandleScalingSelected(FString SelectedItem,
+    ESelectInfo::Type SelectionType)
+{
+    if (bApplyingFromCode || SelectionType == ESelectInfo::Direct || !Spawner || !ScalingCombo)
+    {
+        return;
+    }
+    Spawner->PointScaling = static_cast<EJUSYNCPointScaling>(
+        FMath::Clamp(ScalingCombo->GetSelectedIndex(), 0, 3));
+    SyncPointCloudFixedSizeMode();
+    Spawner->ApplyPointCloudDisplaySettings();
     Refresh();
 }
 
-// ---- POINTS section handlers --------------------------------------------
-
-void UJusyncPathlineWidget::HandlePointsEnableClicked()
+void UJusyncPathlineWidget::HandleOrientationSelected(FString SelectedItem,
+    ESelectInfo::Type SelectionType)
 {
-    if (!Spawner)
+    if (bApplyingFromCode || SelectionType == ESelectInfo::Direct
+        || !Spawner || !OrientationCombo)
     {
         return;
     }
-    Spawner->SetPointCloudsVisible(!Spawner->bPointCloudsVisible);
+    Spawner->PointOrientation = static_cast<EJUSYNCPointOrientation>(
+        FMath::Clamp(OrientationCombo->GetSelectedIndex(), 0, 1));
+    Spawner->ApplyPointCloudDisplaySettings();
     Refresh();
 }
 
-void UJusyncPathlineWidget::HandlePointHueToggle()
+void UJusyncPathlineWidget::HandlePointHueSelected(FString SelectedItem,
+    ESelectInfo::Type SelectionType)
 {
-    if (!Spawner)
-    {
-        return;
-    }
-    Spawner->bPointCloudHueFilterEnabled = !Spawner->bPointCloudHueFilterEnabled;
-    Spawner->UpdatePointCloudHueFilter();
-    Refresh();
-}
-
-void UJusyncPathlineWidget::ApplyPointHueChip(int32 ChipIndex)
-{
-    if (!Spawner)
-    {
-        return;
-    }
-    const TArray<float>& Angles = FJusyncPathlineHUDModel::HueChipAngles();
-    if (!Angles.IsValidIndex(ChipIndex))
+    if (bApplyingFromCode || SelectionType == ESelectInfo::Direct || !Spawner || !PointHueCombo)
     {
         return;
     }
 
-    const float Angle = Angles[ChipIndex];
-    if (Spawner->bPointCloudHueFilterEnabled
-        && FJusyncPathlineHUDModel::HueDistance(Spawner->PointCloudHue, Angle) < 1.0f)
+    const int32 Index = PointHueCombo->GetSelectedIndex();
+    if (Index <= 0)
     {
-        // Same chip twice = clear the filter.
         Spawner->bPointCloudHueFilterEnabled = false;
     }
     else
     {
-        Spawner->PointCloudHue = Angle;
-        Spawner->bPointCloudHueFilterEnabled = true;
+        const TArray<float>& Angles = FJusyncPathlineHUDModel::HueChipAngles();
+        if (Angles.IsValidIndex(Index - 1))
+        {
+            Spawner->PointCloudHue = Angles[Index - 1];
+            Spawner->PointCloudHueTolerance = 30.0f;
+            Spawner->bPointCloudHueFilterEnabled = true;
+        }
     }
+
+    // Repaint the displayed clouds now; SetPointHueFilter also re-applies to
+    // every frame swapped in later.
     Spawner->UpdatePointCloudHueFilter();
     Refresh();
 }
 
-void UJusyncPathlineWidget::HandlePointToleranceMinus()
+void UJusyncPathlineWidget::HandleNormalsClicked()
 {
     if (Spawner)
     {
-        // Same convention as the trail filter: minus WIDENS the match.
-        Spawner->PointCloudHueTolerance =
-            FJusyncPathlineHUDModel::StepHueTolerance(Spawner->PointCloudHueTolerance, +1);
-        Spawner->UpdatePointCloudHueFilter();
+        Spawner->bCalculatePointCloudNormals = !Spawner->bCalculatePointCloudNormals;
+        Spawner->ApplyPointCloudDisplaySettings(true);
+        Refresh();
     }
+}
+
+void UJusyncPathlineWidget::StepMaxBy(int32 Direction)
+{
+    SetIntCvar(TEXT("jusync.Pathlines.MaxTracks"),
+        FJusyncPathlineHUDModel::StepTrackPreset(EffectiveMaxTracks(), Direction));
     Refresh();
 }
 
-void UJusyncPathlineWidget::HandlePointTolerancePlus()
+void UJusyncPathlineWidget::StepExpiryBy(int32 Direction)
 {
     if (Spawner)
     {
-        Spawner->PointCloudHueTolerance =
-            FJusyncPathlineHUDModel::StepHueTolerance(Spawner->PointCloudHueTolerance, -1);
-        Spawner->UpdatePointCloudHueFilter();
+        Spawner->PathlineTrackExpirySamples = FMath::Clamp(
+            Spawner->PathlineTrackExpirySamples + Direction * 4, 1, 512);
+        Refresh();
     }
-    Refresh();
 }
 
-void UJusyncPathlineWidget::StepPointGlowBy(int32 Direction)
+void UJusyncPathlineWidget::StepQualityBy(int32 Direction)
 {
-    SetFloatCvar(TEXT("jusync.Spawner.CloudEmissiveFloor"),
-        FJusyncPathlineHUDModel::StepPointGlow(
-            CurrentFloatCvar(TEXT("jusync.Spawner.CloudEmissiveFloor"), 0.004f), Direction));
-    Refresh();
-}
-
-void UJusyncPathlineWidget::HandlePointGlowInputCommitted(const FText& Text, ETextCommit::Type CommitType)
-{
-    if (Text.IsNumeric())
+    if (Spawner)
     {
-        SetFloatCvar(TEXT("jusync.Spawner.CloudEmissiveFloor"),
-            FJusyncPathlineHUDModel::ClampPointGlow(FCString::Atof(*Text.ToString())));
+        Spawner->PointCloudNormalsQuality = FMath::Clamp(
+            Spawner->PointCloudNormalsQuality + Direction, 1, 100);
+        Spawner->ApplyPointCloudDisplaySettings(true);
+        Refresh();
     }
-    if (CommitType == ETextCommit::OnEnter)
-    {
-        ReleaseInputFocus();
-    }
-    Refresh();
-}
-
-void UJusyncPathlineWidget::HandlePointSizeInputCommitted(const FText& Text, ETextCommit::Type CommitType)
-{
-    if (Text.IsNumeric())
-    {
-        SetFloatCvar(TEXT("jusync.Morph.CloudScreenSize"),
-            FJusyncPathlineHUDModel::ClampPointSize(FCString::Atof(*Text.ToString())));
-    }
-    if (CommitType == ETextCommit::OnEnter)
-    {
-        ReleaseInputFocus();
-    }
-    Refresh();
-}
-
-void UJusyncPathlineWidget::HandleEmissiveInputCommitted(const FText& Text, ETextCommit::Type CommitType)
-{
-    if (Spawner && Text.IsNumeric())
-    {
-        Spawner->PathlineEmissiveStrength =
-            FJusyncPathlineHUDModel::ClampEmissive(FCString::Atof(*Text.ToString()));
-    }
-    if (CommitType == ETextCommit::OnEnter)
-    {
-        ReleaseInputFocus();
-    }
-    Refresh();
-}
-
-void UJusyncPathlineWidget::HandleSidesInputCommitted(const FText& Text, ETextCommit::Type CommitType)
-{
-    if (Text.IsNumeric())
-    {
-        if (IConsoleVariable* CVar =
-            IConsoleManager::Get().FindConsoleVariable(TEXT("jusync.Pathlines.TubeSides")))
-        {
-            CVar->Set(FJusyncPathlineHUDModel::ClampTubeSides(FCString::Atoi(*Text.ToString())));
-        }
-    }
-    if (CommitType == ETextCommit::OnEnter)
-    {
-        ReleaseInputFocus();
-    }
-    Refresh();
-}
-
-void UJusyncPathlineWidget::HandleMaxInputCommitted(const FText& Text, ETextCommit::Type CommitType)
-{
-    if (Text.IsNumeric())
-    {
-        const int32 Value = FCString::Atoi(*Text.ToString());
-        if (IConsoleVariable* CVar =
-            IConsoleManager::Get().FindConsoleVariable(TEXT("jusync.Pathlines.MaxTracks")))
-        {
-            CVar->Set(FJusyncPathlineHUDModel::ClampMaxTracks(Value));
-        }
-    }
-    if (CommitType == ETextCommit::OnEnter)
-    {
-        ReleaseInputFocus();
-    }
-    Refresh();
-}
-
-void UJusyncPathlineWidget::HandleRadiusInputCommitted(const FText& Text, ETextCommit::Type CommitType)
-{
-    if (Text.IsNumeric())
-    {
-        const float Value = FCString::Atof(*Text.ToString());
-        SetFloatCvar(TEXT("jusync.Pathlines.Radius"), FJusyncPathlineHUDModel::ClampRadius(Value));
-    }
-    if (CommitType == ETextCommit::OnEnter)
-    {
-        ReleaseInputFocus();
-    }
-    Refresh();
 }
 
 #undef LOCTEXT_NAMESPACE

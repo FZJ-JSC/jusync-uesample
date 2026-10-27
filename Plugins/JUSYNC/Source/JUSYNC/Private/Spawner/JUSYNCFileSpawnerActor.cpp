@@ -643,14 +643,14 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     PathlineVisibleTracks = 0;
     PathlineDroppedSamples = 0;
     PathlineIgnoredSamples = 0;
-    PointCloudSize = 0.04f;
+    PointCloudSize = 0.1f;
     bPointCloudsVisible = true;
     bPointCloudHueFilterEnabled = false;
     PointCloudHue = 0.0f;
     PointCloudHueTolerance = 30.0f;
     PointShape = EJUSYNCPointShape::Square;
     PointOrientation = EJUSYNCPointOrientation::FacingCamera;
-    PointScaling = EJUSYNCPointScaling::PerNodeAdaptive;
+    PointScaling = EJUSYNCPointScaling::FixedScreenSize;
     PointSizeBias = 0.012f;
     GapFillingStrength = 0.0f;
     PointCloudPoolSize = 16;
@@ -3008,6 +3008,33 @@ void AJUSYNCFileSpawnerActor::UpdatePointCloudHueFilter()
     }
 }
 
+void AJUSYNCFileSpawnerActor::ApplyPointCloudDisplaySettings(bool bRecalculateNormals)
+{
+    UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
+    FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr;
+    if (!PCSpawner)
+    {
+        return;
+    }
+
+    // Push every setting, not just the one that changed: the spawner may have
+    // been created from older defaults, and a single handler call should make
+    // the live cloud match the whole panel.
+    ApplyPointCloudSettingsToSpawner(PCSpawner);
+
+#ifdef WITH_ANARI_USD_MIDDLEWARE
+    // Existing actors only receive size/shape/scaling/orientation when a new
+    // cloud is allocated, which is why the panel used to look inert on a
+    // steady stream. Re-apply to everything currently displayed.
+    PCSpawner->ApplySizingToActiveActors();
+
+    if (bRecalculateNormals)
+    {
+        PCSpawner->ApplyNormalCalculationToActiveActors();
+    }
+#endif
+}
+
 uint64 AJUSYNCFileSpawnerActor::ResolveLiveSampleId(uint64 SenderTimestamp)
 {
     // The sender timestamp is the ANARI animation time, used for display.
@@ -3205,7 +3232,15 @@ void AJUSYNCFileSpawnerActor::AddSampleCacheEntry(const FString& Key, FJUSYNCSam
     for (int32 Index = 0; Index < List.Num(); ++Index)
     {
         FJUSYNCSampleCacheEntry& Existing = List[Index];
-        if (Existing.SampleId != Entry.SampleId)
+        // A loop, a scrub-back revisit or the sender replaying its own timeline
+        // republishes an already-cached timestep under a *new* commit id (the
+        // notification timestamp is wall clock, not the dataset time). Collapse
+        // on the dataset time as well, so one ring slot exists per timestep and
+        // playback never steps through the same time twice.
+        const bool bSameTime =
+            Existing.SampleTime >= 0.0 && Entry.SampleTime >= 0.0 &&
+            FMath::IsNearlyEqual(Existing.SampleTime, Entry.SampleTime, 1e-6);
+        if (Existing.SampleId != Entry.SampleId && !bSameTime)
         {
             continue;
         }
@@ -3889,6 +3924,7 @@ void AJUSYNCFileSpawnerActor::ApplyPointCloudSettingsToSpawner(FJUSYNCPointCloud
     Spawner->SetPointSizeBias(PointSizeBias);
     Spawner->SetGapFillingStrength(GapFillingStrength);
     Spawner->SetPerfLogging(bEnablePerfLogging);
+    Spawner->SetGradientColorsEnabled(bUseGradientColors);
     Spawner->SetNormalCalculation(
         bCalculatePointCloudNormals,
         PointCloudNormalsMaxPoints,

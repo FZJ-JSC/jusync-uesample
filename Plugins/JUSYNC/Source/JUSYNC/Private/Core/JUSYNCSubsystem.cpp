@@ -1290,8 +1290,10 @@ bool UJUSYNCSubsystem::LoadUSDFullFromBuffer(const TArray<uint8>& Buffer, const 
             pc.PointCount = static_cast<int32>(cpc.points_count);
             pc.bHasColors = cpc.has_colors != 0;
             pc.bHasNormals = cpc.has_normals != 0;
-            pc.BoundingBoxMin = FVector(cpc.bounding_box_min[0], cpc.bounding_box_min[2], -cpc.bounding_box_min[1]);
-            pc.BoundingBoxMax = FVector(cpc.bounding_box_max[0], cpc.bounding_box_max[2], -cpc.bounding_box_max[1]);
+            // USD (x, y, z) maps to UE (x, z, -y): negating an axis flips the
+            // interval, so the min comes from the USD max on that axis.
+            pc.BoundingBoxMin = FVector(cpc.bounding_box_min[0], cpc.bounding_box_min[2], -cpc.bounding_box_max[1]);
+            pc.BoundingBoxMax = FVector(cpc.bounding_box_max[0], cpc.bounding_box_max[2], -cpc.bounding_box_min[1]);
 
             if (cpc.points_count > 0 && cpc.positions)
             {
@@ -1492,8 +1494,8 @@ bool UJUSYNCSubsystem::LoadUSDFullFromBufferNoCopy(const TArray<uint8>& Buffer, 
         for (int32 i = 0; i < OutPointCloudData.Num(); ++i)
         {
             const CPointCloudDataFill& dst = FillClouds[i];
-            OutPointCloudData[i].BoundingBoxMin = FVector(dst.bounding_box_min[0], dst.bounding_box_min[2], -dst.bounding_box_min[1]);
-            OutPointCloudData[i].BoundingBoxMax = FVector(dst.bounding_box_max[0], dst.bounding_box_max[2], -dst.bounding_box_max[1]);
+            OutPointCloudData[i].BoundingBoxMin = FVector(dst.bounding_box_min[0], dst.bounding_box_min[2], -dst.bounding_box_max[1]);
+            OutPointCloudData[i].BoundingBoxMax = FVector(dst.bounding_box_max[0], dst.bounding_box_max[2], -dst.bounding_box_min[1]);
         }
         FMemory::Free(FillClouds);
     }
@@ -1944,8 +1946,10 @@ static bool JUSYNCParseRawGeoBuffer(const TArray<uint8>& Buffer, const FString& 
             }
         }
 
-        PC->BoundingBoxMin = FVector(MinU[0], MinU[2], -MinU[1]);
-        PC->BoundingBoxMax = FVector(MaxU[0], MaxU[2], -MaxU[1]);
+        // Same USD->UE (x, z, -y) mapping as the point positions above: the
+        // negated axis takes its minimum from the USD maximum.
+        PC->BoundingBoxMin = FVector(MinU[0], MinU[2], -MaxU[1]);
+        PC->BoundingBoxMax = FVector(MaxU[0], MaxU[2], -MinU[1]);
 
         OutCloud = MoveTemp(PC);
         return true;
@@ -2479,8 +2483,8 @@ bool UJUSYNCSubsystem::LoadUSDFullCompactFromBuffer(const TArray<uint8>& Buffer,
         for (int32 i = 0; i < OutPointCloudData.Num(); ++i)
         {
             const CPointCloudDataFill& dst = FillClouds[i];
-            OutPointCloudData[i]->BoundingBoxMin = FVector(dst.bounding_box_min[0], dst.bounding_box_min[2], -dst.bounding_box_min[1]);
-            OutPointCloudData[i]->BoundingBoxMax = FVector(dst.bounding_box_max[0], dst.bounding_box_max[2], -dst.bounding_box_max[1]);
+            OutPointCloudData[i]->BoundingBoxMin = FVector(dst.bounding_box_min[0], dst.bounding_box_min[2], -dst.bounding_box_max[1]);
+            OutPointCloudData[i]->BoundingBoxMax = FVector(dst.bounding_box_max[0], dst.bounding_box_max[2], -dst.bounding_box_min[1]);
         }
         FMemory::Free(FillClouds);
     }
@@ -3983,8 +3987,8 @@ bool UJUSYNCSubsystem::LoadPointCloudFromBuffer(const TArray<uint8>& Buffer, con
         pc.bHasColors = cpc.has_colors != 0;
         pc.bHasNormals = cpc.has_normals != 0;
 
-        pc.BoundingBoxMin = FVector(cpc.bounding_box_min[0], cpc.bounding_box_min[2], -cpc.bounding_box_min[1]);
-        pc.BoundingBoxMax = FVector(cpc.bounding_box_max[0], cpc.bounding_box_max[2], -cpc.bounding_box_max[1]);
+        pc.BoundingBoxMin = FVector(cpc.bounding_box_min[0], cpc.bounding_box_min[2], -cpc.bounding_box_max[1]);
+        pc.BoundingBoxMax = FVector(cpc.bounding_box_max[0], cpc.bounding_box_max[2], -cpc.bounding_box_min[1]);
 
         if (cpc.points_count > 0 && cpc.positions)
         {

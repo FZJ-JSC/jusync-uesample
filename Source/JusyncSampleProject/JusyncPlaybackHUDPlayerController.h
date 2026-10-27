@@ -41,20 +41,26 @@ public:
 
 	/**
 	 * Toggles the panel whose key matches, returning whether Key was one.
-	 * The widgets call this from NativeOnKeyDown because Slate routes keys
-	 * along the focused widget's path: while the caret sits inside a panel,
-	 * the controller's InputKey never runs and the toggles would seem dead.
+	 * The pre-input hook calls this first; the widgets and InputKey also call
+	 * it as a fallback. A per-frame guard makes one physical press toggle
+	 * exactly once even when all three paths see the same event.
 	 */
-	bool HandlePanelToggleKey(const FKey& Key);
+	bool HandlePanelToggleKey(const FKey& Key, bool bFromPreInput = false);
 
 protected:
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual bool InputKey(const FInputKeyEventArgs& Params) override;
 
 private:
 	void TogglePanel();
 	void TogglePathlinePanel();
 	void ApplyPanelInputMode();
+
+	/** Runs before Slate focus navigation, so Tab/P still toggle the panels
+	 *  when a HUD button or slider owns keyboard focus. */
+	void HandlePreInputKey(const FKeyEvent& KeyEvent);
+	bool IsGameViewportFocused() const;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UJusyncPlaybackWidget> PlaybackWidget;
@@ -65,4 +71,8 @@ private:
 	AJUSYNCFileSpawnerActor* Spawner = nullptr;
 	bool bPanelVisible = false;
 	bool bPathlinePanelVisible = false;
+
+	FDelegateHandle PreInputKeyHandle;
+	FKey PreInputHandledKey;
+	uint64 PreInputHandledFrame = MAX_uint64;
 };

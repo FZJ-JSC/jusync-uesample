@@ -568,6 +568,13 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Points")
     void UpdatePointCloudHueFilter();
 
+    /** POINTS panel forwards: push the current point-cloud display settings
+     *  (size, bias, gap fill, shape, scaling, orientation, gradient) to the
+     *  shared spawner and apply them to clouds that are already on screen.
+     *  bRecalculateNormals re-runs normal generation for live clouds. */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Points")
+    void ApplyPointCloudDisplaySettings(bool bRecalculateNormals = false);
+
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner|Playback")
     float GetPlaybackPosition() const { return PlaybackPosition; }
 

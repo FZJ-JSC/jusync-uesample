@@ -903,8 +903,9 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
 
                     Comp->SetPointCloud(Cloud);
                     ApplyVisualSettings(Comp);
-                    // POINTS panel state (hue filter, hidden) must survive
-                    // every fresh frame that swaps in.
+                    // POINTS panel state (hue filter, gradient, hidden) must
+                    // survive every fresh frame that swaps in.
+                    ApplyGradientColorsToCloud(Cloud);
                     ApplyPointHueFilterToCloud(Cloud);
                     Actor->SetActorHiddenInGame(bPointCloudsHidden);
                     F.bEverSwapped = true;
@@ -1287,6 +1288,7 @@ bool FJUSYNCPointCloudSpawner::TryDisplayCachedPlaybackCloud(
         Built->SetOptimizedForDynamicData(true);
         Comp->SetPointCloud(Built);
         ApplyVisualSettings(Comp);
+        ApplyGradientColorsToCloud(Built);
         ApplyPointHueFilterToCloud(Built);
     }
     LidarActor->SetActorHiddenInGame(bPointCloudsHidden);
@@ -1620,6 +1622,120 @@ void FJUSYNCPointCloudSpawner::PrunePointColorOriginals()
     }
 }
 
+void FJUSYNCPointCloudSpawner::SetGradientColorsEnabled(bool bEnabled)
+{
+    bGradientColorsEnabled = bEnabled;
+
+#ifdef WITH_ANARI_USD_MIDDLEWARE
+    // Apply (or restore) immediately on what is on screen. Clouds swapped in
+    // later call ApplyGradientColorsToCloud at the swap site.
+    for (AActor* Actor : ActiveActors)
+    {
+        ALidarPointCloudActor* LidarActor = Cast<ALidarPointCloudActor>(Actor);
+        ULidarPointCloudComponent* Comp = LidarActor ? LidarActor->GetPointCloudComponent() : nullptr;
+        ApplyGradientColorsToCloud(Comp ? Comp->GetPointCloud() : nullptr);
+    }
+
+    if (!bGradientColorsEnabled)
+    {
+        PruneGradientColorOriginals();
+    }
+#endif
+}
+
+#ifdef WITH_ANARI_USD_MIDDLEWARE
+void FJUSYNCPointCloudSpawner::ApplyGradientColorsToCloud(ULidarPointCloud* Cloud)
+{
+    if (!IsValid(Cloud) || Cloud->HasAnyFlags(RF_BeginDestroyed))
+    {
+        return;
+    }
+
+    const TWeakObjectPtr<UObject> CloudKey(Cloud);
+    if (bGradientColorsEnabled)
+    {
+        // Restore the colours captured when grayscale was enabled.
+        if (TArray<FColor>* Originals = GradientColorOriginals.Find(CloudKey))
+        {
+            const TArray<FColor>& Restore = *Originals;
+            int32 Index = 0;
+            Cloud->ExecuteActionOnAllPoints([&Restore, &Index](FLidarPointCloudPoint* P)
+            {
+                if (Restore.IsValidIndex(Index))
+                {
+                    P->Color = Restore[Index];
+                }
+                ++Index;
+            }, /*bVisibleOnly*/false);
+            GradientColorOriginals.Remove(CloudKey);
+            Cloud->RefreshRendering();
+        }
+        return;
+    }
+
+    const int32 NumPts = static_cast<int32>(Cloud->GetNumPoints());
+    TArray<FColor>& Originals = GradientColorOriginals.FindOrAdd(CloudKey);
+    if (Originals.Num() != NumPts)
+    {
+        // First sight of this cloud while grayscale is active (or the cloud
+        // data changed): capture the displayed colours before overwriting.
+        Originals.Init(FColor::White, NumPts);
+        int32 Capture = 0;
+        Cloud->ExecuteActionOnAllPoints([&Originals, &Capture](FLidarPointCloudPoint* P)
+        {
+            if (Originals.IsValidIndex(Capture))
+            {
+                Originals[Capture] = P->Color;
+            }
+            ++Capture;
+        }, /*bVisibleOnly*/false);
+    }
+
+    int32 Index = 0;
+    Cloud->ExecuteActionOnAllPoints([&Originals, &Index](FLidarPointCloudPoint* P)
+    {
+        const FColor Base = Originals.IsValidIndex(Index) ? Originals[Index] : P->Color;
+        const uint8 Luma = static_cast<uint8>(FMath::Clamp(
+            FMath::RoundToInt(0.299f * Base.R + 0.587f * Base.G + 0.114f * Base.B), 0, 255));
+        P->Color = FColor(Luma, Luma, Luma, Base.A);
+        ++Index;
+    }, /*bVisibleOnly*/false);
+    Cloud->RefreshRendering();
+}
+
+void FJUSYNCPointCloudSpawner::PruneGradientColorOriginals()
+{
+    for (auto It = GradientColorOriginals.CreateIterator(); It; ++It)
+    {
+        UObject* Cloud = It.Key().Get();
+        if (!Cloud)
+        {
+            It.RemoveCurrent();
+            continue;
+        }
+        if (IsPlaybackCachedCloud(Cloud))
+        {
+            continue;
+        }
+        bool bDisplayed = false;
+        for (AActor* Actor : ActiveActors)
+        {
+            ALidarPointCloudActor* LidarActor = Cast<ALidarPointCloudActor>(Actor);
+            ULidarPointCloudComponent* Comp = LidarActor ? LidarActor->GetPointCloudComponent() : nullptr;
+            if (Comp && Comp->GetPointCloud() == Cloud)
+            {
+                bDisplayed = true;
+                break;
+            }
+        }
+        if (!bDisplayed)
+        {
+            It.RemoveCurrent();
+        }
+    }
+}
+#endif
+
 
 namespace JUSyncCloudSmooth
 {
@@ -1871,8 +1987,12 @@ void FJUSYNCPointCloudSpawner::ApplyVisualSettings(ULidarPointCloudComponent* Co
 
     if (CVarJusyncCloudFixedSize.GetValueOnGameThread() > 0)
     {
+        // FixedScreenSize keeps streamed clouds octree-independent. PointSize is
+        // already the screen-fraction size the panel shows (the renderer scales
+        // sprites by view depth * 0.01 * PointSize * component scale). Do not
+        // fold in CloudScreenSizePct here: it is a legacy per-level morph value
+        // and stale values made the POINT SIZE slider look inert.
         Comp->ScalingMethod = ELidarPointCloudScalingMethod::FixedScreenSize;
-        Comp->PointSize = FMath::Max(0.0f, CVarJusyncCloudScreenSize.GetValueOnGameThread());
     }
 
     // The renderer multiplies sprite size by the component world scale
@@ -1940,6 +2060,57 @@ void FJUSYNCPointCloudSpawner::ApplySizingToActiveActors()
                 Comp->MarkRenderStateDirty();
             }
         }
+    }
+}
+
+void FJUSYNCPointCloudSpawner::EnsureCloudEmissiveFloor()
+{
+    // Scrubbing swaps clouds whose material instance is rebuilt from the
+    // material default (0.004). ApplyVisualSettings pushes the CVar only when
+    // the CVar itself changed, so a cloud created after the last slider move
+    // started dark and stayed dark. Re-assert here every tick; the value
+    // compare keeps it free once the MID already matches.
+    const float Floor = CVarJusyncCloudEmissiveFloor.GetValueOnGameThread();
+    for (AActor* Actor : ActiveActors)
+    {
+        ALidarPointCloudActor* LidarActor = Cast<ALidarPointCloudActor>(Actor);
+        ULidarPointCloudComponent* Comp = LidarActor ? LidarActor->GetPointCloudComponent() : nullptr;
+        if (!Comp)
+        {
+            continue;
+        }
+        if (UMaterialInstanceDynamic* Dyn = Cast<UMaterialInstanceDynamic>(Comp->GetMaterial(0)))
+        {
+            float Current = -1.f;
+            if (!Dyn->GetScalarParameterValue(FName("EmissiveFloor"), Current) ||
+                !FMath::IsNearlyEqual(Current, Floor))
+            {
+                Dyn->SetScalarParameterValue(FName("EmissiveFloor"), Floor);
+            }
+        }
+    }
+}
+
+void FJUSYNCPointCloudSpawner::ApplyNormalCalculationToActiveActors()
+{
+    if (!bCalculateNormals)
+    {
+        return;
+    }
+    for (AActor* Actor : ActiveActors)
+    {
+        ALidarPointCloudActor* LidarActor = Cast<ALidarPointCloudActor>(Actor);
+        ULidarPointCloudComponent* Comp = LidarActor ? LidarActor->GetPointCloudComponent() : nullptr;
+        ULidarPointCloud* Cloud = Comp ? Comp->GetPointCloud() : nullptr;
+        if (!Cloud)
+        {
+            continue;
+        }
+
+        // A panel click is an explicit request; do not let the normal-calc
+        // cooldown swallow it when QUALITY changes twice in quick succession.
+        LastNormalCalcTime.Remove(Actor);
+        MaybeCalculateNormals(Cloud, Actor, static_cast<int32>(Cloud->GetNumPoints()));
     }
 }
 
@@ -2242,6 +2413,10 @@ void FJUSYNCPointCloudSpawner::Tick(float DeltaTime)
         LastCloudEmissiveFloor = CloudFloorNow;
         ApplySizingToActiveActors();
     }
+
+    // New clouds (every scrubbed frame) rebuild their material instance, so the
+    // floor has to be re-asserted rather than pushed once on CVar change.
+    EnsureCloudEmissiveFloor();
 #endif
 }
 
@@ -2536,6 +2711,7 @@ void FJUSYNCPointCloudSpawner::DestroyAllActors()
     ElementToActor.Empty();
     ActorToElement.Empty();
     LastNormalCalcTime.Empty();
+    GradientColorOriginals.Empty();
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     for (auto& Pair : InFlightBuilds)
@@ -2587,6 +2763,7 @@ void FJUSYNCPointCloudSpawner::RecolorGradientPendingActors()
         JUSYNCPadDegenerateBounds(NewPoints);
         if (Cloud && Cloud->SetData(NewPoints))
         {
+            ApplyGradientColorsToCloud(Cloud);
             ApplyPointHueFilterToCloud(Cloud);
             MaybeCalculateNormals(Cloud, Actor, static_cast<int32>(NewPoints.Num()));
             Recolored++;

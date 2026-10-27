@@ -7,18 +7,16 @@
 class AJUSYNCFileSpawnerActor;
 class UBorder;
 class UButton;
-class UComboBoxString;
 class UTextBlock;
 class USlider;
 
 /**
- * In-game transport for the sample cache on AJUSYNCFileSpawnerActor: scrub
- * bar, step buttons, LIVE resume and a timestep picker.
+ * In-game stream deck: the centred bottom transport, the top-left status
+ * HUD, and the timestep readout. Geometry follows the dimensional drawing at
+ * the 1920x1080 reference (W7 = 960, V1 = 24, H7 = 72, H8 = 44).
  *
- * Mirrors what the Details-panel scrubber does in the editor, but only with
- * runtime widgets so it also works in PIE and packaged builds. The layout is
- * built here in code; the maths and label formats live in
- * FJusyncPlaybackHUDModel so they stay testable.
+ * The pathline / point-cloud cards live in UJusyncPathlineWidget; this widget
+ * is the playback half of the deck.
  */
 UCLASS()
 class UJusyncPlaybackWidget : public UUserWidget
@@ -65,38 +63,62 @@ private:
 	void HandlePlayPauseClicked();
 
 	UFUNCTION()
-	void HandlePathlineClicked();
+	void HandleRateMinus();
 
 	UFUNCTION()
-	void HandleTimestepSelected(FString SelectedItem, ESelectInfo::Type SelectionType);
+	void HandleRatePlus();
+
+	UFUNCTION()
+	void HandleLoopClicked();
 
 	void BuildLayout();
 	UTextBlock* MakeLabel(const FName Name, const FText& Label);
 	UButton* MakeButton(const FName Name, const FText& Label, const FText& Tooltip,
-		TObjectPtr<UTextBlock>* OutCaption = nullptr);
+		TObjectPtr<UTextBlock>* OutCaption = nullptr, float FontSize = 13.0f);
+	UBorder* MakeRoundedBorder(const FName Name, const FLinearColor& Fill,
+		const FLinearColor& Outline, float Radius, float OutlineWidth,
+		const FMargin& InPadding = FMargin(0.0f));
+	UButton* MakeSwitch(const FName Name, const FText& Tooltip, TObjectPtr<UBorder>& OutThumb);
+	void SetSwitchState(UButton* Button, UBorder* Thumb, bool bOn);
 
 	/** Pull count / index / sender time out of the spawner and repaint. */
 	void Refresh();
-
-	/** Only rebuilds the dropdown when the cached timeline actually changed. */
-	void SyncTimestepOptions(int32 SampleCount);
-
-	static FString MakeLiveOptionLabel();
 
 	UPROPERTY(Transient)
 	TObjectPtr<AJUSYNCFileSpawnerActor> Spawner;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UBorder> Panel;
+	TObjectPtr<UBorder> HUDPanel;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UTextBlock> StatusText;
+	TObjectPtr<UBorder> HUDDot;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> HUDStateText;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> HUDFilesText;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> HUDTracksText;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UBorder> TransportBar;
 
 	UPROPERTY(Transient)
 	TObjectPtr<USlider> ScrubSlider;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UComboBoxString> TimestepCombo;
+	TObjectPtr<UTextBlock> StepText;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> TimeText;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> StepCountText;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> RateValueText;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UButton> PrevButton;
@@ -115,19 +137,23 @@ private:
 	TObjectPtr<UTextBlock> PlayPauseCaption;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UButton> PathlineButton;
+	TObjectPtr<UButton> RateMinusButton;
 
-	/** Caption of PathlineButton; the label reflects bEnablePathlines. */
 	UPROPERTY(Transient)
-	TObjectPtr<UTextBlock> PathlineCaption;
+	TObjectPtr<UButton> RatePlusButton;
 
-	/** Guards the programmatic SetValue / SetSelectedIndex calls. */
+	UPROPERTY(Transient)
+	TObjectPtr<UButton> LoopSwitch;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UBorder> LoopThumb;
+
+	/** Guards the programmatic SetValue calls. */
 	bool bApplyingFromCode = false;
 	bool bDraggingSlider = false;
 	bool bLayoutBuilt = false;
 
 	float RefreshAccumulator = 0.0f;
-	FString LastTimelineSignature;
 
 	static constexpr float RefreshIntervalSeconds = 0.1f;
 };
