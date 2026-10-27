@@ -1,5 +1,6 @@
 #include "JUSYNCPathlineActor.h"
 
+#include "Core/JUSYNCRealtimeMeshUtil.h"
 #include "JUSYNCStreamBuilder.h"
 #include "Materials/MaterialInterface.h"
 #include "RealtimeMeshComponent.h"
@@ -56,7 +57,7 @@ void AJUSYNCPathlineActor::ApplyMesh(const FJUSYNCCompactMeshData& Mesh,
 	const FRealtimeMeshSectionKey SectionKey =
 		FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 0);
 
-	if (RealtimeMesh->GetSectionGroup(GroupKey))
+	if (JUSYNCRealtimeMeshHasSectionGroup(RealtimeMesh, GroupKey))
 	{
 		RealtimeMesh->UpdateSectionGroup(GroupKey, MoveTemp(Streams));
 	}
@@ -90,7 +91,7 @@ void AJUSYNCPathlineActor::ClearMesh()
 	{
 		const FRealtimeMeshSectionGroupKey GroupKey =
 			FRealtimeMeshSectionGroupKey::Create(0, TEXT("USDGroup"));
-		if (RealtimeMesh->GetSectionGroup(GroupKey))
+		if (JUSYNCRealtimeMeshHasSectionGroup(RealtimeMesh, GroupKey))
 		{
 			RealtimeMesh->RemoveSectionGroup(GroupKey);
 		}

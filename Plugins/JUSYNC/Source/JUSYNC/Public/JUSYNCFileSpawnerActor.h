@@ -315,6 +315,18 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
         meta = (EditCondition = "bEnablePathlines", EditConditionHides))
+    bool bPathlineHueFilterEnabled;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
+        meta = (EditCondition = "bEnablePathlines && bPathlineHueFilterEnabled", EditConditionHides, ClampMin = "0", ClampMax = "360"))
+    float PathlineHue;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
+        meta = (EditCondition = "bEnablePathlines && bPathlineHueFilterEnabled", EditConditionHides, ClampMin = "0", ClampMax = "180"))
+    float PathlineHueTolerance;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
+        meta = (EditCondition = "bEnablePathlines", EditConditionHides))
     bool bPathlineColorByScalar;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
@@ -328,6 +340,28 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
         meta = (EditCondition = "bEnablePathlines && !bPathlineColorByScalar", EditConditionHides))
     FLinearColor PathlineFlatColor;
+
+    /** Emissive multiplier for the generated trail material (0 = no glow).
+        Live-tunable from the in-game pathline panel. */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
+        meta = (ClampMin = "0", ClampMax = "4", EditCondition = "bEnablePathlines", EditConditionHides))
+    float PathlineEmissiveStrength;
+
+    /** Whether the streamed LiDAR points are displayed (POINTS panel section
+        of the P menu; the spawner remembers this across future frames). */
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Points")
+    bool bPointCloudsVisible;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Points")
+    bool bPointCloudHueFilterEnabled;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Points",
+        meta = (EditCondition = "bPointCloudHueFilterEnabled", EditConditionHides, ClampMin = "0", ClampMax = "360"))
+    float PointCloudHue;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Points",
+        meta = (EditCondition = "bPointCloudHueFilterEnabled", EditConditionHides, ClampMin = "0", ClampMax = "180"))
+    float PointCloudHueTolerance;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
         meta = (EditCondition = "bEnablePathlines", EditConditionHides, ClampMin = "0"))
@@ -370,6 +404,24 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Cache", meta = (EditCondition = "bEnableMeshCache", EditConditionHides))
     bool bCachePointClouds;
+
+    // Dynamic cache budget: let the sample cache grow/shrink with the RAM the
+    // machine actually has free instead of a fixed MB number. SampleCacheMaxMB
+    // stays the FLOOR (never worse than before), CacheBudgetMaxMB the cap.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Cache")
+    bool bDynamicCacheBudget = true;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Cache", meta = (EditCondition = "bDynamicCacheBudget", EditConditionHides, ClampMin = "10", ClampMax = "90"))
+    int32 CacheRamPercent = 70;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Cache", meta = (EditCondition = "bDynamicCacheBudget", EditConditionHides, ClampMin = "64"))
+    int32 CacheBudgetMaxMB = 8192;
+
+    // Share of the process's remaining DXGI video-memory budget reserved for
+    // the warm replay-cloud pool (built clouds that skip a rebuild on scrub
+    // revisit). Same hysteresis + polling as the RAM budget.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Cache", meta = (EditCondition = "bDynamicCacheBudget", EditConditionHides, ClampMin = "10", ClampMax = "90"))
+    int32 CacheVRamPercent = 70;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Playback")
     bool bEnableSampleCache;
@@ -501,6 +553,14 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
     void ClearCachedSamples();
 
+    /** POINTS panel forwards: push point-cloud visibility / hue-filter state
+     *  held on this actor down to the shared point-cloud spawner. */
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Points")
+    void SetPointCloudsVisible(bool bVisible);
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Points")
+    void UpdatePointCloudHueFilter();
+
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner|Playback")
     float GetPlaybackPosition() const { return PlaybackPosition; }
 
@@ -525,6 +585,23 @@ public:
 
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner")
     FVector GetNextSpawnLocation() const;
+
+    // Element+payload identity of a rolling clip stream with the timestep mark
+    // dropped: "..._Geom__0.000000.geo" and "..._Geom__0.250000.geo" are the
+    // SAME live element. Empty for files without a per-timestep mark (their
+    // identity never rolls). The deletion sweep uses this to tell a clip
+    // rollover from a retired element; exposed so tests can pin the contract.
+    static FString BuildClipStreamKey(const FString& Filename);
+
+    // Dynamic cache budget math (pure so tests can pin it). Percent is 0-100
+    // of the sender-reported free bytes, clamped to [FloorBytes, CapBytes];
+    // a zero/negative Percent (or unreadable memory) yields FloorBytes.
+    static int64 ComputeCacheBudgetBytes(int64 FreeBytes, int32 Percent, int64 FloorBytes, int64 CapBytes);
+
+    // True when Value moved far enough from LastAccepted to be worth acting
+    // on (hysteresis: changes below PercentToAct% of the accepted value are
+    // ignored, so a wobbling free-RAM number cannot thrash the cache).
+    static bool PassesBudgetHysteresis(int64 LastAccepted, int64 Value, int32 PercentToAct = 10);
 
 protected:
     virtual void BeginPlay() override;
@@ -621,6 +698,19 @@ private:
     int32 ResolveFileRank(const FString& Filename, int32 KnownRank) const;
     int32 DestroyFileActors(const FString& Filename);
 
+    // A rolling clip stream renames its clip file every timestep
+    // ("..._Geom__0.000000.geo" -> "..._Geom__0.250000.geo"). The live actor
+    // must survive that swap, so ownership moves from the retired filename to
+    // the live one instead of the deletion sweep destroying (and pathline-
+    // unregistering) the actor the next sample is about to morph into.
+    void TransferFileActorOwnership(const FString& FromFile, const FString& ToFile);
+
+    // A deleted clip can arrive one commit BEFORE its replacement shows up in
+    // the file list (the store swaps faster than notifications). Hold the
+    // destruction; if the stream reappears under a new timestep filename the
+    // actor is transferred, only a truly retired stream is destroyed.
+    void SweepPendingDeletedFiles();
+
     // One logical element (including all "_u<k>" rebuild variants) must own a
     // single actor. Duplicates left by the pre-fix initial spawn are retired
     // here so an older sample cannot stay visible.
@@ -705,6 +795,16 @@ private:
     TMap<FString, AActor*> FileToActorMap;
     TMap<FString, TArray<AActor*>> FilenameToActors;
     TMap<FString, TArray<AActor*>> FilenameToPCActors;
+    // One-shot: when no PathlineMaterial is set, try the project's shared
+    // vertex-colour material so baked trail colours are actually sampled.
+    bool bPathlineMaterialFallbackTried = false;
+    // ConstB of the generated trail material's emissive scale node; the
+    // panel's EM= box retunes PathlineEmissiveStrength through it.
+    UPROPERTY(Transient)
+    TObjectPtr<class UMaterialExpressionMultiply> TrailEmissiveExpression;
+    // Deleted clip filename -> world time at which its actors are destroyed
+    // when no successor clip for the same stream key has appeared.
+    TMap<FString, float> PendingDeletedFiles;
     TMap<FString, FString> PCElementToFilename;
 
     TMap<FString, uint64> FileHashLo;
@@ -813,8 +913,32 @@ private:
     void RebuildPathlinesFromSampleCache();
     FJUSYNCPathlineSettings BuildPathlineSettings() const;
     void SyncPathlineManager();
+
+    /** Runtime VertexColor -> BaseColor+Emissive material so baked trail
+        colours survive without scene lighting (editor builds only). */
+    UMaterialInterface* CreateEmissiveVertexColorMaterial();
     void AddSampleCacheEntry(const FString& Key, FJUSYNCSampleCacheEntry&& Entry);
     void TrimSampleCache();
+
+    // 2 s cadence re-read of free RAM (dynamic budget). Acts only through
+    // PassesBudgetHysteresis; applies the result to the sample cache and to
+    // the point cloud spawner's warm-replay pool (via its own VRAM query).
+    void PollDynamicCacheBudgets(float DeltaSeconds);
+
+    // Effective sample-cache byte ceiling: dynamic value when enabled and
+    // sampled, else the static SampleCacheMaxMB floor.
+    int64 GetSampleCacheBudgetBytes() const;
+
+    // Effective per-key sample ring size. Static SampleCacheSize clamp when
+    // the dynamic budget is off; with it on, the BYTE budget is what bounds
+    // memory, so the ring grows to fit (budget / avg cached entry bytes,
+    // max 1024) and a full dataset stays scrubbable instead of pinning the
+    // scrubber at 8 samples.
+    int32 GetSampleCacheCountCap() const;
+
+    float CacheBudgetAccum = 0.0f;
+    int64 DynamicSampleCacheBytes = 0;  // 0 = not sampled yet
+    int64 DynamicCloudBudgetBytes = 0;  // 0 = not sampled yet
     void ClearSampleCache();
     void FlushPendingLiveSamples();
     void ApplyCachedSample(float NormalizedPosition);

@@ -4,6 +4,7 @@
 #include "RawGeo/JUSYNCRawGeoCurves.h"
 #include "JUSYNCPointCloudSpawner.h"
 #include "JUSYNCBenchmarkTiming.h"
+#include "Platform/JUSYNCVideoMemory.h"
 #include "JUSYNCUSDLoader.h"
 #include "EngineUtils.h"
 #if WITH_ANARI_USD_MIDDLEWARE
@@ -65,6 +66,7 @@ static bool JUSYNCRequestFileToString(const FString& Filename, int32 Rank, FStri
 #include "Materials/Material.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialExpression.h"
+#include "Materials/MaterialExpressionMultiply.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialExpressionVertexColor.h"
 #include "Async/Async.h"
@@ -79,6 +81,53 @@ static TAutoConsoleVariable<int32> CVarJusyncCollapseVariants(
     TEXT("so alternating _<n>/_u<k> notifications update the same mesh instead of\n")
     TEXT("leaving an older sample visible. Turning this on can suppress subset (.geo\n")
     TEXT("_s<k>) streams and freeze part of a cloud."),
+    ECVF_Default);
+
+// Runtime budget overrides so a huge point stream cannot outrun the machine
+// before anyone can reach the Details panel (0 = follow the actor property).
+static TAutoConsoleVariable<int32> CVarJusyncPathlineMaxTracks(
+    TEXT("jusync.Pathlines.MaxTracks"), 0,
+    TEXT("Overrides PathlineMaxTracks on every spawner when > 0."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarJusyncPathlineHistorySamples(
+    TEXT("jusync.Pathlines.HistorySamples"), 0,
+    TEXT("Overrides PathlineHistorySamples on every spawner when > 0."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarJusyncPathlineMaxNodes(
+    TEXT("jusync.Pathlines.MaxNodes"), 0,
+    TEXT("Overrides PathlineMaxNodes on every spawner when > 0. This is the\n")
+    TEXT("hard cap on trail geometry nodes (tracks x history) and the main\n")
+    TEXT("memory/GPU guard for dense streams."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarJusyncPathlineRadius(
+    TEXT("jusync.Pathlines.Radius"), 0.02f,
+    TEXT("Overrides PathlineRadius (cm) on every spawner when > 0, so trail\n")
+    TEXT("thickness can be tuned live from the console. 0 = use the spawner's\n")
+    TEXT("details-panel value."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarJusyncPathlineTubeSides(
+    TEXT("jusync.Pathlines.TubeSides"), 8,
+    TEXT("Overrides PathlineTubeSides on every spawner when >= 3. The\n")
+    TEXT("4-sided default reads as a bent square; 8 looks cylindrical at\n")
+    TEXT("trail radii. 0 = use the spawner's details-panel value."),
+    ECVF_Default);
+
+// Rolling clip streams delete a timestep's clip file one commit before the
+// next timestep's clip appears. Destroying actors the instant the delete is
+// seen destroys and respawns the point cloud every timestep and wipes
+// pathline history; hold first, transfer ownership when the successor arrives.
+static TAutoConsoleVariable<float> CVarJusyncDeletedFileGrace(
+    TEXT("jusync.Spawner.DeletedFileGraceSeconds"), 5.0f,
+    TEXT("Seconds to hold actors owned by a deleted clip file before\n")
+    TEXT("deciding, so a rollover to the next timestep's filename can\n")
+    TEXT("take the actor over. After it expires the last frame is HELD, not\n")
+    TEXT("destroyed: the sender's store deletes streamed clips during its own\n")
+    TEXT("reconciliation (always on the final commit of a stream), so a clip\n")
+    TEXT("name vanishing without a successor is not a delete signal."),
     ECVF_Default);
 
 static bool JUSYNCIsLiveUpdateGeometryFile(const FString& Filename)
@@ -195,6 +244,149 @@ static FString JUSYNCBuildLogicalActorKey(const FString& Filename)
         : (Variant.Payload == JUSYNCElementNames::EPayload::Usd) ? TEXT("usd") : TEXT("other");
     const FString StableElement = JUSYNCElementNames::CanonicalActorIdentity(Variant.Element);
     return FString::Printf(TEXT("%s@%s@%s"), *StableElement, Payload, *TimeMark);
+}
+
+// Rolling-clip identity: the logical key minus the time mark. Returns empty for
+// files with no "__<time>" mark, whose identity never rotates with timesteps.
+FString AJUSYNCFileSpawnerActor::BuildClipStreamKey(const FString& Filename)
+{
+    const FString Logical = JUSYNCBuildLogicalActorKey(Filename);
+    int32 Cut = INDEX_NONE;
+    if (Logical.IsEmpty() || !Logical.FindLastChar(TEXT('@'), Cut) ||
+        Cut == Logical.Len() - 1)
+    {
+        return FString();
+    }
+    return Logical.Left(Cut);
+}
+
+int64 AJUSYNCFileSpawnerActor::ComputeCacheBudgetBytes(int64 FreeBytes, int32 Percent, int64 FloorBytes, int64 CapBytes)
+{
+    const int64 Floor = FMath::Max<int64>(1, FloorBytes);
+    const int64 Cap = FMath::Max(Floor, CapBytes);
+    if (Percent <= 0 || FreeBytes <= 0)
+    {
+        return Floor;
+    }
+    const int64 Desired = FreeBytes / 100 * FMath::Clamp(Percent, 1, 100);
+    return FMath::Clamp(Desired, Floor, Cap);
+}
+
+bool AJUSYNCFileSpawnerActor::PassesBudgetHysteresis(int64 LastAccepted, int64 Value, int32 PercentToAct)
+{
+    if (LastAccepted <= 0)
+    {
+        return Value > 0;
+    }
+    const int64 Delta = Value > LastAccepted ? Value - LastAccepted : LastAccepted - Value;
+    return Delta * 100 > LastAccepted * FMath::Clamp(PercentToAct, 1, 90);
+}
+
+int64 AJUSYNCFileSpawnerActor::GetSampleCacheBudgetBytes() const
+{
+    const int64 FloorBytes = static_cast<int64>(FMath::Max(16, SampleCacheMaxMB)) * 1024 * 1024;
+    if (!bDynamicCacheBudget || DynamicSampleCacheBytes <= 0)
+    {
+        return FloorBytes;
+    }
+    return DynamicSampleCacheBytes;
+}
+
+int32 AJUSYNCFileSpawnerActor::GetSampleCacheCountCap() const
+{
+    const int32 StaticCap = FMath::Clamp(SampleCacheSize, 1, 64);
+    if (!bDynamicCacheBudget || DynamicSampleCacheBytes <= 0)
+    {
+        return StaticCap;
+    }
+    const int64 AvgBytes = SampleCacheEntryCount > 0
+        ? FMath::Max<int64>(1, SampleCacheBytes / SampleCacheEntryCount) : 0;
+    if (AvgBytes <= 0)
+    {
+        return StaticCap; // no size history yet; byte trim still guards memory
+    }
+    return static_cast<int32>(FMath::Clamp<int64>(
+        DynamicSampleCacheBytes / AvgBytes, StaticCap, 1024));
+}
+
+void AJUSYNCFileSpawnerActor::PollDynamicCacheBudgets(float DeltaSeconds)
+{
+    if (!bDynamicCacheBudget)
+    {
+        if (DynamicSampleCacheBytes != 0 || DynamicCloudBudgetBytes != 0)
+        {
+            DynamicSampleCacheBytes = 0;
+            DynamicCloudBudgetBytes = 0;
+            if (UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem())
+            {
+                if (FJUSYNCPointCloudSpawner* PCSpawner = Subsystem->GetPointCloudSpawner())
+                {
+                    PCSpawner->SetWarmCloudBudgetBytes(0); // legacy fixed pool
+                }
+            }
+        }
+        CacheBudgetAccum = 0.0f;
+        return;
+    }
+
+    CacheBudgetAccum += DeltaSeconds;
+    if (CacheBudgetAccum < 2.0f)
+    {
+        return;
+    }
+    CacheBudgetAccum = 0.0f;
+
+    // --- RAM: decoded sample payloads (morph sources, instant scrub data).
+    // UE 5.8's GetStats() reports AvailablePhysical in BYTES already (ullAvailPhys).
+    const FPlatformMemoryStats Mem = FPlatformMemory::GetStats();
+    const int64 FreeRamBytes = static_cast<int64>(Mem.AvailablePhysical);
+    const int64 FloorBytes = static_cast<int64>(FMath::Max(16, SampleCacheMaxMB)) * 1024 * 1024;
+    const int64 CapBytes = static_cast<int64>(FMath::Max(64, CacheBudgetMaxMB)) * 1024 * 1024;
+    const int64 RamBudget = ComputeCacheBudgetBytes(FreeRamBytes, CacheRamPercent, FloorBytes, CapBytes);
+    const int64 AcceptedRam = DynamicSampleCacheBytes > 0 ? DynamicSampleCacheBytes : FloorBytes;
+    if (RamBudget != DynamicSampleCacheBytes && PassesBudgetHysteresis(AcceptedRam, RamBudget))
+    {
+        DynamicSampleCacheBytes = RamBudget;
+        UE_LOG(LogTemp, Display, TEXT(
+            "[Spawner] sample-cache budget -> %lld MB (free RAM %lld MB x %d%%, floor %d MB, cap %d MB)"),
+            RamBudget / (1024 * 1024), FreeRamBytes / (1024 * 1024),
+            CacheRamPercent, FMath::Max(16, SampleCacheMaxMB), FMath::Max(64, CacheBudgetMaxMB));
+        TrimSampleCache();
+
+        if (MeshCache && bEnableMeshCache)
+        {
+            const int64 MeshFloorBytes = static_cast<int64>(FMath::Max(16, MeshCacheMaxMB)) * 1024 * 1024;
+            MeshCache->SetLimits(MeshCacheMaxEntries,
+                ComputeCacheBudgetBytes(FreeRamBytes, CacheRamPercent, MeshFloorBytes, CapBytes));
+        }
+    }
+
+    // --- VRAM: warm replay-cloud pool, sized off the process's remaining
+    // DXGI video-memory budget (what the RHI itself has to work with).
+    UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
+    FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr;
+    if (!PCSpawner)
+    {
+        return;
+    }
+    int64 FreeVRamBytes = 0;
+    int64 TotalVRamBudgetBytes = 0;
+    if (!JUSYNCVideoMemory::QueryProcessLocalBudget(FreeVRamBytes, TotalVRamBudgetBytes))
+    {
+        return; // keep the current pool; legacy 24 until the first good read
+    }
+    const int64 WarmFloorBytes = 64LL * 1024 * 1024;
+    const int64 WarmCapBytes = 2048LL * 1024 * 1024;
+    const int64 WarmBudget = ComputeCacheBudgetBytes(FreeVRamBytes, CacheVRamPercent, WarmFloorBytes, WarmCapBytes);
+    const int64 AcceptedVram = DynamicCloudBudgetBytes > 0 ? DynamicCloudBudgetBytes : WarmFloorBytes;
+    if (WarmBudget != DynamicCloudBudgetBytes && PassesBudgetHysteresis(AcceptedVram, WarmBudget))
+    {
+        DynamicCloudBudgetBytes = WarmBudget;
+        PCSpawner->SetWarmCloudBudgetBytes(WarmBudget);
+        UE_LOG(LogTemp, Display, TEXT(
+            "[Spawner] warm-cloud pool budget -> %lld MB (free VRAM budget %lld MB x %d%%)"),
+            WarmBudget / (1024 * 1024), FreeVRamBytes / (1024 * 1024), CacheVRamPercent);
+    }
 }
 
 // The RawGeo stream names consecutive samples "<element>" and
@@ -399,7 +591,7 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     CloudBlendMs = 0;     // auto = sample gap capped by CloudMaxBlendMs
     CloudMaxBlendMs = 200; // keep a swap inside the stream interval (no 2 s lag)
     bCloudFixedSize = true;
-    CloudScreenSizePct = 0.25f;
+    CloudScreenSizePct = 2.7f;
 
     bEnableBenchmarking = true;
     BenchmarkTestName = TEXT("JUSYNC_SpawnerSession");
@@ -418,12 +610,12 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     GradientPngFilename = TEXT("");
 
     bEnablePathlines = false;
-    PathlineMaxTracks = 4096;
+    PathlineMaxTracks = 1000;
     PathlineHistorySamples = 128;
     PathlineMaxNodes = 524288;
     PathlineTrackExpirySamples = 64;
     PathlineTubeSides = 4;
-    PathlineRadius = 0.5f;
+    PathlineRadius = 0.02f;
     PathlineRadiusScale = 1.0f;
     bPathlineUsePointWidth = false;
     PathlineIdAttribute = TEXT("particle_id");
@@ -432,10 +624,14 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     bPathlineFilterEnabled = false;
     PathlineFilterMin = 0.0f;
     PathlineFilterMax = 1.0f;
+    bPathlineHueFilterEnabled = false;
+    PathlineHue = 0.0f;
+    PathlineHueTolerance = 30.0f;
     bPathlineColorByScalar = true;
     PathlineColorMin = 0.0f;
     PathlineColorMax = 1.0f;
     PathlineFlatColor = FLinearColor::White;
+    PathlineEmissiveStrength = 0.05f;
     PathlineSelectionSeed = 1337;
     PathlinePendingTimeoutSeconds = 2.0f;
     PathlineMaterial = nullptr;
@@ -445,6 +641,10 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     PathlineDroppedSamples = 0;
     PathlineIgnoredSamples = 0;
     PointCloudSize = 0.04f;
+    bPointCloudsVisible = true;
+    bPointCloudHueFilterEnabled = false;
+    PointCloudHue = 0.0f;
+    PointCloudHueTolerance = 30.0f;
     PointShape = EJUSYNCPointShape::Square;
     PointOrientation = EJUSYNCPointOrientation::FacingCamera;
     PointScaling = EJUSYNCPointScaling::PerNodeAdaptive;
@@ -922,6 +1122,8 @@ void AJUSYNCFileSpawnerActor::Tick(float DeltaSeconds)
     Super::Tick(DeltaSeconds);
 
     SyncPathlineManager();
+    SweepPendingDeletedFiles();
+    PollDynamicCacheBudgets(DeltaSeconds);
 
     if (bEnableLiveUpdates && LiveUpdatePollInterval > 0.0f &&
         bInitialSpawnDone && CurrentState == EJUSYNCSpawnerState::Complete)
@@ -982,9 +1184,29 @@ FJUSYNCPathlineSettings AJUSYNCFileSpawnerActor::BuildPathlineSettings() const
     Settings.MaxTracks = FMath::Max(1, PathlineMaxTracks);
     Settings.HistorySamples = FMath::Max(2, PathlineHistorySamples);
     Settings.MaxNodes = FMath::Max(0, PathlineMaxNodes);
+    if (const int32 TrackCap = CVarJusyncPathlineMaxTracks.GetValueOnGameThread(); TrackCap > 0)
+    {
+        Settings.MaxTracks = TrackCap;
+    }
+    if (const int32 HistoryCap = CVarJusyncPathlineHistorySamples.GetValueOnGameThread(); HistoryCap > 2)
+    {
+        Settings.HistorySamples = HistoryCap;
+    }
+    if (const int32 NodeCap = CVarJusyncPathlineMaxNodes.GetValueOnGameThread(); NodeCap > 0)
+    {
+        Settings.MaxNodes = NodeCap;
+    }
     Settings.TrackExpirySamples = FMath::Max(0, PathlineTrackExpirySamples);
     Settings.TubeSides = FMath::Clamp(PathlineTubeSides, 3, 16);
+    if (const int32 SidesOverride = CVarJusyncPathlineTubeSides.GetValueOnGameThread(); SidesOverride >= 3)
+    {
+        Settings.TubeSides = FMath::Clamp(SidesOverride, 3, 16);
+    }
     Settings.Radius = FMath::Max(0.001f, PathlineRadius);
+    if (const float RadiusOverride = CVarJusyncPathlineRadius.GetValueOnGameThread(); RadiusOverride > 0.0f)
+    {
+        Settings.Radius = RadiusOverride;
+    }
     Settings.RadiusScale = FMath::Max(0.001f, PathlineRadiusScale);
     Settings.bUsePointWidth = bPathlineUsePointWidth;
     Settings.IdAttribute = PathlineIdAttribute;
@@ -993,6 +1215,9 @@ FJUSYNCPathlineSettings AJUSYNCFileSpawnerActor::BuildPathlineSettings() const
     Settings.bFilterEnabled = bPathlineFilterEnabled;
     Settings.FilterMin = FMath::Min(PathlineFilterMin, PathlineFilterMax);
     Settings.FilterMax = FMath::Max(PathlineFilterMin, PathlineFilterMax);
+    Settings.bFilterByHue = bPathlineHueFilterEnabled;
+    Settings.FilterHue = FMath::Clamp(PathlineHue, 0.0f, 360.0f);
+    Settings.FilterHueTolerance = FMath::Clamp(PathlineHueTolerance, 0.0f, 180.0f);
     Settings.bColorByScalar = bPathlineColorByScalar;
     Settings.ColorMin = FMath::Min(PathlineColorMin, PathlineColorMax);
     Settings.ColorMax = FMath::Max(PathlineColorMin, PathlineColorMax);
@@ -1002,11 +1227,91 @@ FJUSYNCPathlineSettings AJUSYNCFileSpawnerActor::BuildPathlineSettings() const
     return Settings;
 }
 
+UMaterialInterface* AJUSYNCFileSpawnerActor::CreateEmissiveVertexColorMaterial()
+{
+#if WITH_EDITOR
+	// Compiling UMaterial at runtime is an editor-only capability; packaged
+	// builds take the cached M_VertexColor asset path instead.
+	UMaterial* Material = NewObject<UMaterial>(
+		GetTransientPackage(), TEXT("M_JusyncTrailVertexColor"));
+	if (!Material)
+	{
+		return nullptr;
+	}
+
+	UMaterialExpressionVertexColor* VertexColor =
+		NewObject<UMaterialExpressionVertexColor>(Material);
+
+	// Base Color and Emissive Color are material inputs, not expression
+	// nodes: the VertexColor node wires into both directly.
+	UMaterialEditorOnlyData* EditorData = Material->GetEditorOnlyData();
+	EditorData->BaseColor.Expression = VertexColor;
+
+	// Emissive is the vertex colour scaled by the live-tunable strength
+	// (default 0.35): trails glow enough to read in the dark without
+	// blowing out to white against the points.
+	UMaterialExpressionMultiply* Dim =
+		NewObject<UMaterialExpressionMultiply>(Material);
+	Dim->A.Expression = VertexColor;
+	Dim->ConstB = FMath::Clamp(PathlineEmissiveStrength, 0.0f, 4.0f);
+	EditorData->EmissiveColor.Expression = Dim;
+	TrailEmissiveExpression = Dim;
+
+	// PostEditChange is what actually compiles the transient material.
+	Material->PostEditChange();
+	return Material;
+#else
+	return nullptr;
+#endif
+}
+
 void AJUSYNCFileSpawnerActor::SyncPathlineManager()
 {
     if (!PathlineManager)
     {
         PathlineManager = MakeShared<FJUSYNCPathlineManager>();
+    }
+
+    // The shared compact-mesh default does not sample vertex colour, and the
+    // project's lit M_VertexColor reads near-black on thin tubes in a dark
+    // viewport (the point clouds are emissive sprites, which is why points
+    // pop and trails did not). Build a self-lit vertex-colour material so the
+    // trails always carry the same colours the points show.
+    if (!PathlineMaterial && !bPathlineMaterialFallbackTried)
+    {
+        bPathlineMaterialFallbackTried = true;
+        PathlineMaterial = CreateEmissiveVertexColorMaterial();
+        if (!PathlineMaterial)
+        {
+            // Packaged builds cannot compile materials at runtime; fall back
+            // to the project asset (lit, but at least vertex-coloured).
+            UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
+            PathlineMaterial = Subsystem
+                ? Subsystem->GetCachedMaterial(TEXT("/Game/Materials/M_VertexColor"))
+                : LoadObject<UMaterialInterface>(
+                    nullptr, TEXT("/Game/Materials/M_VertexColor.M_VertexColor"));
+        }
+        UE_LOG(LogTemp, Display, TEXT("[Spawner] Pathline material: %s"),
+            PathlineMaterial ? *PathlineMaterial->GetName()
+                             : TEXT("none — trails keep the default material and lose vertex colours"));
+    }
+
+    // Live emission retune: the panel writes PathlineEmissiveStrength; push
+    // it into the generated material only when it actually changed (each
+    // PostEditChange recompiles the shader).
+    if (TrailEmissiveExpression)
+    {
+        const float Wanted = FMath::Clamp(PathlineEmissiveStrength, 0.0f, 4.0f);
+        if (!FMath::IsNearlyEqual(TrailEmissiveExpression->ConstB, Wanted, 1e-3f))
+        {
+            TrailEmissiveExpression->ConstB = Wanted;
+#if WITH_EDITOR
+            if (UMaterial* TrailMaterial = TrailEmissiveExpression->GetTypedOuter<UMaterial>())
+            {
+                TrailMaterial->PostEditChange();
+            }
+#endif
+        }
     }
 
     PathlineManager->SetSettings(BuildPathlineSettings());
@@ -1025,6 +1330,25 @@ void AJUSYNCFileSpawnerActor::SyncPathlineManager()
     PathlineVisibleTracks = Stats.VisibleTracks;
     PathlineDroppedSamples = static_cast<int32>(FMath::Min<int64>(Stats.DroppedSamples, MAX_int32));
     PathlineIgnoredSamples = Stats.IgnoredSamples;
+
+    // Periodic readout while pathlines are on. It is the only channel that separates the
+    // three failure modes: samples never reaching the manager (Ignored/Dropped climbing),
+    // ids missing or renamed on the wire (ActiveTracks stuck at 0), and geometry built but
+    // not visible (VisibleTracks 0 while ActiveTracks is not).
+    {
+        static double LastStatsLogTime = -1.0;
+        const double NowSeconds = FPlatformTime::Seconds();
+        if (bEnablePathlines && (LastStatsLogTime < 0.0 || NowSeconds - LastStatsLogTime >= 2.0))
+        {
+            LastStatsLogTime = NowSeconds;
+            UE_LOG(LogTemp, Display,
+                TEXT("[Spawner] Pathlines: active=%d visible=%d nodes=%lld ignored=%lld dropped=%lld "
+                     "dupIds=%lld elements=%d ingest=%.2fms build=%.2fms"),
+                Stats.ActiveTracks, Stats.VisibleTracks, Stats.TotalNodes, Stats.IgnoredSamples,
+                Stats.DroppedSamples, Stats.DuplicateIds, PathlineManager->GetElementKeys().Num(),
+                Stats.LastIngestMs, Stats.LastBuildMs);
+        }
+    }
 }
 
 void AJUSYNCFileSpawnerActor::RebuildPathlinesFromSampleCache()
@@ -2483,6 +2807,9 @@ void AJUSYNCFileSpawnerActor::ClearSampleCache()
     if (FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr)
     {
         PCSpawner->SetPlaybackMode(false);
+        // The reuse cache is keyed by sample-cache payload identity; once the
+        // samples are gone the built clouds they produced must go with them.
+        PCSpawner->ClearPlaybackCloudReuse();
     }
     if (PathlineManager)
     {
@@ -2494,6 +2821,25 @@ void AJUSYNCFileSpawnerActor::ClearCachedSamples()
 {
     ClearSampleCache();
     UE_LOG(LogTemp, Log, TEXT("[SampleCache] cleared recent-sample cache"));
+}
+
+void AJUSYNCFileSpawnerActor::SetPointCloudsVisible(bool bVisible)
+{
+    bPointCloudsVisible = bVisible;
+    UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
+    if (FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr)
+    {
+        PCSpawner->SetPointCloudsHidden(!bVisible);
+    }
+}
+
+void AJUSYNCFileSpawnerActor::UpdatePointCloudHueFilter()
+{
+    UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
+    if (FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr)
+    {
+        PCSpawner->SetPointHueFilter(bPointCloudHueFilterEnabled, PointCloudHue, PointCloudHueTolerance);
+    }
 }
 
 uint64 AJUSYNCFileSpawnerActor::ResolveLiveSampleId(uint64 SenderTimestamp)
@@ -2587,7 +2933,7 @@ FString AJUSYNCFileSpawnerActor::GetSampleCacheDebugString() const
 
 void AJUSYNCFileSpawnerActor::TrimSampleCache()
 {
-    const int64 MaxBytes = static_cast<int64>(FMath::Max(16, SampleCacheMaxMB)) * 1024 * 1024;
+    const int64 MaxBytes = GetSampleCacheBudgetBytes();
     while (SampleCacheBytes > MaxBytes && SampleCacheEntryCount > 1)
     {
         FString OldestKey;
@@ -2630,7 +2976,7 @@ void AJUSYNCFileSpawnerActor::TrimSampleCache()
     // dropdown grow without bound. Keep only the newest N distinct frames.
     TArray<uint64> Timeline;
     GetSampleTimeline(Timeline);
-    const int32 MaxTimeline = FMath::Clamp(SampleCacheSize, 1, 64);
+    const int32 MaxTimeline = GetSampleCacheCountCap();
     if (Timeline.Num() > MaxTimeline)
     {
         TSet<uint64> DropIds;
@@ -2770,7 +3116,7 @@ void AJUSYNCFileSpawnerActor::AddSampleCacheEntry(const FString& Key, FJUSYNCSam
         SampleCacheLiveFilename.Add(Key, List.Last().Filename);
     }
 
-    const int32 MaxEntries = FMath::Clamp(SampleCacheSize, 1, 64);
+    const int32 MaxEntries = GetSampleCacheCountCap();
     while (List.Num() > MaxEntries)
     {
         SampleCacheBytes -= List[0].Bytes;
@@ -3349,7 +3695,7 @@ void AJUSYNCFileSpawnerActor::PostEditChangeProperty(FPropertyChangedEvent& Prop
     }
     else if (PropertyName == GET_MEMBER_NAME_CHECKED(AJUSYNCFileSpawnerActor, SampleCacheSize))
     {
-        const int32 MaxEntries = FMath::Clamp(SampleCacheSize, 1, 64);
+        const int32 MaxEntries = GetSampleCacheCountCap();
         for (TPair<FString, TArray<FJUSYNCSampleCacheEntry>>& Pair : SampleCache)
         {
             while (Pair.Value.Num() > MaxEntries)
@@ -4937,6 +5283,16 @@ void AJUSYNCFileSpawnerActor::OnPointCloudSpawnedHandler(const FString& EleName,
     {
         if (!FileName.IsEmpty())
         {
+            // A clip rollover re-registers the same actor under the new
+            // timestep filename; drop the stale entry under the old file so
+            // its deletion sweep cannot destroy the live actor.
+            for (TPair<FString, TArray<AActor*>>& Pair : FilenameToPCActors)
+            {
+                if (Pair.Key != FileName)
+                {
+                    Pair.Value.Remove(Spawned);
+                }
+            }
             TArray<AActor*>& Arr = FilenameToPCActors.FindOrAdd(FileName);
             if (!Arr.Contains(Spawned))
             {
@@ -4984,6 +5340,13 @@ void AJUSYNCFileSpawnerActor::OnPointCloudSpawnedHandler(const FString& EleName,
 
         if (!FileName.IsEmpty())
         {
+            for (TPair<FString, TArray<AActor*>>& Pair : FilenameToPCActors)
+            {
+                if (Pair.Key != FileName)
+                {
+                    Pair.Value.Remove(Spawned);
+                }
+            }
             FilenameToPCActors.FindOrAdd(FileName).Add(Spawned);
         }
 
@@ -5337,8 +5700,37 @@ void AJUSYNCFileSpawnerActor::HandleFileUpdateNotification(const FString& Filena
         OldHashLo == HashLo &&
         OldHashHi == HashHi)
     {
-        UE_LOG(LogTemp, Log, TEXT("[LiveUpdate] Dedup: hash already tracked for '%s'"), *Filename);
-        return;
+        // "Already tracked" only means WE told the broker about this hash - the
+        // poll path records hashes into FileHashLo/Hi without ever building the
+        // actors (raw=143 vs tracked=68: every clip sample arrived as V2, was
+        // pre-tracked by a poll, then every re-notify deduped and the point
+        // cloud never updated). Dedup only when this exact hash was actually
+        // applied to actors; otherwise queue the refresh now instead of waiting
+        // for the poll's changed-file sweep to notice the gap.
+        bool bAlreadyApplied = false;
+#if WITH_ANARI_USD_MIDDLEWARE
+        bool bAppliedChecked = false;
+        if (UJUSYNCSubsystem* ApplyCheck = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem())
+        {
+            if (const FJUSYNCPointCloudSpawner* PCApply = ApplyCheck->GetPointCloudSpawner())
+            {
+                bAppliedChecked = true;
+                bAlreadyApplied = PCApply->HasAppliedFileHash(Filename, HashLo, HashHi);
+            }
+        }
+#endif
+        if (!bAppliedChecked)
+        {
+            const int64* AppliedSize = AppliedFileSizes.Find(Filename);
+            bAlreadyApplied = AppliedSize && *AppliedSize == FileSize;
+        }
+        if (bAlreadyApplied)
+        {
+            UE_LOG(LogTemp, Log, TEXT("[LiveUpdate] Dedup: hash already applied for '%s'"), *Filename);
+            return;
+        }
+        UE_LOG(LogTemp, Display,
+            TEXT("[LiveUpdate] Dedup bypassed for '%s': hash tracked but never applied"), *Filename);
     }
 
     // One logical element can alternate between rebuild variants ("..._0" and
@@ -5632,11 +6024,28 @@ void AJUSYNCFileSpawnerActor::DiffAndRefreshFileList(const TArray<FString>& NewF
         }
     }
 
+    // Live rolling-clip owners keyed by stream (element+payload, timestep
+    // ignored): lets a retired clip filename hand its actors to the successor
+    // timestep file instead of having them destroyed.
+    TMap<FString, FString> LiveFileByStream;
+    LiveFileByStream.Reserve(NewFiles.Num());
+    for (const FString& LiveFile : NewFiles)
+    {
+        const FString Stream = BuildClipStreamKey(LiveFile);
+        if (!Stream.IsEmpty())
+        {
+            LiveFileByStream.Add(Stream, LiveFile);
+        }
+    }
+
     int32 DeletedCount = 0;
+    const float GraceSeconds =
+        FMath::Max(0.0f, CVarJusyncDeletedFileGrace.GetValueOnGameThread());
     for (const FString& OldName : OldFileList)
     {
         if (NewFileSet.Contains(OldName))
         {
+            PendingDeletedFiles.Remove(OldName);
             continue;
         }
 
@@ -5645,6 +6054,7 @@ void AJUSYNCFileSpawnerActor::DiffAndRefreshFileList(const TArray<FString>& NewF
         {
             UE_LOG(LogTemp, Verbose, TEXT("[LiveUpdate] Keeping actor(s) for variant file '%s' (logical '%s' still live)"),
                 *OldName, *OldLogical);
+            PendingDeletedFiles.Remove(OldName);
             FileHashLo.Remove(OldName);
             FileHashHi.Remove(OldName);
             FileLastSize.Remove(OldName);
@@ -5652,11 +6062,39 @@ void AJUSYNCFileSpawnerActor::DiffAndRefreshFileList(const TArray<FString>& NewF
             continue;
         }
 
-        const int32 Destroyed = DestroyFileActors(OldName);
-        if (Destroyed > 0)
+        const FString OldStream = BuildClipStreamKey(OldName);
+        if (!OldStream.IsEmpty())
         {
-            DeletedCount += Destroyed;
-            UE_LOG(LogTemp, Warning, TEXT("[LiveUpdate] Destroyed %d orphan actor(s) for deleted file '%s'"), Destroyed, *OldName);
+            if (const FString* LiveFile = LiveFileByStream.Find(OldStream))
+            {
+                // Same element republished under the next timestep's filename:
+                // keep the actor alive so it morphs and pathlines keep their
+                // history across the rollover.
+                TransferFileActorOwnership(OldName, *LiveFile);
+                UE_LOG(LogTemp, Verbose,
+                    TEXT("[LiveUpdate] Rolled clip '%s' onto live file '%s' (actors kept)"),
+                    *OldName, **LiveFile);
+            }
+            else
+            {
+                // The successor clip is not in this list yet (the store swaps
+                // files around the commit notification). Hold the destroy
+                // briefly instead of killing a cloud that respawns next tick.
+                PendingDeletedFiles.Add(OldName,
+                    (GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f) + GraceSeconds);
+                UE_LOG(LogTemp, Verbose,
+                    TEXT("[LiveUpdate] Deferred destroy of deleted file '%s' (%.1fs grace)"),
+                    *OldName, GraceSeconds);
+            }
+        }
+        else
+        {
+            const int32 Destroyed = DestroyFileActors(OldName);
+            if (Destroyed > 0)
+            {
+                DeletedCount += Destroyed;
+                UE_LOG(LogTemp, Warning, TEXT("[LiveUpdate] Destroyed %d orphan actor(s) for deleted file '%s'"), Destroyed, *OldName);
+            }
         }
 
         // Forget the file completely. Keeping its hash makes a later republish of
@@ -6268,6 +6706,140 @@ int32 AJUSYNCFileSpawnerActor::DestroyFileActors(const FString& Filename)
     }
 
     return Destroyed;
+}
+
+void AJUSYNCFileSpawnerActor::TransferFileActorOwnership(const FString& FromFile,
+    const FString& ToFile)
+{
+    if (FromFile.IsEmpty() || ToFile.IsEmpty() || FromFile == ToFile)
+    {
+        return;
+    }
+
+    auto MoveList = [&](TMap<FString, TArray<AActor*>>& Map)
+    {
+        TArray<AActor*>* From = Map.Find(FromFile);
+        if (!From || From->Num() == 0)
+        {
+            return;
+        }
+        TArray<AActor*>& To = Map.FindOrAdd(ToFile);
+        for (AActor* Actor : *From)
+        {
+            if (Actor && Actor->IsValidLowLevel() && !To.Contains(Actor))
+            {
+                To.Add(Actor);
+            }
+        }
+        From->Reset();
+    };
+    MoveList(FilenameToActors);
+    MoveList(FilenameToPCActors);
+
+    for (TPair<FString, FString>& Pair : PCElementToFilename)
+    {
+        if (Pair.Value == FromFile)
+        {
+            Pair.Value = ToFile;
+        }
+    }
+
+    // Re-apply keys must follow the filename or the next sample spawns a
+    // second actor beside the kept one instead of morphing into it. The map
+    // carries raw-filename keys (mesh), logical-key keys (mesh) and ranked
+    // element keys (point clouds, untouched here).
+    auto RemapKey = [&](const FString& FromKey, const FString& ToKey)
+    {
+        if (FromKey.IsEmpty() || FromKey == ToKey)
+        {
+            return;
+        }
+        if (AActor** pActor = FileToActorMap.Find(FromKey))
+        {
+            AActor* Actor = *pActor;
+            FileToActorMap.Remove(FromKey);
+            if (Actor && Actor->IsValidLowLevel() && !FileToActorMap.Contains(ToKey))
+            {
+                FileToActorMap.Add(ToKey, Actor);
+            }
+        }
+    };
+    RemapKey(FromFile, ToFile);
+    RemapKey(JUSYNCBuildLogicalActorKey(FromFile), JUSYNCBuildLogicalActorKey(ToFile));
+}
+
+void AJUSYNCFileSpawnerActor::SweepPendingDeletedFiles()
+{
+    if (PendingDeletedFiles.Num() == 0)
+    {
+        return;
+    }
+    const float Now = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0f;
+
+    TMap<FString, FString> LiveFileByStream;
+    LiveFileByStream.Reserve(RawFileList.Num());
+    for (const FString& LiveFile : RawFileList)
+    {
+        const FString Stream = BuildClipStreamKey(LiveFile);
+        if (!Stream.IsEmpty())
+        {
+            LiveFileByStream.Add(Stream, LiveFile);
+        }
+    }
+
+    for (auto It = PendingDeletedFiles.CreateIterator(); It; ++It)
+    {
+        const FString& Name = It.Key();
+        if (RawFileList.Contains(Name))
+        {
+            // The file is back (loop replay republishing the same clip name);
+            // its actors were never orphaned after all.
+            It.RemoveCurrent();
+            continue;
+        }
+
+        const FString Stream = BuildClipStreamKey(Name);
+        const FString* LiveFile =
+            Stream.IsEmpty() ? nullptr : LiveFileByStream.Find(Stream);
+        if (LiveFile)
+        {
+            TransferFileActorOwnership(Name, *LiveFile);
+            UE_LOG(LogTemp, Verbose,
+                TEXT("[LiveUpdate] Rolled retired clip '%s' onto late file '%s' (actors kept)"),
+                *Name, **LiveFile);
+            It.RemoveCurrent();
+            continue;
+        }
+
+        if (Now < It.Value())
+        {
+            continue;
+        }
+
+        // Grace expired and no successor arrived. For streamed clips this is
+        // NOT a deletion signal: ParaView's reference reconciliation removes
+        // clip store entries on its own, and it always does so on the last
+        // commit before a pause or the end of the series (nothing re-creates
+        // them afterwards). Hold the final frame; a new stream arrives under
+        // fresh names and takes over as usual.
+        if (!Stream.IsEmpty())
+        {
+            UE_LOG(LogTemp, Display, TEXT(
+                "[LiveUpdate] Clip file '%s' left the store without a successor - "
+                "holding last frame (stream paused/ended or sender store cleanup)"), *Name);
+            It.RemoveCurrent();
+            continue;
+        }
+
+        const int32 Destroyed = DestroyFileActors(Name);
+        if (Destroyed > 0)
+        {
+            UE_LOG(LogTemp, Warning,
+                TEXT("[LiveUpdate] Destroyed %d orphan actor(s) for deleted file '%s' (grace expired)"),
+                Destroyed, *Name);
+        }
+        It.RemoveCurrent();
+    }
 }
 
 void AJUSYNCFileSpawnerActor::AbortAllInFlightDownloads()

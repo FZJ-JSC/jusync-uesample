@@ -9,12 +9,14 @@
 #include "RealtimeMeshComponent.h"
 #include "JUSYNCModule.h"
 #include "HAL/FileManager.h"
+#include "HAL/ThreadSafeCounter.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Engine/GameInstance.h"
 #include "Kismet/GameplayStatics.h"
 #include "RealtimeMeshSimple.h"
 #include "JUSYNCStreamBuilder.h"
+#include "Core/JUSYNCRealtimeMeshUtil.h"
 #include "UObject/UObjectGlobals.h"
 #include "Misc/DateTime.h"
 #include "HAL/PlatformTime.h"
@@ -1567,6 +1569,15 @@ static void JUSYNCReadRawGeoAttributes(
     {
         FJUSYNCPointAttribute& Attribute = Out[static_cast<int32>(a)];
         Attribute.Name = UTF8_TO_TCHAR(Descs[a].name);
+        if (Attribute.Name.IsEmpty())
+        {
+            // ANARI point primitives address attributes positionally, so an
+            // unnamed section on the wire IS attribute<a>. The exporter has
+            // been shipping the scalar without its name; without this the
+            // pathline LUT lookup for "attribute0" misses and the trails
+            // render flat white.
+            Attribute.Name = FString::Printf(TEXT("attribute%d"), a);
+        }
         Attribute.Components = static_cast<int32>(Descs[a].components);
         const int64 Values = Count * Attribute.Components;
         Attribute.Values.SetNumUninitialized(static_cast<int32>(Values));
@@ -1771,6 +1782,35 @@ static bool JUSYNCParseRawGeoBuffer(const TArray<uint8>& Buffer, const FString& 
     }
     if ((uint64)Buffer.Num() < Expected)
         return false;
+
+    // Attribute-table dump. FJUSYNCPathlineManager keys tracks on an attribute literally
+    // named "particle_id", and the sender only carries float arrays and whatever names the
+    // ANARI exporter bothers to set - so this is the one place that can tell "ids dropped
+    // upstream" apart from "ids present but unnamed/renamed". Rate limited to the first
+    // frames of a session and then 1 in 300.
+    {
+        static FThreadSafeCounter RawGeoAttrDumpCount(0);
+        const int32 DumpIndex = RawGeoAttrDumpCount.Increment();
+        if (DumpIndex <= 3 || DumpIndex % 300 == 0)
+        {
+            FString AttrDump;
+            bool bHasIdAttr = false;
+            for (uint32 a = 0; a < Hdr.num_attributes; ++a)
+            {
+                const FString AttrName(Descs[a].name);
+                bHasIdAttr |= (strcmp(Descs[a].name, "particle_id") == 0);
+                AttrDump += FString::Printf(TEXT(" %u:%s x%u"), a,
+                    AttrName.IsEmpty() ? *FString::Printf(TEXT("<empty>=attribute%u"), a) : *AttrName,
+                    Descs[a].components);
+            }
+            UE_LOG(LogJUSYNC, Display,
+                TEXT("RawGeo attrs #%d file='%s' pts=%llu attrs=%u colors=%u rows=%llu idAttr=%d:%s"),
+                DumpIndex, *FPaths::GetCleanFilename(Filename), (unsigned long long)Hdr.num_points,
+                Hdr.num_attributes, (uint32)Hdr.color_components,
+                (unsigned long long)Hdr.attr_uniform_count,
+                bHasIdAttr ? 1 : 0, *AttrDump);
+        }
+    }
 
     const float* PosF = reinterpret_cast<const float*>(Src + HdrSize + AttrTableBytes);
     const float* ColF = nullptr;
@@ -2797,7 +2837,7 @@ bool UJUSYNCSubsystem::UpdateRealtimeMeshFromJUSYNC(
     const FRealtimeMeshSectionGroupKey GroupKey = FRealtimeMeshSectionGroupKey::Create(0, TEXT("USDGroup"));
     const FRealtimeMeshSectionKey SectionKey = FRealtimeMeshSectionKey::CreateForPolyGroup(GroupKey, 0);
 
-    if (RealtimeMesh->GetSectionGroup(GroupKey))
+    if (JUSYNCRealtimeMeshHasSectionGroup(RealtimeMesh, GroupKey))
     {
         RealtimeMesh->UpdateSectionGroup(GroupKey, MoveTemp(Streams));
     }
@@ -3055,7 +3095,7 @@ bool UJUSYNCSubsystem::UpdateRealtimeMeshFromJUSYNC_WithCompact(
                             bMorphBlend, MoveTemp(MorphPrev));
     }
 
-    if (RealtimeMesh->GetSectionGroup(GroupKey))
+    if (JUSYNCRealtimeMeshHasSectionGroup(RealtimeMesh, GroupKey))
     {
         RealtimeMesh->UpdateSectionGroup(GroupKey, MoveTemp(Streams));
     }

@@ -39,6 +39,8 @@ namespace
 		float Scalar = 0.0f;
 		float Width = 1.0f;
 		bool bHasScalar = false;
+		FColor Color = FColor::White;
+		bool bHasColor = false;
 		bool bBreak = false;
 		uint64 SampleId = 0;
 	};
@@ -70,6 +72,8 @@ namespace
 		float Scalar = 0.0f;
 		float Width = 1.0f;
 		bool bHasScalar = false;
+		FColor Color = FColor::White;
+		bool bHasColor = false;
 	};
 
 	struct FCandidate
@@ -149,24 +153,118 @@ namespace
 		return static_cast<uint64>(static_cast<uint32>(Index));
 	}
 
+	// Ramp used when the stream carries no gradient file (RawGeo-only senders
+	// like ParaView never ship a .png LUT, but their scalar attribute still
+	// deserves colours instead of a flat white tube).
+	const TArray<FColor>& DefaultScalarLut()
+	{
+		static const TArray<FColor> Ramp = []
+		{
+			const FLinearColor Stops[] = {
+				FLinearColor(0.267f, 0.005f, 0.329f),
+				FLinearColor(0.283f, 0.141f, 0.458f),
+				FLinearColor(0.254f, 0.265f, 0.530f),
+				FLinearColor(0.207f, 0.372f, 0.553f),
+				FLinearColor(0.164f, 0.471f, 0.558f),
+				FLinearColor(0.128f, 0.567f, 0.551f),
+				FLinearColor(0.135f, 0.659f, 0.518f),
+				FLinearColor(0.267f, 0.749f, 0.441f),
+				FLinearColor(0.478f, 0.821f, 0.318f),
+				FLinearColor(0.741f, 0.873f, 0.150f),
+				FLinearColor(0.993f, 0.906f, 0.144f)
+			};
+			TArray<FColor> Out;
+			Out.Reserve(UE_ARRAY_COUNT(Stops));
+			for (const FLinearColor& Stop : Stops)
+			{
+				Out.Add(Stop.ToFColor(true));
+			}
+			return Out;
+		}();
+		return Ramp;
+	}
+
+	// Hue distance on the 0-360 wheel, wrapping through red.
+	float HueDistance(float HueA, float HueB)
+	{
+		const float Delta = FMath::Abs(HueA - HueB);
+		return FMath::Min(Delta, 360.0f - Delta);
+	}
+
+	// Hue in degrees (0-360) and saturation (0-1) of a linear RGB colour.
+	// Engine ColorToHSV does not exist on FLinearColor, and the hue picker
+	// needs the float-precision colour straight from the LUT.
+	void RgbToHS(const FLinearColor& Color, float& OutHue, float& OutSaturation)
+	{
+		const float Max = FMath::Max3(Color.R, Color.G, Color.B);
+		const float Min = FMath::Min3(Color.R, Color.G, Color.B);
+		const float Delta = Max - Min;
+
+		OutSaturation = Max > KINDA_SMALL_NUMBER ? Delta / Max : 0.0f;
+
+		if (Delta <= KINDA_SMALL_NUMBER)
+		{
+			OutHue = 0.0f;
+			return;
+		}
+		if (Max == Color.R)
+		{
+			OutHue = 60.0f * FMath::Fmod((Color.G - Color.B) / Delta, 6.0f);
+		}
+		else if (Max == Color.G)
+		{
+			OutHue = 60.0f * ((Color.B - Color.R) / Delta + 2.0f);
+		}
+		else
+		{
+			OutHue = 60.0f * ((Color.R - Color.G) / Delta + 4.0f);
+		}
+		if (OutHue < 0.0f)
+		{
+			OutHue += 360.0f;
+		}
+	}
+
 	FColor ResolveColor(const FElementState& Element, const FJUSYNCPathlineSettings& Settings,
-		const FPathlineNode& Latest)
+		const FPathlineNode& Node)
 	{
 		FColor Flat = Settings.FlatColor.ToFColor(true);
-		if (!Settings.bColorByScalar || !Latest.bHasScalar || Element.Lut.Num() == 0)
+		if (!Settings.bColorByScalar)
+		{
+			return Flat;
+		}
+		// Prefer the colour the point cloud itself renders with; the scalar
+		// + LUT path is only the fallback for clouds that carry no colours.
+		if (Node.bHasColor)
+		{
+			return Node.Color;
+		}
+		if (!Node.bHasScalar)
 		{
 			return Flat;
 		}
 
+		const TArray<FColor>& Lut = Element.Lut.Num() > 0 ? Element.Lut : DefaultScalarLut();
 		const float Range = Settings.ColorMax - Settings.ColorMin;
 		const float Alpha = FMath::IsNearlyZero(Range)
 			? 0.0f
-			: FMath::Clamp((Latest.Scalar - Settings.ColorMin) / Range, 0.0f, 1.0f);
+			: FMath::Clamp((Node.Scalar - Settings.ColorMin) / Range, 0.0f, 1.0f);
 		const int32 Index = FMath::Clamp(
-			FMath::RoundToInt(Alpha * static_cast<float>(Element.Lut.Num() - 1)),
-			0, Element.Lut.Num() - 1);
-		return Element.Lut[Index];
+			FMath::RoundToInt(Alpha * static_cast<float>(Lut.Num() - 1)),
+			0, Lut.Num() - 1);
+		return Lut[Index];
 	}
+}
+
+FString FJUSYNCPathlineManager::ResolveAttributeName(const FJUSYNCPointCloudData& Cloud,
+	const FString& Name)
+{
+	if (Name.IsEmpty() || Cloud.FindAttribute(Name))
+	{
+		return Name;
+	}
+	const FString Prefixed = FString(TEXT("vtk_")) + Name;
+	return Cloud.FindAttribute(Prefixed) ? Prefixed : Name;
 }
 
 struct FJUSYNCPathlineManager::FImpl
@@ -246,11 +344,18 @@ struct FJUSYNCPathlineManager::FImpl
 		TMap<FPathlineKey, FSamplePoint> Current;
 		Current.Reserve(Cloud->PointCount);
 
+		// VTK exporters rename arrays (particle_id -> vtk_particle_id); resolve
+		// once per sample so the per-point loop below keeps exact-name cost.
+		const FString IdAttribute =
+			FJUSYNCPathlineManager::ResolveAttributeName(*Cloud, Settings.IdAttribute);
+		const FString ScalarAttribute =
+			FJUSYNCPathlineManager::ResolveAttributeName(*Cloud, Settings.ScalarAttribute);
+
 		int32 Duplicates = 0;
 		for (int32 PointIndex = 0; PointIndex < Cloud->PointCount; ++PointIndex)
 		{
 			bool bFromAttribute = false;
-			const uint64 Id = DecodeParticleId(*Cloud, PointIndex, Settings.IdAttribute, bFromAttribute);
+			const uint64 Id = DecodeParticleId(*Cloud, PointIndex, IdAttribute, bFromAttribute);
 			const FPathlineKey Key{ Rank, Id };
 			if (Current.Contains(Key))
 			{
@@ -261,8 +366,18 @@ struct FJUSYNCPathlineManager::FImpl
 			FSamplePoint Point;
 			Point.Position = Cloud->GetPosition(PointIndex);
 			Point.Width = Cloud->GetWidth(PointIndex);
+			// Carry the colour the point actually renders with, when the
+			// parser baked one into the cloud. LidarPoints colours are NOT
+			// trustworthy here: the component build colours a copy and the
+			// raw default is white, which would silently beat the LUT path.
+			Point.bHasColor = false;
+			if (Cloud->bHasColors && Cloud->Colors.IsValidIndex(PointIndex))
+			{
+				Point.Color = Cloud->Colors[PointIndex];
+				Point.bHasColor = true;
+			}
 			Point.bHasScalar = Cloud->GetAttributeScalar(
-				PointIndex, Settings.ScalarAttribute, Settings.ScalarComponent, Point.Scalar);
+				PointIndex, ScalarAttribute, Settings.ScalarComponent, Point.Scalar);
 			if (!FMath::IsFinite(Point.Scalar))
 			{
 				Point.bHasScalar = false;
@@ -271,6 +386,49 @@ struct FJUSYNCPathlineManager::FImpl
 			Current.Add(Key, Point);
 		}
 		Stats.DuplicateIds += Duplicates;
+
+		// One-shot colour-pipeline probe: says whether the scalar attribute
+		// arrived and which LUT colours will be baked into trails. This is
+		// what distinguishes "no scalar" from "bad LUT" for white trails.
+		static std::atomic<bool> bScalarDiagLogged{ false };
+		if (!bScalarDiagLogged.exchange(true))
+		{
+			bool bAnyScalar = false;
+			float SampleValue = 0.0f;
+			bool bAnyPointColor = false;
+			FColor PointColor = FColor::Black;
+			for (const TPair<FPathlineKey, FSamplePoint>& Pair : Current)
+			{
+				if (Pair.Value.bHasScalar)
+				{
+					bAnyScalar = true;
+					SampleValue = Pair.Value.Scalar;
+				}
+				if (Pair.Value.bHasColor)
+				{
+					bAnyPointColor = true;
+					PointColor = Pair.Value.Color;
+				}
+				if (bAnyScalar && bAnyPointColor)
+				{
+					break;
+				}
+			}
+			const FString LutFirst = Element.Lut.Num() > 0
+				? Element.Lut[0].ToString() : FString(TEXT("-"));
+			const FString LutMid = Element.Lut.Num() > 1
+				? Element.Lut[Element.Lut.Num() / 2].ToString() : FString(TEXT("-"));
+			const TCHAR* Verdict = !Settings.bColorByScalar ? TEXT("flat")
+				: (bAnyPointColor ? TEXT("POINT-COLOURED")
+					: (!bAnyScalar ? TEXT("FLAT WHITE: no scalar, no point colours")
+								   : TEXT("scalar-coloured")));
+			UE_LOG(LogTemp, Display,
+				TEXT("[Pathlines] color diag: pointColor=%d point=%s scalar='%s' present=%d "
+					 "value=%.4f lut=%d first=%s mid=%s (trails will be %s)"),
+				bAnyPointColor ? 1 : 0, *PointColor.ToString(),
+				*ScalarAttribute, bAnyScalar ? 1 : 0, SampleValue, Element.Lut.Num(),
+				*LutFirst, *LutMid, Verdict);
+		}
 
 		// Expire tracks before selection so vacant slots can be reused this
 		// sample. Only the rank that just emitted can prove an id is absent;
@@ -352,6 +510,8 @@ struct FJUSYNCPathlineManager::FImpl
 					Last.Scalar = Point->Scalar;
 					Last.Width = Point->Width;
 					Last.bHasScalar = Point->bHasScalar;
+					Last.Color = Point->Color;
+					Last.bHasColor = Point->bHasColor;
 					Last.bBreak = Last.bBreak || bBreak;
 				}
 				else
@@ -361,6 +521,8 @@ struct FJUSYNCPathlineManager::FImpl
 					Node.Scalar = Point->Scalar;
 					Node.Width = Point->Width;
 					Node.bHasScalar = Point->bHasScalar;
+					Node.Color = Point->Color;
+					Node.bHasColor = Point->bHasColor;
 					Node.SampleId = SampleId;
 					Node.bBreak = bBreak;
 					Track.Nodes.Add(Node);
@@ -473,6 +635,19 @@ struct FJUSYNCPathlineManager::FImpl
 					continue;
 				}
 			}
+			if (Settings.bFilterByHue)
+			{
+				// Filter on the colour the track is actually rendered with,
+				// so the picker works through a gradient LUT as well as the
+				// built-in ramp (and matches what the eye sees on the cloud).
+				float Hue = 0.0f;
+				float Saturation = 0.0f;
+				RgbToHS(FLinearColor(ResolveColor(*Element, Settings, Latest)), Hue, Saturation);
+				if (HueDistance(Hue, Settings.FilterHue) > Settings.FilterHueTolerance)
+				{
+					continue;
+				}
+			}
 
 			++OutVisibleTracks;
 			if (Visible.Num() < 2)
@@ -480,9 +655,18 @@ struct FJUSYNCPathlineManager::FImpl
 				continue;
 			}
 
-			const FColor Color = ResolveColor(*Element, Settings, Latest);
+			// One colour per sample-node: each tube ring takes the colour of
+			// ITS sample, so a particle whose scalar changes between steps
+			// shows the change as a gradient travelling down the trail.
+			TArray<FColor, TInlineAllocator<64>> NodeColors;
+			NodeColors.Reserve(Visible.Num());
+			for (const FPathlineNode* NodePtr : Visible)
+			{
+				NodeColors.Add(ResolveColor(*Element, Settings, *NodePtr));
+			}
 			auto AddRun = [&](int32 StartIndex, int32 EndIndex)
 			{
+				FVector RunSide = FVector::ZeroVector;
 				for (int32 NodeIndex = StartIndex + 1; NodeIndex <= EndIndex; ++NodeIndex)
 				{
 					const FPathlineNode& A = *Visible[NodeIndex - 1];
@@ -494,10 +678,35 @@ struct FJUSYNCPathlineManager::FImpl
 					}
 
 					const FVector Direction = Delta.GetSafeNormal();
-					const FVector Reference = FMath::Abs(Direction.Z) < 0.9
-						? FVector::UpVector : FVector::RightVector;
-					const FVector Side = FVector::CrossProduct(Direction, Reference).GetSafeNormal();
-					const FVector Up = FVector::CrossProduct(Side, Direction).GetSafeNormal();
+					// Parallel transport: carry ONE side vector along the whole
+					// run. Rebuilding the frame per segment from a fixed
+					// reference rotates consecutive rings against each other,
+					// which reads as a twisted ribbon instead of a tube.
+					if (!RunSide.IsNearlyZero())
+					{
+						FVector Transported = RunSide - Direction * FVector::DotProduct(RunSide, Direction);
+						if (!Transported.IsNearlyZero())
+						{
+							RunSide = Transported.GetSafeNormal();
+						}
+					}
+					if (RunSide.IsNearlyZero())
+					{
+						const FVector Reference = FMath::Abs(Direction.Z) < 0.9
+							? FVector::UpVector : FVector::RightVector;
+						RunSide = FVector::CrossProduct(Direction, Reference).GetSafeNormal();
+					}
+					const FVector Side = RunSide;
+					FVector Up = FVector::CrossProduct(Side, Direction).GetSafeNormal();
+					if (Up.IsNearlyZero())
+					{
+						// Segment flipped along the transport axis: rebuild the
+						// frame once for this run and keep going.
+						const FVector Reference = FMath::Abs(Direction.Z) < 0.9
+							? FVector::UpVector : FVector::RightVector;
+						RunSide = FVector::CrossProduct(Direction, Reference).GetSafeNormal();
+						Up = FVector::CrossProduct(RunSide, Direction).GetSafeNormal();
+					}
 
 					float Radius = BaseRadius;
 					if (Settings.bUsePointWidth)
@@ -514,6 +723,7 @@ struct FJUSYNCPathlineManager::FImpl
 					for (int32 Ring = 0; Ring < 2; ++Ring)
 					{
 						const FVector Center = Ring == 0 ? A.Position : B.Position;
+						const FColor RingColor = NodeColors[Ring == 0 ? NodeIndex - 1 : NodeIndex];
 						for (int32 SideIndex = 0; SideIndex < Sides; ++SideIndex)
 						{
 							const float Angle = 2.0f * PI * static_cast<float>(SideIndex) /
@@ -532,7 +742,7 @@ struct FJUSYNCPathlineManager::FImpl
 							OutMesh.UVs.Add(FVector2f(
 								static_cast<float>(SideIndex) / static_cast<float>(Sides),
 								static_cast<float>(Ring)));
-							OutMesh.VertexColors.Add(Color);
+							OutMesh.VertexColors.Add(RingColor);
 						}
 					}
 
@@ -765,6 +975,9 @@ void FJUSYNCPathlineManager::SetSettings(const FJUSYNCPathlineSettings& NewSetti
 			NewSettings.bFilterEnabled != Impl->Settings.bFilterEnabled ||
 			NewSettings.FilterMin != Impl->Settings.FilterMin ||
 			NewSettings.FilterMax != Impl->Settings.FilterMax ||
+			NewSettings.bFilterByHue != Impl->Settings.bFilterByHue ||
+			NewSettings.FilterHue != Impl->Settings.FilterHue ||
+			NewSettings.FilterHueTolerance != Impl->Settings.FilterHueTolerance ||
 			NewSettings.bColorByScalar != Impl->Settings.bColorByScalar ||
 			NewSettings.ColorMin != Impl->Settings.ColorMin ||
 			NewSettings.ColorMax != Impl->Settings.ColorMax ||

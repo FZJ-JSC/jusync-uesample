@@ -34,6 +34,13 @@ struct JUSYNC_API FJUSYNCPathlineSettings
 	float FilterMin = 0.0f;
 	float FilterMax = 1.0f;
 
+	// Colour picker filter: keeps tracks whose resolved (rendered) colour
+	// lies within HueTolerance degrees of Hue on the HSV wheel. Independent
+	// of the scalar-range filter; when both are on, a track must pass both.
+	bool bFilterByHue = false;
+	float FilterHue = 0.0f;          // degrees, 0-360
+	float FilterHueTolerance = 30.0f; // degrees
+
 	bool bColorByScalar = true;
 	float ColorMin = 0.0f;
 	float ColorMax = 1.0f;
@@ -119,6 +126,14 @@ public:
 	TArray<uint64> GetTrackIds(const FString& ElementName, int32 Rank) const;
 	int32 GetElementNodeCount(const FString& ElementName) const;
 	int32 GetTrackNodeCount(const FString& ElementName, int32 Rank, uint64 Id) const;
+
+	/**
+	 * ParaView's VTK exporter prefixes point arrays on the wire (a user array
+	 * "particle_id" arrives as "vtk_particle_id"). Returns the prefixed name
+	 * when only that exists on the cloud, otherwise Name unchanged, so the
+	 * configured attribute names keep working for both sender families.
+	 */
+	static FString ResolveAttributeName(const FJUSYNCPointCloudData& Cloud, const FString& Name);
 
 private:
 	struct FImpl;
