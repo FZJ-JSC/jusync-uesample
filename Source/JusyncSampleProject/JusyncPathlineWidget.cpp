@@ -308,7 +308,7 @@ namespace
      * Slate uses Tab and Shift+Tab for focus navigation. While a control in
      * this panel owns focus, that navigation consumes the key before the
      * widget's NativeOnKeyDown can pass it to the transport toggle. Escape
-     * keeps the key bubbling instead, so Tab still toggles the transport bar
+     * keeps the key bubbling instead, so T still toggles the transport bar
      * no matter which HUD control was last clicked.
      */
     void DisableTabNavigation(UWidget* Widget)
@@ -469,6 +469,33 @@ void UJusyncPathlineWidget::EnsureLayoutBuilt()
     Refresh();
 }
 
+void UJusyncPathlineWidget::Open()
+{
+    EnsureLayoutBuilt();
+    SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+    Reveal.Show();
+    ApplyReveal();
+}
+
+void UJusyncPathlineWidget::Close()
+{
+    if (Reveal.IsClosed())
+    {
+        SetVisibility(ESlateVisibility::Collapsed);
+        return;
+    }
+
+    Reveal.Hide();
+    ApplyReveal();
+}
+
+void UJusyncPathlineWidget::ApplyReveal()
+{
+    // The card slides in from the right edge, matching its top-right anchor.
+    JusyncApplyPanelReveal(Reveal, WidgetTree ? WidgetTree->RootWidget : nullptr,
+        FVector2D(16.0f, 0.0f), GlassBlurs);
+}
+
 void UJusyncPathlineWidget::NativeOnInitialized()
 {
     Super::NativeOnInitialized();
@@ -478,6 +505,15 @@ void UJusyncPathlineWidget::NativeOnInitialized()
 void UJusyncPathlineWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 {
     Super::NativeTick(MyGeometry, InDeltaTime);
+
+    if (Reveal.Tick(InDeltaTime))
+    {
+        ApplyReveal();
+        if (Reveal.IsClosed())
+        {
+            SetVisibility(ESlateVisibility::Collapsed);
+        }
+    }
 
     RefreshAccumulator += InDeltaTime;
     if (RefreshAccumulator < RefreshIntervalSeconds)
@@ -537,6 +573,7 @@ void UJusyncPathlineWidget::BuildLayout()
         Surface->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
 
         UBackgroundBlur* Blur = MakeGlassBlur(WidgetTree, Radius, Strength);
+        GlassBlurs.Add({ Blur, Strength });
         if (UOverlaySlot* BlurSlot = Surface->AddChildToOverlay(Blur))
         {
             BlurSlot->SetHorizontalAlignment(HAlign_Fill);

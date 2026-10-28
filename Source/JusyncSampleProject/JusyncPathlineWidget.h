@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
 #include "Types/SlateEnums.h"
+#include "JusyncHUDPanelReveal.h"
 #include "JusyncPathlineWidget.generated.h"
 
 class AJUSYNCFileSpawnerActor;
@@ -35,10 +36,16 @@ public:
 	/** Idempotent; called from NativeOnInitialized and after binding. */
 	void EnsureLayoutBuilt();
 
+	/** Reveals the panel with the eased glass animation. */
+	void Open();
+
+	/** Fades the panel out and collapses it once the tween finishes. */
+	void Close();
+
 protected:
 	virtual void NativeOnInitialized() override;
 	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
-	/** Lets Tab/P toggle the panels even while focus sits inside one. */
+	/** Lets T/P toggle the panels even while focus sits inside one. */
 	virtual FReply NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent) override;
 
 private:
@@ -104,6 +111,7 @@ private:
 	void StepQualityBy(int32 Direction);
 
 	void BuildLayout();
+	void ApplyReveal();
 	UTextBlock* MakeLabel(const FName Name, const FText& Label);
 	UButton* MakeButton(const FName Name, const FText& Label, const FText& Tooltip,
 		TObjectPtr<UTextBlock>* OutCaption = nullptr, float FontSize = 10.0f);
@@ -248,6 +256,10 @@ private:
 	bool bApplyingFromCode = false;
 	bool bLayoutBuilt = false;
 	float RefreshAccumulator = 0.0f;
+
+	/** Eased show/hide, shared with the transport deck. */
+	FJusyncPanelReveal Reveal;
+	TArray<FJusyncGlassBlur> GlassBlurs;
 
 	static constexpr float RefreshIntervalSeconds = 0.1f;
 };

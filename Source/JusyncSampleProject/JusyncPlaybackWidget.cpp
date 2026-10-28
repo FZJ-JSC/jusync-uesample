@@ -407,6 +407,36 @@ void UJusyncPlaybackWidget::EnsureLayoutBuilt()
     Refresh();
 }
 
+void UJusyncPlaybackWidget::Open()
+{
+    EnsureLayoutBuilt();
+
+    // A collapsed widget does not tick, so show it first and let the first
+    // reveal step start from alpha 0 on the same frame instead of flashing.
+    SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+    Reveal.Show();
+    ApplyReveal();
+}
+
+void UJusyncPlaybackWidget::Close()
+{
+    if (Reveal.IsClosed())
+    {
+        SetVisibility(ESlateVisibility::Collapsed);
+        return;
+    }
+
+    // Keep the widget visible (and ticking) until the fade has finished.
+    Reveal.Hide();
+    ApplyReveal();
+}
+
+void UJusyncPlaybackWidget::ApplyReveal()
+{
+    JusyncApplyPanelReveal(Reveal, WidgetTree ? WidgetTree->RootWidget : nullptr,
+        FVector2D(0.0f, 14.0f), GlassBlurs);
+}
+
 void UJusyncPlaybackWidget::NativeOnInitialized()
 {
     Super::NativeOnInitialized();
@@ -418,6 +448,15 @@ void UJusyncPlaybackWidget::NativeTick(const FGeometry& MyGeometry, float InDelt
 {
     Super::NativeTick(MyGeometry, InDeltaTime);
 
+    if (Reveal.Tick(InDeltaTime))
+    {
+        ApplyReveal();
+        if (Reveal.IsClosed())
+        {
+            SetVisibility(ESlateVisibility::Collapsed);
+        }
+    }
+
     // A sender that replays its clip never produces a new live frame: every
     // notification carries an already-applied hash, so the live diff reports
     // "0 changed, 0 new" and the scene would sit on the last sample forever.
@@ -428,7 +467,7 @@ void UJusyncPlaybackWidget::NativeTick(const FGeometry& MyGeometry, float InDelt
     // JUSYNC module in place, so the project module cannot link a symbol that
     // was added after the editor started.
     const double NowSeconds = FPlatformTime::Seconds();
-    // A collapsed panel (Tab) does not tick, so the latch keeps filling while
+    // A collapsed panel (T) does not tick, so the latch keeps filling while
     // the HUD is closed. Opening it must not yank the view out of live mode:
     // the tick gap tells us the panel was hidden, the latch is discarded, and
     // the automatic sender-loop takeover is parked until the user asks for
@@ -625,6 +664,7 @@ void UJusyncPlaybackWidget::BuildLayout()
         const FVector2D& Alignment, const FVector2D& Position, const FVector2D& Size)
     {
         UBackgroundBlur* Blur = MakeGlassBlur(WidgetTree, Radius, Strength);
+        GlassBlurs.Add({ Blur, Strength });
         UCanvasPanelSlot* Slot = Root->AddChildToCanvas(Blur);
         Slot->SetAnchors(Anchors);
         Slot->SetAlignment(Alignment);

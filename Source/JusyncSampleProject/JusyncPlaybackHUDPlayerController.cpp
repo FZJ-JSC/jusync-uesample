@@ -2,6 +2,7 @@
 
 #include "JusyncPlaybackWidget.h"
 #include "JusyncPathlineWidget.h"
+#include "JusyncShortcutHintWidget.h"
 #include "JUSYNCFileSpawnerActor.h"
 
 #include "Engine/GameViewportClient.h"
@@ -41,9 +42,14 @@ void AJusyncPlaybackHUDPlayerController::TogglePanel()
 	// SelfHitTestInvisible: the widget itself fills the viewport, so a plain
 	// Visible root would swallow mouse clicks over the whole screen - that is
 	// why opening one panel made the other panel's buttons unclickable.
-	PlaybackWidget->SetVisibility(bPanelVisible
-		? ESlateVisibility::SelfHitTestInvisible
-		: ESlateVisibility::Collapsed);
+	if (bPanelVisible)
+	{
+		PlaybackWidget->Open();
+	}
+	else
+	{
+		PlaybackWidget->Close();
+	}
 	ApplyPanelInputMode();
 
 	UE_LOG(LogTemp, Log, TEXT("JUSYNC playback HUD %s (toggle key %s)"),
@@ -63,9 +69,14 @@ void AJusyncPlaybackHUDPlayerController::TogglePathlinePanel()
 	{
 		ReleaseFocusIfInside(PathlineWidget);
 	}
-	PathlineWidget->SetVisibility(bPathlinePanelVisible
-		? ESlateVisibility::SelfHitTestInvisible
-		: ESlateVisibility::Collapsed);
+	if (bPathlinePanelVisible)
+	{
+		PathlineWidget->Open();
+	}
+	else
+	{
+		PathlineWidget->Close();
+	}
 	ApplyPanelInputMode();
 
 	UE_LOG(LogTemp, Log, TEXT("JUSYNC pathline panel %s (toggle key %s)"),
@@ -142,6 +153,27 @@ void AJusyncPlaybackHUDPlayerController::BeginPlay()
 	else
 	{
 		UE_LOG(LogTemp, Warning, TEXT("JUSYNC pathline panel: widget creation failed"));
+	}
+
+	// The legend is the only always-on HUD surface: it lists the two toggle
+	// keys from level start, at a Z below both panels so opening a panel draws
+	// over it rather than the other way round.
+	const TSubclassOf<UJusyncShortcutHintWidget> HintClass = ShortcutHintClass
+		? ShortcutHintClass
+		: TSubclassOf<UJusyncShortcutHintWidget>(UJusyncShortcutHintWidget::StaticClass());
+
+	ShortcutHintWidget = CreateWidget<UJusyncShortcutHintWidget>(this, HintClass);
+	if (ShortcutHintWidget)
+	{
+		ShortcutHintWidget->EnsureLayoutBuilt();
+		ShortcutHintWidget->RefreshKeys();
+		ShortcutHintWidget->AddToViewport(99);
+		UE_LOG(LogTemp, Log, TEXT("JUSYNC shortcut legend ready (%s playback, %s pathlines)"),
+			*ToggleKey.ToString(), *PathlineToggleKey.ToString());
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("JUSYNC shortcut legend: widget creation failed"));
 	}
 
 	if (FSlateApplication::IsInitialized())

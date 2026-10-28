@@ -8,6 +8,7 @@
 class AJUSYNCFileSpawnerActor;
 class UJusyncPlaybackWidget;
 class UJusyncPathlineWidget;
+class UJusyncShortcutHintWidget;
 
 /**
  * Shows the JUSYNC playback transport on demand.
@@ -16,6 +17,8 @@ class UJusyncPathlineWidget;
  * back again, so camera or other level input is only interrupted while the
  * transport is actually in use. The pathline controls live in their own
  * panel on its own key (PathlineToggleKey) so the transport stays a strip.
+ * A small always-visible legend lists both keys from the moment the level
+ * starts, so the shortcuts never have to be guessed or documented offline.
  */
 UCLASS()
 class AJusyncPlaybackHUDPlayerController : public APlayerController
@@ -33,8 +36,12 @@ public:
 	UPROPERTY(EditDefaultsOnly, Category = "JUSYNC|Playback HUD")
 	TSubclassOf<UJusyncPathlineWidget> PathlineWidgetClass;
 
+	/** Defaults to the C++ key legend; set to a Blueprint subclass to restyle. */
 	UPROPERTY(EditDefaultsOnly, Category = "JUSYNC|Playback HUD")
-	FKey ToggleKey = EKeys::Tab;
+	TSubclassOf<UJusyncShortcutHintWidget> ShortcutHintClass;
+
+	UPROPERTY(EditDefaultsOnly, Category = "JUSYNC|Playback HUD")
+	FKey ToggleKey = EKeys::T;
 
 	UPROPERTY(EditDefaultsOnly, Category = "JUSYNC|Playback HUD")
 	FKey PathlineToggleKey = EKeys::P;
@@ -47,7 +54,7 @@ public:
 	 */
 	bool HandlePanelToggleKey(const FKey& Key, bool bFromPreInput = false);
 
-	/** Show/hide the playback transport, the same action the Tab key runs. */
+	/** Show/hide the playback transport, the same action the T key runs. */
 	UFUNCTION(BlueprintCallable, Category = "JUSYNC|Playback HUD")
 	void TogglePanel();
 
@@ -60,7 +67,7 @@ private:
 	void TogglePathlinePanel();
 	void ApplyPanelInputMode();
 
-	/** Runs before Slate focus navigation, so Tab/P still toggle the panels
+	/** Runs before Slate focus navigation, so T/P still toggle the panels
 	 *  when a HUD button or slider owns keyboard focus. */
 	void HandlePreInputKey(const FKeyEvent& KeyEvent);
 	bool IsGameViewportFocused() const;
@@ -70,6 +77,9 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UJusyncPathlineWidget> PathlineWidget;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UJusyncShortcutHintWidget> ShortcutHintWidget;
 
 	AJUSYNCFileSpawnerActor* Spawner = nullptr;
 	bool bPanelVisible = false;

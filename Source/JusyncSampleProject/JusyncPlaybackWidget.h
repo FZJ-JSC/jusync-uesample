@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Blueprint/UserWidget.h"
+#include "JusyncHUDPanelReveal.h"
 #include "JusyncPlaybackWidget.generated.h"
 
 class AJUSYNCFileSpawnerActor;
@@ -35,10 +36,16 @@ public:
 	 */
 	void EnsureLayoutBuilt();
 
+	/** Reveals the deck with the eased glass animation. */
+	void Open();
+
+	/** Fades the deck out and collapses it once the tween finishes. */
+	void Close();
+
 protected:
 	virtual void NativeOnInitialized() override;
 	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
-	/** Lets Tab/P toggle the panels even while focus sits inside one. */
+	/** Lets T/P toggle the panels even while focus sits inside one. */
 	virtual FReply NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent) override;
 
 private:
@@ -73,6 +80,7 @@ private:
 	void HandleLoopClicked();
 
 	void BuildLayout();
+	void ApplyReveal();
 	UTextBlock* MakeLabel(const FName Name, const FText& Label);
 	UButton* MakeButton(const FName Name, const FText& Label, const FText& Tooltip,
 		TObjectPtr<UTextBlock>* OutCaption = nullptr, float FontSize = 13.0f);
@@ -163,6 +171,10 @@ private:
 	bool bDraggingSlider = false;
 	bool bLayoutBuilt = false;
 
+	/** Eased show/hide; the panel owns it so T re-presses can reverse gently. */
+	FJusyncPanelReveal Reveal;
+	TArray<FJusyncGlassBlur> GlassBlurs;
+
 	/** Transport playback state (drives the PLAY/PAUSE and LOOP controls). */
 	bool bCachedPlaybackRunning = false;
 	float CachedPlaybackAccumulator = 0.0f;
@@ -175,7 +187,7 @@ private:
 	float RefreshAccumulator = 0.0f;
 
 	/** Wall clock of the previous NativeTick. A collapsed panel does not tick, so
-	 *  a large gap means the HUD was closed (Tab) and any sender-loop latch it
+	 *  a large gap means the HUD was closed (T) and any sender-loop latch it
 	 *  reads afterwards is stale - it must not restart cached playback. */
 	double LastWidgetTickSeconds = 0.0;
 
