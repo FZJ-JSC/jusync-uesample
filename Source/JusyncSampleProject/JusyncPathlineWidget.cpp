@@ -1,11 +1,15 @@
 #include "JusyncPathlineWidget.h"
 
+#include "JusyncHUDIcons.h"
 #include "JusyncPathlineHUDModel.h"
 #include "JusyncPlaybackHUDPlayerController.h"
 #include "JUSYNCFileSpawnerActor.h"
 
 #include "Blueprint/WidgetTree.h"
+#include "Brushes/SlateImageBrush.h"
 #include "Brushes/SlateRoundedBoxBrush.h"
+#include "Engine/Texture2D.h"
+#include "Components/BackgroundBlur.h"
 #include "Components/Border.h"
 #include "Components/Button.h"
 #include "Components/ButtonSlot.h"
@@ -14,6 +18,9 @@
 #include "Components/ComboBoxString.h"
 #include "Components/HorizontalBox.h"
 #include "Components/HorizontalBoxSlot.h"
+#include "Components/Image.h"
+#include "Components/Overlay.h"
+#include "Components/OverlaySlot.h"
 #include "Components/SizeBox.h"
 #include "Components/Slider.h"
 #include "Components/Spacer.h"
@@ -30,23 +37,32 @@ namespace
 {
     /**
      * Geometry codes from the drawing:
-     *   V1=24  W=360  H=620  H1=60  H2=52  H3=28  H4=40  H6=40
-     *   R1=12  R2=7  R3=6  S1=16  S2=12  S3=8
+     *   V1=24  W=360  H=668  H1=60  H2=52  H3=28  H4=40  H6=40
+     *   R1=12  R2=7  R3=6  S1=16  S2=12  S3=8  S7=12
      * Every runtime measurement below is one of those values, not a new
-     * one-off, so the panel can be checked against the sheet.
+     * one-off, so the panel can be checked against the sheet. The header and
+     * the two cards are separate floating surfaces; the container in between
+     * is transparent so the scene shows through the S7 gaps.
      */
     namespace Theme
     {
         const FLinearColor PanelEdge(1.0f, 1.0f, 1.0f, 0.11f);
-        const FLinearColor PanelFill(0.035f, 0.040f, 0.050f, 0.92f);
         const FLinearColor PanelHeaderFill(0.070f, 0.080f, 0.098f, 0.95f);
-        const FLinearColor CardFill(0.050f, 0.057f, 0.070f, 0.94f);
-        const FLinearColor CardHeaderFill(0.080f, 0.090f, 0.108f, 0.96f);
-        const FLinearColor CardEdge(1.0f, 1.0f, 1.0f, 0.08f);
-        const FLinearColor Divider(1.0f, 1.0f, 1.0f, 0.09f);
+        // The floating surfaces use a smoked tint over a live backbuffer blur.
+        // Keep the alpha low enough that the scene moves through the glass,
+        // but high enough that white labels survive the bright warehouse.
+        const FLinearColor GlassTint(0.035f, 0.042f, 0.055f, 0.34f);
+        const FLinearColor GlassRim(1.0f, 1.0f, 1.0f, 0.20f);
+        // The pathline card floats over the bright warehouse window, not the
+        // dark floor under the point-cloud card. At 0.26 the blurred window
+        // washed out the muted row labels and hid the white slider tracks.
+        const FLinearColor CardFill(0.028f, 0.034f, 0.045f, 0.36f);
+        const FLinearColor CardHeaderFill(0.045f, 0.052f, 0.066f, 0.46f);
+        const FLinearColor CardEdge(1.0f, 1.0f, 1.0f, 0.18f);
+        const FLinearColor Divider(1.0f, 1.0f, 1.0f, 0.11f);
 
         const FLinearColor TextPrimary(0.94f, 0.95f, 0.97f, 1.0f);
-        const FLinearColor TextMuted(0.60f, 0.64f, 0.70f, 1.0f);
+        const FLinearColor TextMuted(0.70f, 0.74f, 0.80f, 1.0f);
         const FLinearColor TextShadow(0.0f, 0.0f, 0.0f, 0.65f);
 
         const FLinearColor Live(0.35f, 0.85f, 0.45f, 1.0f);
@@ -59,7 +75,7 @@ namespace
         const FLinearColor ChipDisabled(0.100f, 0.110f, 0.130f, 0.45f);
         const FLinearColor WellFill(0.025f, 0.030f, 0.040f, 0.92f);
         const FLinearColor WellEdge(1.0f, 1.0f, 1.0f, 0.07f);
-        const FLinearColor SliderTrack(1.0f, 1.0f, 1.0f, 0.18f);
+        const FLinearColor SliderTrack(1.0f, 1.0f, 1.0f, 0.30f);
         const FLinearColor SliderThumb(0.88f, 0.92f, 1.00f, 1.0f);
 
         constexpr float V1 = 24.0f;
@@ -76,10 +92,13 @@ namespace
         constexpr float R1 = 12.0f;
         constexpr float R2 = 7.0f;
         constexpr float R3 = 6.0f;
+        constexpr float GlassBlur = 14.0f;
         constexpr float S1 = 16.0f;
         constexpr float S2 = 12.0f;
         constexpr float S3 = 8.0f;
         constexpr float S4 = 20.0f;
+        // Visible gap between the free header surface and the free cards.
+        constexpr float S7 = 12.0f;
         constexpr float LabelWidth = 92.0f;
         constexpr float ValueWidth = 48.0f;
         constexpr float CardContentHeight = 207.0f;
@@ -116,13 +135,16 @@ namespace
             FVector2D(0.0f, 6.0f));
         const FSlateRoundedBoxBrush TrackHover(Theme::SliderTrack * 1.35f, 3.0f,
             FLinearColor::Transparent, 0.0f, FVector2D(0.0f, 6.0f));
-        const FSlateRoundedBoxBrush TrackDisabled(Theme::SliderTrack * 0.5f, 3.0f,
+        // Keep the groove readable while a control is inactive. At 0.5x the
+        // empty track vanished over the bright card and only the thumbs read
+        // as stray dots.
+        const FSlateRoundedBoxBrush TrackDisabled(Theme::SliderTrack * 0.9f, 3.0f,
             FLinearColor::Transparent, 0.0f, FVector2D(0.0f, 6.0f));
         const FSlateRoundedBoxBrush Thumb(Theme::SliderThumb, 7.0f,
             FLinearColor(0.0f, 0.0f, 0.0f, 0.25f), 1.0f, FVector2D(14.0f, 14.0f));
         const FSlateRoundedBoxBrush ThumbHover(FLinearColor(1.0f, 1.0f, 1.0f, 1.0f), 7.0f,
             FLinearColor(0.0f, 0.0f, 0.0f, 0.25f), 1.0f, FVector2D(14.0f, 14.0f));
-        const FSlateRoundedBoxBrush ThumbDisabled(FLinearColor(0.55f, 0.58f, 0.62f, 0.5f), 7.0f,
+        const FSlateRoundedBoxBrush ThumbDisabled(FLinearColor(0.55f, 0.58f, 0.62f, 0.70f), 7.0f,
             FLinearColor::Transparent, 0.0f, FVector2D(14.0f, 14.0f));
 
         Style.NormalBarImage = Track;
@@ -153,6 +175,16 @@ namespace
         Style.ComboButtonStyle.ButtonStyle = Button;
         Style.ComboButtonStyle.ContentPadding = FMargin(10.0f, 0.0f, 6.0f, 0.0f);
         Style.ComboButtonStyle.DownArrowPadding = FMargin(0.0f, 0.0f, 8.0f, 0.0f);
+        // FComboBoxStyle::GetDefault() borrows the editor's combo-arrow brush.
+        // In a game/PIE context that brush resolves to an opaque white square
+        // on the right of every selector. Use the same runtime chevron as the
+        // LAYERS header instead so the combo rows stay monochrome and legible.
+        if (UTexture2D* ArrowTexture = JusyncHUDIcons::GetTexture(
+            JusyncHUDIcons::EIcon::ChevronDown))
+        {
+            Style.ComboButtonStyle.DownArrowImage = FSlateImageBrush(
+                ArrowTexture, FVector2D(12.0f, 12.0f), Theme::TextMuted);
+        }
         Style.ComboButtonStyle.MenuBorderBrush = FSlateRoundedBoxBrush(
             Theme::PanelHeaderFill, 6.0f, Theme::PanelEdge, 1.0f);
         Style.ComboButtonStyle.MenuBorderPadding = FMargin(1.0f);
@@ -190,6 +222,43 @@ namespace
         }
         Box->AddChild(Child);
         return Box;
+    }
+
+    /**
+     * SBackgroundBlur samples the backbuffer underneath its geometry. Keep the
+     * widget out of hit testing so the controls in the tinted layer remain the
+     * only interactive surfaces.
+     */
+    UBackgroundBlur* MakeGlassBlur(UWidgetTree* Tree, float Radius, float Strength)
+    {
+        UBackgroundBlur* Blur = Tree->ConstructWidget<UBackgroundBlur>(
+            UBackgroundBlur::StaticClass(), NAME_None);
+        Blur->SetPadding(FMargin(0.0f));
+        Blur->SetBlurStrength(Strength);
+        Blur->SetCornerRadius(FVector4(Radius, Radius, Radius, Radius));
+        Blur->SetApplyAlphaToBlur(false);
+        Blur->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+        return Blur;
+    }
+
+    UButton* MakeIconButton(UWidgetTree* Tree, const FName Name,
+        JusyncHUDIcons::EIcon Icon, const FText& Tooltip, float IconSize)
+    {
+        UButton* Button = Tree->ConstructWidget<UButton>(UButton::StaticClass(), Name);
+        Button->SetToolTipText(Tooltip);
+        Button->SetStyle(MakeButtonStyle(Theme::ChipIdle, Theme::ChipHover,
+            Theme::ChipPressed, Theme::ChipDisabled, 6.0f));
+        Button->SetClickMethod(EButtonClickMethod::Type::PreciseClick);
+
+        UImage* Image = JusyncHUDIcons::MakeImage(Tree, Icon, IconSize, Theme::TextPrimary);
+        Button->AddChild(Image);
+        if (UButtonSlot* ImageSlot = Cast<UButtonSlot>(Image->Slot))
+        {
+            ImageSlot->SetPadding(FMargin(0.0f));
+            ImageSlot->SetHorizontalAlignment(HAlign_Center);
+            ImageSlot->SetVerticalAlignment(VAlign_Center);
+        }
+        return Button;
     }
 
     /**
@@ -392,8 +461,12 @@ void UJusyncPathlineWidget::BuildLayout()
         UCanvasPanel::StaticClass(), TEXT("Root"));
     WidgetTree->RootWidget = Root;
 
-    Panel = MakeRoundedBorder(TEXT("Panel"), Theme::PanelFill, Theme::PanelEdge,
-        Theme::R1, 1.0f);
+    // The container is intentionally invisible: the header and the two cards
+    // are their own rounded surfaces, separated by S7 so the scene shows
+    // through instead of a third enclosing panel.
+    Panel = MakeRoundedBorder(TEXT("Panel"), FLinearColor::Transparent,
+        FLinearColor::Transparent, 0.0f, 0.0f);
+    Panel->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
     UCanvasPanelSlot* PanelSlot = Root->AddChildToCanvas(Panel);
     PanelSlot->SetAnchors(FAnchors(1.0f, 0.0f, 1.0f, 0.0f));
     PanelSlot->SetAlignment(FVector2D(1.0f, 0.0f));
@@ -404,15 +477,46 @@ void UJusyncPathlineWidget::BuildLayout()
         UVerticalBox::StaticClass(), TEXT("PanelStack"));
     Panel->AddChild(Stack);
 
-    // Outer header: LAYERS + active-card count + chevron.
-    UBorder* Header = MakeRoundedBorder(NAME_None, Theme::PanelHeaderFill,
-        FLinearColor::Transparent, Theme::R1, 0.0f, FMargin(Theme::S1, 0.0f, Theme::S1, 0.0f));
-    USizeBox* HeaderBox = MakeSizeBox(WidgetTree, Header, -1.0f, Theme::H1);
-    Stack->AddChildToVerticalBox(HeaderBox);
+    // Every free surface gets its own blur. The S7 gaps stay outside the
+    // widget, so the scene remains sharp between the header and the cards.
+    auto MakeGlassSurface = [this](UWidget* Content, const FLinearColor& Tint,
+        const FLinearColor& Rim, float Radius, const FMargin& ContentPadding,
+        float Strength) -> UOverlay*
+    {
+        UOverlay* Surface = WidgetTree->ConstructWidget<UOverlay>(
+            UOverlay::StaticClass(), NAME_None);
+        Surface->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
 
+        UBackgroundBlur* Blur = MakeGlassBlur(WidgetTree, Radius, Strength);
+        if (UOverlaySlot* BlurSlot = Surface->AddChildToOverlay(Blur))
+        {
+            BlurSlot->SetHorizontalAlignment(HAlign_Fill);
+            BlurSlot->SetVerticalAlignment(VAlign_Fill);
+            BlurSlot->SetPadding(FMargin(0.0f));
+        }
+
+        UBorder* TintBorder = MakeRoundedBorder(NAME_None, Tint, Rim, Radius, 1.0f, ContentPadding);
+        TintBorder->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+        TintBorder->AddChild(Content);
+        if (UOverlaySlot* TintSlot = Surface->AddChildToOverlay(TintBorder))
+        {
+            TintSlot->SetHorizontalAlignment(HAlign_Fill);
+            TintSlot->SetVerticalAlignment(VAlign_Fill);
+            TintSlot->SetPadding(FMargin(0.0f));
+        }
+        return Surface;
+    };
+
+    // Free header surface: LAYERS + active-card count + chevron.
     UHorizontalBox* HeaderRow = WidgetTree->ConstructWidget<UHorizontalBox>(
         UHorizontalBox::StaticClass(), TEXT("LayersHeader"));
-    Header->AddChild(HeaderRow);
+    // Keep the panel title on the same 12 px vertical as the two card titles
+    // and their row labels. S1 still defines the 60 px header height, but the
+    // horizontal inset is S2 once the free cards use S2.
+    UOverlay* Header = MakeGlassSurface(HeaderRow, Theme::GlassTint, Theme::GlassRim,
+        Theme::R1, FMargin(Theme::S2, 0.0f, Theme::S2, 0.0f), Theme::GlassBlur);
+    USizeBox* HeaderBox = MakeSizeBox(WidgetTree, Header, -1.0f, Theme::H1);
+    Stack->AddChildToVerticalBox(HeaderBox);
 
     UTextBlock* HeaderTitle = MakeLabel(TEXT("LayersTitle"), FText::FromString(TEXT("LAYERS")));
     StyleLabel(HeaderTitle, 13.0f, Theme::TextPrimary);
@@ -429,23 +533,17 @@ void UJusyncPathlineWidget::BuildLayout()
     UHorizontalBoxSlot* ActiveSlot = HeaderRow->AddChildToHorizontalBox(ActiveText);
     ActiveSlot->SetVerticalAlignment(VAlign_Center);
 
-    UTextBlock* Chevron = MakeLabel(TEXT("LayersChevron"), FText::FromString(TEXT("v")));
-    StyleLabel(Chevron, 12.0f, Theme::TextMuted);
+    UImage* Chevron = JusyncHUDIcons::MakeImage(WidgetTree,
+        JusyncHUDIcons::EIcon::ChevronDown, 12.0f, Theme::TextMuted);
     UHorizontalBoxSlot* ChevronSlot = HeaderRow->AddChildToHorizontalBox(Chevron);
     ChevronSlot->SetPadding(FMargin(10.0f, 0.0f, 0.0f, 0.0f));
     ChevronSlot->SetVerticalAlignment(VAlign_Center);
 
-    USizeBox* HeaderRuleBox = MakeSizeBox(WidgetTree,
-        MakeRoundedBorder(NAME_None, Theme::Divider, FLinearColor::Transparent, 0.0f, 0.0f),
-        -1.0f, 1.0f);
-    Stack->AddChildToVerticalBox(HeaderRuleBox);
-
     // --------------------------------------------------- PATHLINES CARD
-    UBorder* PathlineCard = MakeRoundedBorder(NAME_None, Theme::CardFill, Theme::CardEdge,
-        Theme::R2, 1.0f);
     UVerticalBox* PathlineCardStack = WidgetTree->ConstructWidget<UVerticalBox>(
         UVerticalBox::StaticClass(), TEXT("PathlineCardStack"));
-    PathlineCard->AddChild(PathlineCardStack);
+    UOverlay* PathlineCard = MakeGlassSurface(PathlineCardStack, Theme::CardFill,
+        Theme::CardEdge, Theme::R2, FMargin(0.0f), Theme::GlassBlur);
 
     UBorder* PathlineHeader = MakeRoundedBorder(NAME_None, Theme::CardHeaderFill,
         FLinearColor::Transparent, Theme::R2, 0.0f, FMargin(Theme::S2, 0.0f, Theme::S2, 0.0f));
@@ -569,14 +667,13 @@ void UJusyncPathlineWidget::BuildLayout()
         ExpiryMinusButton, ExpiryPlusButton, ExpiryValueText));
 
     UVerticalBoxSlot* PathlineCardSlot = Stack->AddChildToVerticalBox(PathlineCard);
-    PathlineCardSlot->SetPadding(FMargin(0.0f, 11.0f, 0.0f, 0.0f));
+    PathlineCardSlot->SetPadding(FMargin(0.0f, Theme::S7, 0.0f, 0.0f));
 
     // ------------------------------------------------- POINT CLOUD CARD
-    UBorder* PointCard = MakeRoundedBorder(NAME_None, Theme::CardFill, Theme::CardEdge,
-        Theme::R2, 1.0f);
     UVerticalBox* PointCardStack = WidgetTree->ConstructWidget<UVerticalBox>(
         UVerticalBox::StaticClass(), TEXT("PointCardStack"));
-    PointCard->AddChild(PointCardStack);
+    UOverlay* PointCard = MakeGlassSurface(PointCardStack, Theme::CardFill,
+        Theme::CardEdge, Theme::R2, FMargin(0.0f), Theme::GlassBlur);
 
     UBorder* PointHeader = MakeRoundedBorder(NAME_None, Theme::CardHeaderFill,
         FLinearColor::Transparent, Theme::R2, 0.0f, FMargin(Theme::S2, 0.0f, Theme::S2, 0.0f));
@@ -653,10 +750,12 @@ void UJusyncPathlineWidget::BuildLayout()
         UHorizontalBox::StaticClass(), TEXT("ShapeRow"));
     ShapeWell->AddChild(ShapeRow);
 
-    ShapeSquareButton = MakeButton(TEXT("ShapeSquare"), FText::FromString(TEXT("SQ")),
-        LOCTEXT("ShapeSquareTip", "Use square points"), nullptr, 10.0f);
-    ShapeCircleButton = MakeButton(TEXT("ShapeCircle"), FText::FromString(TEXT("CI")),
-        LOCTEXT("ShapeCircleTip", "Use circular points"), nullptr, 10.0f);
+    ShapeSquareButton = MakeIconButton(WidgetTree, TEXT("ShapeSquare"),
+        JusyncHUDIcons::EIcon::Square,
+        LOCTEXT("ShapeSquareTip", "Use square points"), 13.0f);
+    ShapeCircleButton = MakeIconButton(WidgetTree, TEXT("ShapeCircle"),
+        JusyncHUDIcons::EIcon::Circle,
+        LOCTEXT("ShapeCircleTip", "Use circular points"), 13.0f);
     ShapeSquareButton->SetStyle(MakeButtonStyle(FLinearColor::White, FLinearColor::White,
         FLinearColor(0.85f, 0.85f, 0.85f, 1.0f), Theme::ChipDisabled, 4.0f));
     ShapeCircleButton->SetStyle(MakeButtonStyle(FLinearColor::White, FLinearColor::White,
@@ -748,7 +847,7 @@ void UJusyncPathlineWidget::BuildLayout()
         QualityMinusButton, QualityPlusButton, QualityValueText));
 
     UVerticalBoxSlot* PointCardSlot = Stack->AddChildToVerticalBox(PointCard);
-    PointCardSlot->SetPadding(FMargin(0.0f, 12.0f, 0.0f, 16.0f));
+    PointCardSlot->SetPadding(FMargin(0.0f, Theme::S7, 0.0f, Theme::S1));
 }
 
 void UJusyncPathlineWidget::AddSliderRow(UVerticalBox* Parent, const FText& Label,
@@ -804,10 +903,12 @@ UWidget* UJusyncPathlineWidget::MakeStepper(const FName BaseName, float Width,
 
     const FName MinusName(*FString::Printf(TEXT("%sMinus"), *BaseName.ToString()));
     const FName PlusName(*FString::Printf(TEXT("%sPlus"), *BaseName.ToString()));
-    OutMinus = MakeButton(MinusName, FText::FromString(TEXT("-")),
-        LOCTEXT("StepMinusTip", "Step this value down"), nullptr, 12.0f);
-    OutPlus = MakeButton(PlusName, FText::FromString(TEXT("+")),
-        LOCTEXT("StepPlusTip", "Step this value up"), nullptr, 12.0f);
+    OutMinus = MakeIconButton(WidgetTree, MinusName,
+        JusyncHUDIcons::EIcon::Minus,
+        LOCTEXT("StepMinusTip", "Step this value down"), 12.0f);
+    OutPlus = MakeIconButton(WidgetTree, PlusName,
+        JusyncHUDIcons::EIcon::Plus,
+        LOCTEXT("StepPlusTip", "Step this value up"), 12.0f);
     OutMinus->SetStyle(MakeButtonStyle(FLinearColor::Transparent,
         FLinearColor(1.0f, 1.0f, 1.0f, 0.08f), FLinearColor(1.0f, 1.0f, 1.0f, 0.14f),
         FLinearColor::Transparent, 4.0f));
@@ -1129,47 +1230,47 @@ void UJusyncPathlineWidget::Refresh()
     if (HistorySlider)
     {
         HistorySlider->SetIsEnabled(bOn);
-        HistorySlider->SetRenderOpacity(bOn ? 1.0f : 0.45f);
+        HistorySlider->SetRenderOpacity(bOn ? 1.0f : 0.55f);
     }
     if (WidthSlider)
     {
         WidthSlider->SetIsEnabled(bOn);
-        WidthSlider->SetRenderOpacity(bOn ? 1.0f : 0.45f);
+        WidthSlider->SetRenderOpacity(bOn ? 1.0f : 0.55f);
     }
     if (PointSizeSlider)
     {
         PointSizeSlider->SetIsEnabled(bPoints);
-        PointSizeSlider->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+        PointSizeSlider->SetRenderOpacity(bPoints ? 1.0f : 0.55f);
     }
     if (PointGlowSlider)
     {
         PointGlowSlider->SetIsEnabled(bPoints);
-        PointGlowSlider->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+        PointGlowSlider->SetRenderOpacity(bPoints ? 1.0f : 0.55f);
     }
     if (ColorCombo)
     {
         ColorCombo->SetIsEnabled(bOn);
-        ColorCombo->SetRenderOpacity(bOn ? 1.0f : 0.45f);
+        ColorCombo->SetRenderOpacity(bOn ? 1.0f : 0.62f);
     }
     if (HueCombo)
     {
         HueCombo->SetIsEnabled(bOn);
-        HueCombo->SetRenderOpacity(bOn ? 1.0f : 0.45f);
+        HueCombo->SetRenderOpacity(bOn ? 1.0f : 0.62f);
     }
     if (ScalingCombo)
     {
         ScalingCombo->SetIsEnabled(bPoints);
-        ScalingCombo->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+        ScalingCombo->SetRenderOpacity(bPoints ? 1.0f : 0.62f);
     }
     if (OrientationCombo)
     {
         OrientationCombo->SetIsEnabled(bPoints);
-        OrientationCombo->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+        OrientationCombo->SetRenderOpacity(bPoints ? 1.0f : 0.62f);
     }
     if (PointHueCombo)
     {
         PointHueCombo->SetIsEnabled(bPoints);
-        PointHueCombo->SetRenderOpacity(bPoints ? 1.0f : 0.45f);
+        PointHueCombo->SetRenderOpacity(bPoints ? 1.0f : 0.62f);
     }
     if (NormalsSwitch)
     {

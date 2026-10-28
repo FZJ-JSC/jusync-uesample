@@ -1,18 +1,22 @@
 #include "JusyncPlaybackWidget.h"
 
+#include "JusyncHUDIcons.h"
 #include "JusyncPlaybackHUDModel.h"
 #include "JusyncPlaybackHUDPlayerController.h"
 #include "JUSYNCFileSpawnerActor.h"
 
 #include "Blueprint/WidgetTree.h"
 #include "Brushes/SlateRoundedBoxBrush.h"
+#include "Components/BackgroundBlur.h"
 #include "Components/Border.h"
+#include "Components/BorderSlot.h"
 #include "Components/Button.h"
 #include "Components/ButtonSlot.h"
 #include "Components/CanvasPanel.h"
 #include "Components/CanvasPanelSlot.h"
 #include "Components/HorizontalBox.h"
 #include "Components/HorizontalBoxSlot.h"
+#include "Components/Image.h"
 #include "Components/SizeBox.h"
 #include "Components/Slider.h"
 #include "Components/Spacer.h"
@@ -34,9 +38,11 @@ namespace
      */
     namespace Theme
     {
-        const FLinearColor PanelEdge(1.0f, 1.0f, 1.0f, 0.11f);
-        const FLinearColor PanelFill(0.035f, 0.040f, 0.050f, 0.92f);
-        const FLinearColor Divider(1.0f, 1.0f, 1.0f, 0.09f);
+        const FLinearColor PanelEdge(1.0f, 1.0f, 1.0f, 0.18f);
+        // Smoked glass: the live scene comes through the backbuffer blur, but
+        // the tint stays dark enough for the white transport labels.
+        const FLinearColor PanelFill(0.030f, 0.035f, 0.045f, 0.30f);
+        const FLinearColor Divider(1.0f, 1.0f, 1.0f, 0.16f);
 
         const FLinearColor TextPrimary(0.94f, 0.95f, 0.97f, 1.0f);
         const FLinearColor TextMuted(0.60f, 0.64f, 0.70f, 1.0f);
@@ -51,9 +57,18 @@ namespace
         const FLinearColor ChipHover(0.220f, 0.250f, 0.295f, 1.00f);
         const FLinearColor ChipPressed(0.200f, 0.450f, 0.850f, 1.00f);
         const FLinearColor ChipDisabled(0.100f, 0.110f, 0.130f, 0.45f);
+        // The LIVE chip is glass, not an opaque well: it lets the blurred bar
+        // and scene through, while a faint rim keeps its 84 px boundary clear.
+        const FLinearColor LiveChipIdle(0.120f, 0.140f, 0.180f, 0.34f);
+        const FLinearColor LiveChipHover(0.170f, 0.200f, 0.250f, 0.48f);
+        const FLinearColor LiveChipPressed(0.210f, 0.250f, 0.310f, 0.58f);
+        const FLinearColor LiveChipDisabled(0.100f, 0.110f, 0.130f, 0.22f);
+        const FLinearColor GlassRim(1.0f, 1.0f, 1.0f, 0.16f);
         const FLinearColor WellFill(0.025f, 0.030f, 0.040f, 0.92f);
         const FLinearColor WellEdge(1.0f, 1.0f, 1.0f, 0.07f);
-        const FLinearColor SliderTrack(1.0f, 1.0f, 1.0f, 0.18f);
+        // The scrub track sits on bright warehouse glass; at 0.18 it vanished
+        // into the bar and only the thumb read as a stray dot.
+        const FLinearColor SliderTrack(1.0f, 1.0f, 1.0f, 0.30f);
         const FLinearColor SliderThumb(0.88f, 0.92f, 1.00f, 1.0f);
 
         constexpr float V1 = 24.0f;
@@ -64,6 +79,10 @@ namespace
         constexpr float R1 = 12.0f;
         constexpr float R2 = 7.0f;
         constexpr float R3 = 6.0f;
+        constexpr float HUDBlur = 10.0f;
+        constexpr float TransportBlur = 12.0f;
+        /** FILES/TRACKS are gone; 86 px of content between 12 px gutters. */
+        constexpr float HUDWidth = 110.0f;
         /** The transport is a centred deck, not an edge-to-edge dock. */
         constexpr float TransportWidth = 960.0f;
 
@@ -95,6 +114,22 @@ namespace
         return Style;
     }
 
+    FButtonStyle MakeLiveButtonStyle()
+    {
+        FButtonStyle Style = FButtonStyle::GetDefault();
+        Style.Normal = FSlateRoundedBoxBrush(Theme::LiveChipIdle, 8.0f,
+            Theme::GlassRim, 1.0f);
+        Style.Hovered = FSlateRoundedBoxBrush(Theme::LiveChipHover, 8.0f,
+            Theme::GlassRim, 1.0f);
+        Style.Pressed = FSlateRoundedBoxBrush(Theme::LiveChipPressed, 8.0f,
+            Theme::GlassRim, 1.0f);
+        Style.Disabled = FSlateRoundedBoxBrush(Theme::LiveChipDisabled, 8.0f,
+            FLinearColor(1.0f, 1.0f, 1.0f, 0.08f), 1.0f);
+        Style.NormalPadding = FMargin(0.0f);
+        Style.PressedPadding = FMargin(0.0f);
+        return Style;
+    }
+
     FSliderStyle MakeSliderStyle()
     {
         FSliderStyle Style = FSliderStyle::GetDefault();
@@ -102,13 +137,15 @@ namespace
             FVector2D(0.0f, 6.0f));
         const FSlateRoundedBoxBrush TrackHover(Theme::SliderTrack * 1.35f, 3.0f,
             FLinearColor::Transparent, 0.0f, FVector2D(0.0f, 6.0f));
-        const FSlateRoundedBoxBrush TrackDisabled(Theme::SliderTrack * 0.5f, 3.0f,
+        const FSlateRoundedBoxBrush TrackDisabled(Theme::SliderTrack * 0.8f, 3.0f,
             FLinearColor::Transparent, 0.0f, FVector2D(0.0f, 6.0f));
         const FSlateRoundedBoxBrush Thumb(Theme::SliderThumb, 7.0f,
             FLinearColor(0.0f, 0.0f, 0.0f, 0.25f), 1.0f, FVector2D(14.0f, 14.0f));
         const FSlateRoundedBoxBrush ThumbHover(FLinearColor(1.0f, 1.0f, 1.0f, 1.0f), 7.0f,
             FLinearColor(0.0f, 0.0f, 0.0f, 0.25f), 1.0f, FVector2D(14.0f, 14.0f));
-        const FSlateRoundedBoxBrush ThumbDisabled(FLinearColor(0.55f, 0.58f, 0.62f, 0.5f), 7.0f,
+        // A dark disabled thumb read as a hole in the scrub bar. Keep it
+        // visibly grey so the one-sample scrubber still reads as a control.
+        const FSlateRoundedBoxBrush ThumbDisabled(FLinearColor(0.80f, 0.84f, 0.90f, 0.65f), 7.0f,
             FLinearColor::Transparent, 0.0f, FVector2D(14.0f, 14.0f));
 
         Style.NormalBarImage = Track;
@@ -134,6 +171,93 @@ namespace
         }
         Box->AddChild(Child);
         return Box;
+    }
+
+    /**
+     * The blur is a sibling behind the tinted border, not a child. Slate
+     * samples the backbuffer under the widget, so keeping it in a lower canvas
+     * layer leaves the rounded border and its controls crisp.
+     */
+    UBackgroundBlur* MakeGlassBlur(UWidgetTree* Tree, float Radius, float Strength)
+    {
+        UBackgroundBlur* Blur = Tree->ConstructWidget<UBackgroundBlur>(
+            UBackgroundBlur::StaticClass(), NAME_None);
+        Blur->SetPadding(FMargin(0.0f));
+        Blur->SetBlurStrength(Strength);
+        Blur->SetCornerRadius(FVector4(Radius, Radius, Radius, Radius));
+        Blur->SetApplyAlphaToBlur(false);
+        Blur->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+        return Blur;
+    }
+
+    UButton* MakeIconButton(UWidgetTree* Tree, const FName Name,
+        JusyncHUDIcons::EIcon Icon, const FText& Tooltip, float IconSize,
+        UImage** OutIcon = nullptr)
+    {
+        UButton* Button = Tree->ConstructWidget<UButton>(UButton::StaticClass(), Name);
+        Button->SetToolTipText(Tooltip);
+        Button->SetStyle(MakeButtonStyle(Theme::ChipIdle, Theme::ChipHover,
+            Theme::ChipPressed, Theme::ChipDisabled, 8.0f));
+        Button->SetClickMethod(EButtonClickMethod::Type::PreciseClick);
+
+        UImage* Image = JusyncHUDIcons::MakeImage(Tree, Icon, IconSize, Theme::TextPrimary);
+        Button->AddChild(Image);
+        if (UButtonSlot* ImageSlot = Cast<UButtonSlot>(Image->Slot))
+        {
+            ImageSlot->SetPadding(FMargin(0.0f));
+            ImageSlot->SetHorizontalAlignment(HAlign_Center);
+            ImageSlot->SetVerticalAlignment(VAlign_Center);
+        }
+        if (OutIcon)
+        {
+            *OutIcon = Image;
+        }
+        return Button;
+    }
+
+    UButton* MakeIconLabelButton(UWidgetTree* Tree, const FName Name,
+        JusyncHUDIcons::EIcon Icon, const FText& Label, const FText& Tooltip,
+        float IconSize, float FontSize)
+    {
+        UButton* Button = Tree->ConstructWidget<UButton>(UButton::StaticClass(), Name);
+        Button->SetToolTipText(Tooltip);
+        Button->SetStyle(MakeButtonStyle(Theme::ChipIdle, Theme::ChipHover,
+            Theme::ChipPressed, Theme::ChipDisabled, 8.0f));
+        Button->SetClickMethod(EButtonClickMethod::Type::PreciseClick);
+
+        // Absolute 84 px composition: 15 px edge + 13 px dot + 5 px gap +
+        // 36 px caption + 15 px edge. A canvas keeps each edge fixed instead
+        // of letting the button's content slot or text advance shift the row.
+        UCanvasPanel* Content = Tree->ConstructWidget<UCanvasPanel>(
+            UCanvasPanel::StaticClass(), NAME_None);
+
+        UImage* Image = JusyncHUDIcons::MakeImage(Tree, Icon, IconSize, Theme::Live);
+        UCanvasPanelSlot* IconSlot = Content->AddChildToCanvas(Image);
+        IconSlot->SetPosition(FVector2D(15.0f, (Theme::Z1 - IconSize) * 0.5f));
+        IconSlot->SetSize(FVector2D(IconSize, IconSize));
+        IconSlot->SetAlignment(FVector2D(0.0f, 0.0f));
+
+        UTextBlock* Text = Tree->ConstructWidget<UTextBlock>(
+            UTextBlock::StaticClass(), NAME_None);
+        Text->SetText(Label);
+        StyleLabel(Text, FontSize, Theme::TextPrimary);
+        Text->SetJustification(ETextJustify::Center);
+        const float TextLeft = 15.0f + IconSize + 5.0f;
+        const float TextWidth = 84.0f - TextLeft - 15.0f;
+        UCanvasPanelSlot* TextSlot = Content->AddChildToCanvas(Text);
+        TextSlot->SetPosition(FVector2D(TextLeft, 13.0f));
+        TextSlot->SetSize(FVector2D(TextWidth, 14.0f));
+        TextSlot->SetAlignment(FVector2D(0.0f, 0.0f));
+
+        USizeBox* ContentBox = MakeSizeBox(Tree, Content, 84.0f, Theme::Z1);
+        Button->AddChild(ContentBox);
+        if (UButtonSlot* ContentSlot = Cast<UButtonSlot>(ContentBox->Slot))
+        {
+            ContentSlot->SetPadding(FMargin(0.0f));
+            ContentSlot->SetHorizontalAlignment(HAlign_Center);
+            ContentSlot->SetVerticalAlignment(VAlign_Center);
+        }
+        return Button;
     }
 
     /**
@@ -381,7 +505,23 @@ void UJusyncPlaybackWidget::BuildLayout()
         UCanvasPanel::StaticClass(), TEXT("Root"));
     WidgetTree->RootWidget = Root;
 
+    auto AddGlassBlur = [this, Root](float Radius, float Strength, const FAnchors& Anchors,
+        const FVector2D& Alignment, const FVector2D& Position, const FVector2D& Size)
+    {
+        UBackgroundBlur* Blur = MakeGlassBlur(WidgetTree, Radius, Strength);
+        UCanvasPanelSlot* Slot = Root->AddChildToCanvas(Blur);
+        Slot->SetAnchors(Anchors);
+        Slot->SetAlignment(Alignment);
+        Slot->SetPosition(Position);
+        Slot->SetSize(Size);
+        Slot->SetZOrder(0);
+        return Blur;
+    };
+
     // ---------------------------------------------------------------- HUD
+    AddGlassBlur(Theme::R1, Theme::HUDBlur, FAnchors(0.0f, 0.0f, 0.0f, 0.0f),
+        FVector2D(0.0f, 0.0f), FVector2D(Theme::V1, Theme::V1),
+        FVector2D(Theme::HUDWidth, Theme::H8));
     HUDPanel = MakeRoundedBorder(TEXT("HUDPanel"), Theme::PanelFill, Theme::PanelEdge,
         Theme::R1, 1.0f, FMargin(12.0f, 0.0f, 12.0f, 0.0f));
     HUDPanel->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
@@ -389,54 +529,50 @@ void UJusyncPlaybackWidget::BuildLayout()
     HUDSlot->SetAnchors(FAnchors(0.0f, 0.0f, 0.0f, 0.0f));
     HUDSlot->SetAlignment(FVector2D(0.0f, 0.0f));
     HUDSlot->SetPosition(FVector2D(Theme::V1, Theme::V1));
-    HUDSlot->SetSize(FVector2D(320.0f, Theme::H8));
+    HUDSlot->SetSize(FVector2D(Theme::HUDWidth, Theme::H8));
+    HUDSlot->SetZOrder(1);
 
     UHorizontalBox* HUD = WidgetTree->ConstructWidget<UHorizontalBox>(
         UHorizontalBox::StaticClass(), TEXT("HUD"));
     HUDPanel->AddChild(HUD);
 
+    // Compact live-status pill: dot + state only. FILES and TRACKS were
+    // diagnostic readouts, not transport information, so they no longer
+    // consume half of the HUD. The state group is centred so LIVE does not
+    // sit against the left edge of a shortened pill.
+    auto AddHUDSpacer = [this, HUD]()
+    {
+        USpacer* Spacer = WidgetTree->ConstructWidget<USpacer>(
+            USpacer::StaticClass(), NAME_None);
+        UHorizontalBoxSlot* Slot = HUD->AddChildToHorizontalBox(Spacer);
+        Slot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
+    };
+
+    AddHUDSpacer();
+
+    UHorizontalBox* StateGroup = WidgetTree->ConstructWidget<UHorizontalBox>(
+        UHorizontalBox::StaticClass(), TEXT("HUDStateGroup"));
     HUDDot = MakeRoundedBorder(NAME_None, Theme::Live, FLinearColor::Transparent, 4.0f, 0.0f);
     USizeBox* DotBox = MakeSizeBox(WidgetTree, HUDDot, 8.0f, 8.0f);
-    UHorizontalBoxSlot* DotSlot = HUD->AddChildToHorizontalBox(DotBox);
-    DotSlot->SetPadding(FMargin(0.0f, 0.0f, 6.0f, 0.0f));
+    UHorizontalBoxSlot* DotSlot = StateGroup->AddChildToHorizontalBox(DotBox);
+    DotSlot->SetPadding(FMargin(0.0f, 0.0f, 8.0f, 0.0f));
     DotSlot->SetVerticalAlignment(VAlign_Center);
 
     HUDStateText = MakeLabel(TEXT("HUDState"), FText::FromString(TEXT("LIVE")));
     StyleLabel(HUDStateText, Theme::ValueSize, Theme::Live);
     HUDStateText->SetJustification(ETextJustify::Left);
-    // Keep the state label auto-sized: "CONNECTING" is wider than the old
-    // fixed 68 px box and used to run into the FILES segment.
-    UHorizontalBoxSlot* StateSlot = HUD->AddChildToHorizontalBox(HUDStateText);
+    UHorizontalBoxSlot* StateSlot = StateGroup->AddChildToHorizontalBox(HUDStateText);
     StateSlot->SetVerticalAlignment(VAlign_Center);
 
-    auto AddHUDDivider = [this, HUD]()
-    {
-        UBorder* Line = MakeRoundedBorder(NAME_None, Theme::Divider,
-            FLinearColor::Transparent, 0.0f, 0.0f);
-        USizeBox* Box = MakeSizeBox(WidgetTree, Line, 1.0f, 20.0f);
-        UHorizontalBoxSlot* Slot = HUD->AddChildToHorizontalBox(Box);
-        Slot->SetPadding(FMargin(12.0f, 0.0f, 12.0f, 0.0f));
-        Slot->SetVerticalAlignment(VAlign_Center);
-    };
+    UHorizontalBoxSlot* StateGroupSlot = HUD->AddChildToHorizontalBox(StateGroup);
+    StateGroupSlot->SetVerticalAlignment(VAlign_Center);
 
-    AddHUDDivider();
-
-    HUDFilesText = MakeLabel(TEXT("HUDFiles"), FText::FromString(TEXT("FILES --")));
-    StyleLabel(HUDFilesText, Theme::ValueSize, Theme::TextPrimary);
-    UHorizontalBoxSlot* FilesSlot = HUD->AddChildToHorizontalBox(HUDFilesText);
-    FilesSlot->SetVerticalAlignment(VAlign_Center);
-
-    AddHUDDivider();
-
-    HUDTracksText = MakeLabel(TEXT("HUDTracks"), FText::FromString(TEXT("TRACKS 0")));
-    StyleLabel(HUDTracksText, Theme::ValueSize, Theme::TextMuted);
-    HUDTracksText->SetJustification(ETextJustify::Right);
-    UHorizontalBoxSlot* TracksSlot = HUD->AddChildToHorizontalBox(HUDTracksText);
-    TracksSlot->SetSize(FSlateChildSize(ESlateSizeRule::Fill));
-    TracksSlot->SetHorizontalAlignment(HAlign_Right);
-    TracksSlot->SetVerticalAlignment(VAlign_Center);
+    AddHUDSpacer();
 
     // ----------------------------------------------------------- TRANSPORT
+    AddGlassBlur(Theme::R1, Theme::TransportBlur, FAnchors(0.5f, 1.0f, 0.5f, 1.0f),
+        FVector2D(0.5f, 1.0f), FVector2D(0.0f, -Theme::V1),
+        FVector2D(Theme::TransportWidth, Theme::H7));
     TransportBar = MakeRoundedBorder(TEXT("TransportBar"), Theme::PanelFill, Theme::PanelEdge,
         Theme::R1, 1.0f, FMargin(16.0f, 0.0f, 16.0f, 0.0f));
     UCanvasPanelSlot* BarSlot = Root->AddChildToCanvas(TransportBar);
@@ -444,6 +580,7 @@ void UJusyncPlaybackWidget::BuildLayout()
     BarSlot->SetAlignment(FVector2D(0.5f, 1.0f));
     BarSlot->SetPosition(FVector2D(0.0f, -Theme::V1));
     BarSlot->SetSize(FVector2D(Theme::TransportWidth, Theme::H7));
+    BarSlot->SetZOrder(1);
 
     UHorizontalBox* Bar = WidgetTree->ConstructWidget<UHorizontalBox>(
         UHorizontalBox::StaticClass(), TEXT("TransportRow"));
@@ -463,21 +600,32 @@ void UJusyncPlaybackWidget::BuildLayout()
         Slot->SetVerticalAlignment(VAlign_Center);
     };
 
-    PrevButton = MakeButton(TEXT("PrevButton"), FText::FromString(TEXT("\u25C0")),
-        LOCTEXT("PrevTip", "Step one cached sample backwards"), nullptr, Theme::IconSize);
-    NextButton = MakeButton(TEXT("NextButton"), FText::FromString(TEXT("\u25B6")),
-        LOCTEXT("NextTip", "Step one cached sample forwards"), nullptr, Theme::IconSize);
-    PlayPauseButton = MakeButton(TEXT("PlayPauseButton"), FText::FromString(TEXT("||")),
+    PrevButton = MakeIconButton(WidgetTree, TEXT("PrevButton"),
+        JusyncHUDIcons::EIcon::Previous,
+        LOCTEXT("PrevTip", "Step one cached sample backwards"), 18.0f);
+    NextButton = MakeIconButton(WidgetTree, TEXT("NextButton"),
+        JusyncHUDIcons::EIcon::Next,
+        LOCTEXT("NextTip", "Step one cached sample forwards"), 18.0f);
+    UImage* PlayPauseImage = nullptr;
+    PlayPauseButton = MakeIconButton(WidgetTree, TEXT("PlayPauseButton"),
+        JusyncHUDIcons::EIcon::Play,
         LOCTEXT("PlayPauseTip", "Play the cached samples at the current rate, or pause on the frame shown"),
-        &PlayPauseCaption, Theme::IconSize);
-    LiveButton = MakeButton(TEXT("LiveButton"), FText::FromString(TEXT("LIVE")),
+        18.0f, &PlayPauseImage);
+    PlayPauseIcon = PlayPauseImage;
+    LiveButton = MakeIconLabelButton(WidgetTree, TEXT("LiveButton"),
+        JusyncHUDIcons::EIcon::Live, FText::FromString(TEXT("LIVE")),
         LOCTEXT("LiveTip", "Stop the playback and follow the live edge of the stream"),
-        nullptr, 10.0f);
+        13.0f, 9.5f);
+    // Glass chip: translucent fill plus a faint rim, distinct from the opaque
+    // step wells but still part of the same neutral transport family.
+    LiveButton->SetStyle(MakeLiveButtonStyle());
 
     AddTransportButton(PrevButton, false);
     AddTransportButton(PlayPauseButton, false);
     AddTransportButton(NextButton, false);
-    AddTransportButton(LiveButton, true, 56.0f);
+    // 84 px gives the dot, its 5 px gap, the caption and 12 px side padding
+    // room to breathe; at 72 px the label sat against the rounded edge.
+    AddTransportButton(LiveButton, true, 84.0f);
 
     // Middle: step label + sender time over the scrubber.
     UVerticalBox* Middle = WidgetTree->ConstructWidget<UVerticalBox>(
@@ -520,12 +668,25 @@ void UJusyncPlaybackWidget::BuildLayout()
     UHorizontalBoxSlot* RightSlot = Bar->AddChildToHorizontalBox(Right);
     RightSlot->SetVerticalAlignment(VAlign_Center);
 
+    // Slight right bias in the padding corrects the font's left side bearing
+    // so the counter's ink, not just its advance box, sits on the well axis.
     UBorder* CountWell = MakeRoundedBorder(NAME_None, Theme::WellFill, Theme::WellEdge,
-        4.0f, 1.0f, FMargin(8.0f, 0.0f, 8.0f, 0.0f));
+        4.0f, 1.0f, FMargin(4.0f, 0.0f, 12.0f, 0.0f));
     StepCountText = MakeLabel(TEXT("StepCountText"), FText::FromString(TEXT("---/---")));
     StyleLabel(StepCountText, Theme::ValueSize, Theme::TextPrimary);
     StepCountText->SetJustification(ETextJustify::Center);
-    CountWell->AddChild(StepCountText);
+    // Fill the 96 px interior (112 px well minus its 16 px total inset) so the
+    // counter is centred on the well axis rather than on its text advance.
+    StepCountText->SetMinDesiredWidth(96.0f);
+    // The border's default slot packs the text to the left; centre the text
+    // block inside the well so the counter reads 001/001 on the same axis as
+    // the rate and loop controls.
+    if (UBorderSlot* CountTextSlot = Cast<UBorderSlot>(CountWell->AddChild(StepCountText)))
+    {
+        CountTextSlot->SetPadding(FMargin(0.0f));
+        CountTextSlot->SetHorizontalAlignment(HAlign_Center);
+        CountTextSlot->SetVerticalAlignment(VAlign_Center);
+    }
     USizeBox* CountBox = MakeSizeBox(WidgetTree, CountWell, 112.0f, Theme::H3);
     UHorizontalBoxSlot* CountSlot = Right->AddChildToHorizontalBox(CountBox);
     CountSlot->SetPadding(FMargin(0.0f, 0.0f, 8.0f, 0.0f));
@@ -537,10 +698,12 @@ void UJusyncPlaybackWidget::BuildLayout()
         UHorizontalBox::StaticClass(), TEXT("RateRow"));
     RateWell->AddChild(RateRow);
 
-    RateMinusButton = MakeButton(TEXT("RateMinus"), FText::FromString(TEXT("-")),
-        LOCTEXT("RateMinusTip", "Lower the time-step playback rate"), nullptr, 11.0f);
-    RatePlusButton = MakeButton(TEXT("RatePlus"), FText::FromString(TEXT("+")),
-        LOCTEXT("RatePlusTip", "Raise the time-step playback rate"), nullptr, 11.0f);
+    RateMinusButton = MakeIconButton(WidgetTree, TEXT("RateMinus"),
+        JusyncHUDIcons::EIcon::Minus,
+        LOCTEXT("RateMinusTip", "Lower the time-step playback rate"), 12.0f);
+    RatePlusButton = MakeIconButton(WidgetTree, TEXT("RatePlus"),
+        JusyncHUDIcons::EIcon::Plus,
+        LOCTEXT("RatePlusTip", "Raise the time-step playback rate"), 12.0f);
     RateMinusButton->SetStyle(MakeButtonStyle(FLinearColor::Transparent,
         FLinearColor(1.0f, 1.0f, 1.0f, 0.08f), FLinearColor(1.0f, 1.0f, 1.0f, 0.14f),
         FLinearColor::Transparent, 4.0f));
@@ -578,14 +741,22 @@ void UJusyncPlaybackWidget::BuildLayout()
     UVerticalBoxSlot* LoopSlot = LoopStack->AddChildToVerticalBox(LoopBox);
     LoopSlot->SetHorizontalAlignment(HAlign_Center);
 
+    // The dimensional drawing specifies the loop cluster as a pill switch
+    // with a plain centred caption. A tiny circular-arrow glyph at 10 px read
+    // as a stray "C", so keep this cluster label-only and let the switch carry
+    // the state.
     UTextBlock* LoopLabel = MakeLabel(TEXT("LoopLabel"), FText::FromString(TEXT("LOOP")));
-    StyleLabel(LoopLabel, 10.0f, Theme::TextMuted);
+    StyleLabel(LoopLabel, 9.5f, Theme::TextMuted);
     LoopLabel->SetJustification(ETextJustify::Center);
     UVerticalBoxSlot* LoopLabelSlot = LoopStack->AddChildToVerticalBox(LoopLabel);
     LoopLabelSlot->SetHorizontalAlignment(HAlign_Center);
-    LoopLabelSlot->SetPadding(FMargin(0.0f, 2.0f, 0.0f, 0.0f));
+    LoopLabelSlot->SetPadding(FMargin(0.0f, 1.0f, 0.0f, 0.0f));
 
     UHorizontalBoxSlot* LoopStackSlot = Right->AddChildToHorizontalBox(LoopStack);
+    // The drawing centres the switch on the bar centreline and hangs the
+    // caption below it. The old centred 20+2+label stack put the switch 7 px
+    // high and left the caption tight to the bottom edge.
+    LoopStackSlot->SetPadding(FMargin(0.0f, 13.0f, 0.0f, 0.0f));
     LoopStackSlot->SetVerticalAlignment(VAlign_Center);
 
     Refresh();
@@ -702,27 +873,35 @@ void UJusyncPlaybackWidget::Refresh()
 
     FString StateLabel = TEXT("OFFLINE");
     FLinearColor StateColor = Theme::TextMuted;
+    FLinearColor DotColor = Theme::TextMuted;
     if (Spawner)
     {
         if (Spawner->CurrentState == EJUSYNCSpawnerState::Error)
         {
             StateLabel = TEXT("ERROR");
             StateColor = Theme::Error;
+            DotColor = Theme::Error;
         }
         else if (bPlayingCached)
         {
             StateLabel = TEXT("PLAYING");
             StateColor = Theme::Accent;
+            DotColor = Theme::Accent;
         }
         else if (Spawner->IsPlayingCachedSample())
         {
             StateLabel = TEXT("PAUSED");
             StateColor = Theme::Paused;
+            DotColor = Theme::Paused;
         }
         else if (Count > 0)
         {
+            // Match the transport LIVE chip: the dot carries the live state,
+            // while the caption stays neutral white. Green text in the status
+            // pill made the two live indicators disagree.
             StateLabel = TEXT("LIVE");
-            StateColor = Theme::Live;
+            StateColor = Theme::TextPrimary;
+            DotColor = Theme::Live;
         }
         else if (Spawner->CurrentState == EJUSYNCSpawnerState::Downloading
             || Spawner->CurrentState == EJUSYNCSpawnerState::Connecting
@@ -730,11 +909,13 @@ void UJusyncPlaybackWidget::Refresh()
         {
             StateLabel = TEXT("CONNECTING");
             StateColor = Theme::TextMuted;
+            DotColor = Theme::TextMuted;
         }
         else
         {
             StateLabel = TEXT("WAITING");
             StateColor = Theme::TextMuted;
+            DotColor = Theme::TextMuted;
         }
     }
 
@@ -745,21 +926,7 @@ void UJusyncPlaybackWidget::Refresh()
     }
     if (HUDDot)
     {
-        HUDDot->SetBrushColor(StateColor);
-    }
-    if (HUDFilesText)
-    {
-        const int32 Total = Spawner ? Spawner->FilesTotal : 0;
-        const int32 Done = Spawner ? Spawner->FilesDownloaded : 0;
-        HUDFilesText->SetText(FText::FromString(Total > 0
-            ? FString::Printf(TEXT("FILES %d/%d"), Done, Total)
-            : TEXT("FILES --")));
-    }
-    if (HUDTracksText)
-    {
-        const int32 Tracks = Spawner ? Spawner->PathlineActiveTracks : 0;
-        HUDTracksText->SetText(FText::FromString(FString::Printf(TEXT("TRACKS %d"), Tracks)));
-        HUDTracksText->SetColorAndOpacity(FSlateColor(Tracks > 0 ? Theme::TextPrimary : Theme::TextMuted));
+        HUDDot->SetBrushColor(DotColor);
     }
 
     if (StepText)
@@ -805,7 +972,7 @@ void UJusyncPlaybackWidget::Refresh()
     if (ScrubSlider)
     {
         ScrubSlider->SetIsEnabled(bCanScrub);
-        ScrubSlider->SetRenderOpacity(bCanScrub ? 1.0f : 0.45f);
+        ScrubSlider->SetRenderOpacity(bCanScrub ? 1.0f : 0.55f);
     }
     if (PrevButton)
     {
@@ -817,19 +984,44 @@ void UJusyncPlaybackWidget::Refresh()
     }
     if (LiveButton)
     {
-        LiveButton->SetIsEnabled(Count > 0 && !bLive);
-        LiveButton->SetColorAndOpacity(bLive || Count <= 0 ? FLinearColor::White : Theme::Paused);
+        // Keep the chip neutral and use only the dot for the live state. A
+        // green caption on a special chip still read as a green pill at
+        // transport scale, so "LIVE" stays white and the indicator dot alone
+        // changes colour.
+        LiveButton->SetIsEnabled(true);
+        LiveButton->SetRenderOpacity(1.0f);
+        const bool bLiveState = Spawner && bLive && Count > 0;
+        const FLinearColor LiveDot = bLiveState ? Theme::Live : Theme::TextMuted;
+        const FLinearColor LiveCaption = Spawner ? Theme::TextPrimary : Theme::TextMuted;
+        if (UHorizontalBox* LiveRow = Cast<UHorizontalBox>(LiveButton->GetChildAt(0)))
+        {
+            if (UImage* LiveIcon = Cast<UImage>(LiveRow->GetChildAt(0)))
+            {
+                LiveIcon->SetColorAndOpacity(LiveDot);
+            }
+            if (UTextBlock* LiveLabel = Cast<UTextBlock>(LiveRow->GetChildAt(1)))
+            {
+                LiveLabel->SetColorAndOpacity(LiveCaption);
+            }
+        }
+        // UButton::ColorAndOpacity tints the chip brush as well as the child
+        // content, so keep it white and tint only the glyph and caption above.
+        LiveButton->SetColorAndOpacity(FLinearColor::White);
     }
     if (PlayPauseButton)
     {
         const bool bCanFreeze = Spawner && Spawner->bEnableSampleCache && Count > 0;
         PlayPauseButton->SetIsEnabled(bCanFreeze);
         PlayPauseButton->SetRenderOpacity(bCanFreeze ? 1.0f : 0.45f);
-        PlayPauseButton->SetColorAndOpacity(bPlayingCached ? Theme::Live : FLinearColor::White);
+        // Keep the transport chip monochrome. Tinting the whole button green
+        // while the cached animation runs recreates the pale pill that the
+        // LIVE button had, so only the play/pause glyph changes.
+        PlayPauseButton->SetColorAndOpacity(FLinearColor::White);
     }
-    if (PlayPauseCaption)
+    if (PlayPauseIcon)
     {
-        PlayPauseCaption->SetText(FText::FromString(bPlayingCached ? TEXT("||") : TEXT("\u25B6")));
+        JusyncHUDIcons::SetImageIcon(PlayPauseIcon.Get(),
+            bPlayingCached ? JusyncHUDIcons::EIcon::Pause : JusyncHUDIcons::EIcon::Play);
     }
 
     bApplyingFromCode = true;

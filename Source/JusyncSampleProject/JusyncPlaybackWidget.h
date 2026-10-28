@@ -7,6 +7,7 @@
 class AJUSYNCFileSpawnerActor;
 class UBorder;
 class UButton;
+class UImage;
 class UTextBlock;
 class USlider;
 
@@ -105,12 +106,6 @@ private:
 	TObjectPtr<UTextBlock> HUDStateText;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UTextBlock> HUDFilesText;
-
-	UPROPERTY(Transient)
-	TObjectPtr<UTextBlock> HUDTracksText;
-
-	UPROPERTY(Transient)
 	TObjectPtr<UBorder> TransportBar;
 
 	UPROPERTY(Transient)
@@ -140,9 +135,9 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UButton> PlayPauseButton;
 
-	/** Caption of PlayPauseButton; the label flips with the transport state. */
+	/** Icon of PlayPauseButton; the glyph flips with the transport state. */
 	UPROPERTY(Transient)
-	TObjectPtr<UTextBlock> PlayPauseCaption;
+	TObjectPtr<UImage> PlayPauseIcon;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UButton> RateMinusButton;
