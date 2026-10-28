@@ -1,6 +1,8 @@
 #include "JUSYNCPointCloudSpawner.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/PlayerController.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Engine/Engine.h"
 #include "Async/ParallelFor.h"
 #include "HAL/PlatformTime.h"
@@ -63,6 +65,12 @@ static TAutoConsoleVariable<float> CVarJusyncCloudEmissiveFloor(
 static TAutoConsoleVariable<float> CVarJusyncCloudScreenSize(
     TEXT("jusync.Morph.CloudScreenSize"), 2.7f,
     TEXT("Point size (screen-fraction units) used while jusync.Morph.CloudFixedSize is on."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<int32> CVarJusyncLockSilhouette(
+    TEXT("jusync.Morph.LockSilhouette"), 1,
+    TEXT("1 (default) = compensate point-cloud actor scale so changing POINT SIZE keeps the\n")
+    TEXT("cloud's outer width/height stable instead of inflating the silhouette by the sprite radius."),
     ECVF_Default);
 
 static TAutoConsoleVariable<FString> CVarJusyncIgnoreElements(
@@ -2016,6 +2024,73 @@ void FJUSYNCPointCloudSpawner::AdvanceCloudSmoothMorphs(double NowSeconds)
 #endif
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
+float FJUSYNCPointCloudSpawner::ComputeSilhouetteScale(AActor* Actor) const
+{
+    if (CVarJusyncLockSilhouette.GetValueOnGameThread() <= 0)
+    {
+        return 1.0f;
+    }
+
+    ALidarPointCloudActor* LidarActor = Cast<ALidarPointCloudActor>(Actor);
+    ULidarPointCloudComponent* Comp = LidarActor ? LidarActor->GetPointCloudComponent() : nullptr;
+    const ULidarPointCloud* Cloud = Comp ? Comp->GetPointCloud() : nullptr;
+    if (!Cloud || SpawnScale <= KINDA_SMALL_NUMBER)
+    {
+        return 1.0f;
+    }
+
+    const FBox LocalBounds = Cloud->GetBounds();
+    if (!LocalBounds.IsValid)
+    {
+        return 1.0f;
+    }
+
+    // Use the narrowest non-zero axis: it is the one that visibly inflates when
+    // round sprites grow (a tall column's width, a sphere's diameter). Keeping
+    // that axis fixed is the outer-width guarantee; a uniform scale keeps the
+    // cloud's proportions, so the other axes follow.
+    const FVector Size = LocalBounds.GetSize();
+    float DataExtent = TNumericLimits<float>::Max();
+    if (Size.X > KINDA_SMALL_NUMBER) DataExtent = FMath::Min(DataExtent, Size.X);
+    if (Size.Y > KINDA_SMALL_NUMBER) DataExtent = FMath::Min(DataExtent, Size.Y);
+    if (Size.Z > KINDA_SMALL_NUMBER) DataExtent = FMath::Min(DataExtent, Size.Z);
+    if (DataExtent <= KINDA_SMALL_NUMBER || DataExtent == TNumericLimits<float>::Max())
+    {
+        return 1.0f;
+    }
+
+    if (SilhouetteReferencePointSize < 0.0f)
+    {
+        SilhouetteReferencePointSize = FMath::Max(PointSize, 0.001f);
+    }
+
+    // The FixedScreenSize sprite radius is ~PointSize * 0.01 (projected),
+    // while the data's projected width is scale * extent / view depth.
+    // Solve for the scale that keeps data + sprite radius at its reference
+    // value; 1.0 at the captured point size, <1 as POINT SIZE grows.
+    float ViewDepth = 1000.0f;
+    if (UWorld* World = Comp->GetWorld())
+    {
+        if (APlayerController* PC = World->GetFirstPlayerController())
+        {
+            if (APlayerCameraManager* Cam = PC->PlayerCameraManager)
+            {
+                const FVector CloudCenter =
+                    Comp->GetComponentTransform().TransformPosition(LocalBounds.GetCenter());
+                const FVector CamLoc = Cam->GetCameraLocation();
+                const FVector CamFwd = Cam->GetCameraRotation().Vector();
+                ViewDepth = FMath::Max(1.0f, FVector::DotProduct(CloudCenter - CamLoc, CamFwd));
+            }
+        }
+    }
+
+    const float DataScreen = SpawnScale * DataExtent / ViewDepth;
+    const float SpriteScreen = 0.01f * FMath::Max(0.0f, PointSize);
+    const float ReferenceSprite = 0.01f * SilhouetteReferencePointSize;
+    const float DesiredData = DataScreen + ReferenceSprite - SpriteScreen;
+    return FMath::Clamp(DesiredData / FMath::Max(DataScreen, 1e-4f), 0.05f, 2.0f);
+}
+
 void FJUSYNCPointCloudSpawner::ApplyVisualSettings(ULidarPointCloudComponent* Comp)
 {
     if (!Comp)
@@ -2044,9 +2119,23 @@ void FJUSYNCPointCloudSpawner::ApplyVisualSettings(ULidarPointCloudComponent* Co
     // and every actor this spawner touches carries SpawnScale on its transform.
     // Divide that back out so points render at the configured size no matter how
     // the batch was scaled up (manual SpawnScale or the spawner's Fit Volume).
-    if (SpawnScale > KINDA_SMALL_NUMBER)
+    // The LockSilhouette compensation shrinks the data envelope by the same
+    // amount the larger sprite radius adds, so the cloud's outer width stays
+    // put; recenter around the data bounds so the shrink does not slide it.
+    float EffectiveScale = SpawnScale;
+    if (AActor* OwningActor = Comp->GetOwner())
     {
-        Comp->PointSize /= SpawnScale;
+        const float SilhouetteScale = ComputeSilhouetteScale(OwningActor);
+        EffectiveScale = SpawnScale * SilhouetteScale;
+        const ULidarPointCloud* Cloud = Comp->GetPointCloud();
+        const FVector LocalCenter = Cloud ? Cloud->GetBounds().GetCenter() : FVector::ZeroVector;
+        const FVector RotatedLocalCenter = OwningActor->GetActorQuat().RotateVector(LocalCenter);
+        OwningActor->SetActorScale3D(FVector(EffectiveScale));
+        OwningActor->SetActorLocation(SpawnLocation + RotatedLocalCenter * (SpawnScale - EffectiveScale));
+    }
+    if (EffectiveScale > KINDA_SMALL_NUMBER)
+    {
+        Comp->PointSize /= EffectiveScale;
     }
 
     if (Comp->GetPointShape() != PointShape)
@@ -2442,8 +2531,22 @@ void FJUSYNCPointCloudSpawner::ApplyTransformToActor(AActor* Actor)
         return;
     }
 
-    Actor->SetActorLocation(SpawnLocation);
-    Actor->SetActorScale3D(FVector(SpawnScale));
+    const float SilhouetteScale = ComputeSilhouetteScale(Actor);
+    const float EffectiveScale = SpawnScale * SilhouetteScale;
+    FVector LocalCenter = FVector::ZeroVector;
+    if (ALidarPointCloudActor* LidarActor = Cast<ALidarPointCloudActor>(Actor))
+    {
+        if (ULidarPointCloudComponent* Comp = LidarActor->GetPointCloudComponent())
+        {
+            if (const ULidarPointCloud* Cloud = Comp->GetPointCloud())
+            {
+                LocalCenter = Cloud->GetBounds().GetCenter();
+            }
+        }
+    }
+    const FVector RotatedLocalCenter = Actor->GetActorQuat().RotateVector(LocalCenter);
+    Actor->SetActorScale3D(FVector(EffectiveScale));
+    Actor->SetActorLocation(SpawnLocation + RotatedLocalCenter * (SpawnScale - EffectiveScale));
 }
 
 void FJUSYNCPointCloudSpawner::Tick(float DeltaTime)

@@ -205,6 +205,11 @@ private:
     float PointSize = 1.0f;
     float PointSizeBias = 0.035f;
     float GapFillingStrength = 0.0f;
+    // Keeps the cloud's outer screen envelope stable as POINT SIZE changes by
+    // scaling the actor down as the sprite radius grows. The reference is
+    // captured from the first displayed cloud so the current view does not jump.
+    float ComputeSilhouetteScale(AActor* Actor) const;
+    mutable float SilhouetteReferencePointSize = -1.0f;
     bool bPerfLogging = false;
     bool bPlaybackMode = false;
     // POINTS panel state (see SetPointCloudsHidden / SetPointHueFilter).
@@ -214,6 +219,7 @@ private:
     float PointHue = 0.0f;
     float PointHueTolerance = 30.0f;
     void ApplyPointCloudsHiddenToActors();
+
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     /** In-place colour pass for one cloud: captures originals on first use,
      *  then keeps matching colours and paints non-matches black. The cloud
