@@ -2,7 +2,7 @@
 
 #if PLATFORM_WINDOWS
 #include "Windows/AllowWindowsPlatformTypes.h"
-#include <dxgi1_4.h> // IDXGIAdapter3 / DXGI_QUERY_VIDEO_MEMORY_INFO
+#include <dxgi1_4.h>  // IDXGIAdapter3 / DXGI_QUERY_VIDEO_MEMORY_INFO
 #include "Windows/HideWindowsPlatformTypes.h"
 #endif
 
@@ -11,9 +11,6 @@ namespace JUSYNCVideoMemory
 #if PLATFORM_WINDOWS
     namespace
     {
-        // Adapter + factory are process-lifetime on purpose: the query runs
-        // every few seconds and re-creating the factory per poll is wasteful.
-        // Adapter 0 is the default rendering adapter UE picks on desktop.
         IDXGIAdapter3* GetQueryAdapter()
         {
             static IDXGIAdapter3* Adapter = []() -> IDXGIAdapter3*

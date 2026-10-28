@@ -21,11 +21,7 @@
 
 namespace
 {
-    /**
-     * Same visual language as the transport deck and the pathline panel: the
-     * scene shows through a backbuffer blur under a smoked rounded border.
-     * Geometry follows the existing 24 px margin / 12 px radius scale.
-     */
+
     namespace Theme
     {
         const FLinearColor PanelFill(0.030f, 0.035f, 0.045f, 0.30f);
@@ -79,8 +75,6 @@ void UJusyncShortcutHintWidget::NativeTick(const FGeometry& MyGeometry, float In
 {
     Super::NativeTick(MyGeometry, InDeltaTime);
 
-    // The legend is the first HUD surface on screen, so it fades in once by
-    // itself instead of waiting for a key press.
     if (!bIntroStarted)
     {
         bIntroStarted = true;
@@ -117,7 +111,6 @@ void UJusyncShortcutHintWidget::RefreshKeys()
         return;
     }
 
-    // Upper case so the caps read like every other HUD label ("T", "P", "TAB").
     auto KeyName = [](const FKey& Key)
     {
         return Key.IsValid()
@@ -150,9 +143,6 @@ UWidget* UJusyncShortcutHintWidget::MakeRow(const FName BaseName, UTextBlock*& O
         UHorizontalBox::StaticClass(), BaseName);
     Row->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
 
-    // Keycap: a small glass chip with the key name centred. MinDesiredWidth
-    // (not a fixed width) so a longer binding such as "TAB" grows the cap
-    // instead of clipping it.
     UBorder* Cap = WidgetTree->ConstructWidget<UBorder>(UBorder::StaticClass(), NAME_None);
     Cap->SetBrush(FSlateRoundedBoxBrush(Theme::ChipIdle, Theme::R3, Theme::GlassRim, 1.0f));
     Cap->SetPadding(FMargin(7.0f, 0.0f, 7.0f, 0.0f));
@@ -194,9 +184,6 @@ void UJusyncShortcutHintWidget::BuildLayout()
     Root->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
     WidgetTree->RootWidget = Root;
 
-    // Tucked under the 110 x 44 LIVE pill at (V1, V1) and above the bottom
-    // transport deck, so the legend is visible the moment the level loads
-    // without ever sitting on top of either panel's controls.
     const FVector2D CardPos(Theme::V1, Theme::V1 + Theme::H8 + Theme::Gap);
 
     UBackgroundBlur* Blur = WidgetTree->ConstructWidget<UBackgroundBlur>(
@@ -253,8 +240,6 @@ void UJusyncShortcutHintWidget::BuildLayout()
     PathlineSlot->SetVerticalAlignment(VAlign_Center);
     PathlineKeyText = PathlineKey;
 
-    // Start at alpha 0 so the very first painted frame is already the opening
-    // pose; NativeTick then fades the card in.
     ApplyReveal();
 }
 

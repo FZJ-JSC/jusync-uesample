@@ -201,9 +201,6 @@ int64 FJUSYNCAnimationController::DetectTimeStepOrder(const FString& Filename, F
     OutLabel = FPaths::GetBaseFilename(Filename);
     FString Base = FPaths::GetBaseFilename(Filename);
 
-    // Progressive-refinement subsets ("<base>_s<k>.geo", RawGeo v2) belong to
-    // their base file's timestep; the "_s<k>" tail is neither a time nor a
-    // rank mark. Without this strip, "...__7_s2" would bucket as step 2.
     const int32 RefineUnderscore = Base.Find(TEXT("_s"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
     if (RefineUnderscore != INDEX_NONE)
     {
@@ -225,10 +222,6 @@ int64 FJUSYNCAnimationController::DetectTimeStepOrder(const FString& Filename, F
             TimeTok = TimeTok.Left(UniqueSuffix);
         }
 
-        // MPI clip keys carry the owning rank between the separator and the time
-        // ("__r1_0.500000"), so a bare IsNumeric() test fails and the fallback
-        // below then reads the trailing decimals as the order - collapsing every
-        // timestep of every rank onto one step. Drop the rank token first.
         if (TimeTok.StartsWith(TEXT("r"), ESearchCase::IgnoreCase))
         {
             const int32 RankSep = TimeTok.Find(TEXT("_"), ESearchCase::CaseSensitive, ESearchDir::FromStart);
@@ -248,9 +241,6 @@ int64 FJUSYNCAnimationController::DetectTimeStepOrder(const FString& Filename, F
         }
     }
 
-    // A trailing rank mark is not a time step. Without this, "cloud_r1" and
-    // "cloud_r10" are bucketed as steps 1 and 10 and one instant of a partitioned
-    // element is spread over several animation steps; only MPI keys carry "_rN".
     FString Stripped = Base;
     const int32 RankUnderscore = Stripped.Find(TEXT("_r"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
     if (RankUnderscore != INDEX_NONE)
@@ -349,10 +339,6 @@ void FJUSYNCAnimationController::ApplyVisibility()
         {
             if (IsActorLive(Pair.Key))
             {
-                // Live streams own their visibility (the point cloud spawner
-                // hides/shows them from bPointCloudsHidden); the election would
-                // hide the newest cloud as soon as CurrentOrder moves past the
-                // order its slot was registered with.
                 continue;
             }
             const bool bVisible = (Pair.Value.Order == CurrentOrder) && Winners.Contains(Pair.Key);

@@ -38,8 +38,6 @@ FText FJusyncPlaybackHUDModel::MakeStatusText(int32 Index, int32 SampleCount, do
 
     if (bIsLive)
     {
-        // Live playback shows the sender's timecode too, so the counter can
-        // be read against ParaView's timeline without pausing first.
         if (SampleTime >= 0.0)
         {
             return FText::FromString(FString::Printf(TEXT("LIVE   t=%.3g   %s"), SampleTime, *Position));
@@ -63,7 +61,6 @@ FString FJusyncPlaybackHUDModel::MakeTimestepLabel(int32 Index, int32 SampleCoun
 
 int32 FJusyncPlaybackHUDModel::ComboSelectionToSampleIndex(int32 SelectionIndex)
 {
-    // Row 0 is the LIVE entry.
     return SelectionIndex <= 0 ? -1 : SelectionIndex - 1;
 }
 

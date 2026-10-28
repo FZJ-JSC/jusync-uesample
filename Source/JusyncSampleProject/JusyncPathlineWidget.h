@@ -14,17 +14,6 @@ class USlider;
 class UTextBlock;
 class UVerticalBox;
 
-/**
- * The right-hand LAYERS panel from the dimensional drawing: one 360 x 620
- * frame with a 60 px header and two 260 px cards. The PATHLINES card controls
- * the Niagara trail model; the POINT CLOUD card mirrors the spawner's point
- * properties. The geometry is fixed at the 1920x1080 reference; the panel is
- * anchored to the top-right at V1 = 24.
- *
- * As with UJusyncPlaybackWidget the tree is built in C++ (no .uasset), so it
- * works in Shipping. The card slots are placeholders in the drawing; the
- * controls here are the real pathline / point-cloud properties.
- */
 UCLASS()
 class UJusyncPathlineWidget : public UUserWidget
 {
@@ -33,19 +22,15 @@ class UJusyncPathlineWidget : public UUserWidget
 public:
 	void BindSpawner(AJUSYNCFileSpawnerActor* InSpawner);
 
-	/** Idempotent; called from NativeOnInitialized and after binding. */
 	void EnsureLayoutBuilt();
 
-	/** Reveals the panel with the eased glass animation. */
 	void Open();
 
-	/** Fades the panel out and collapses it once the tween finishes. */
 	void Close();
 
 protected:
 	virtual void NativeOnInitialized() override;
 	virtual void NativeTick(const FGeometry& MyGeometry, float InDeltaTime) override;
-	/** Lets T/P toggle the panels even while focus sits inside one. */
 	virtual FReply NativeOnKeyDown(const FGeometry& InGeometry, const FKeyEvent& InKeyEvent) override;
 
 private:
@@ -101,9 +86,6 @@ private:
 	UFUNCTION() void HandleQualityMinus() { StepQualityBy(-1); }
 	UFUNCTION() void HandleQualityPlus() { StepQualityBy(+1); }
 
-	/** The POINTS panel owns sizing: only the SCREEN option keeps the
-	 *  fixed-screen-size override on. Every other scaling mode must be able to
-	 *  change the component's ScalingMethod. */
 	void SyncPointCloudFixedSizeMode();
 
 	void StepMaxBy(int32 Direction);
@@ -177,8 +159,6 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UTextBlock> WidthValueText;
 
-	/** jusync.Pathlines.Glow: the ribbons' emissive strength. They share one
-	 *  material, so this is a collection scalar rather than a per-actor value. */
 	UPROPERTY(Transient)
 	TObjectPtr<USlider> PathlineGlowSlider;
 
@@ -221,8 +201,6 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UTextBlock> PointSizeValueText;
 
-	/** jusync.Spawner.CloudEmissiveFloor: the cloud's self-glow. Owns both the
-	 *  "too dark" and "washed out" endpoints, so it sits beside POINT SIZE. */
 	UPROPERTY(Transient)
 	TObjectPtr<USlider> PointGlowSlider;
 
@@ -257,7 +235,6 @@ private:
 	bool bLayoutBuilt = false;
 	float RefreshAccumulator = 0.0f;
 
-	/** Eased show/hide, shared with the transport deck. */
 	FJusyncPanelReveal Reveal;
 	TArray<FJusyncGlassBlur> GlassBlurs;
 

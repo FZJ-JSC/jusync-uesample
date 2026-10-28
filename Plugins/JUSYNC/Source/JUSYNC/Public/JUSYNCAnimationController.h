@@ -36,10 +36,6 @@ public:
     void RemoveFile(const FString& Filename);
     void Clear();
 
-    /** Actors updated in place by live streaming (one actor per element, its
-        geometry replaced every frame). The time-step election leaves them
-        alone: a scrub through buffered clips must not hide a cloud that is
-        still receiving data, otherwise the viewport goes empty mid-stream. */
     void MarkActorLive(AActor* Actor);
     void UnmarkActorLive(AActor* Actor);
     bool IsActorLive(const AActor* Actor) const;

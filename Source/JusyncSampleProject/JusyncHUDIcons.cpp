@@ -7,13 +7,8 @@
 namespace
 {
     constexpr int32 IconSize = 32;
-    // Rasterise at 4x and box-filter down. This gives the small transport
-    // glyphs clean edges without needing an imported icon texture or font.
     constexpr int32 Supersample = 4;
     constexpr int32 CanvasSize = IconSize * Supersample;
-    // Bump this whenever the glyph art changes: the texture cache survives
-    // Live Coding patches, so reusing the raw enum as the key would keep
-    // showing the previous drawing of an icon.
     constexpr int32 IconCacheVersion = 3;
 
     struct FIconCanvas
@@ -296,14 +291,10 @@ namespace
             Canvas.FillRoundedBox(20.0f, 8.0f, 24.0f, 24.0f, 1.5f);
             break;
         case EIcon::Live:
-            // One solid dot. The earlier parenthesis-like arcs collapsed into
-            // a stray "(.)" at transport size; a single dot matches the status
-            // HUD and reads as a live indicator at 13 px.
             Canvas.FillCircle(16.0f, 16.0f, 6.0f);
             break;
         case EIcon::Loop:
             Canvas.Arc(16.0f, 16.0f, 8.5f, 40.0f, 320.0f, 2.4f);
-            // Arrowhead on the open end of the circular arrow.
             Canvas.Triangle(24.6f, 13.0f, 20.0f, 11.1f, 23.5f, 8.1f);
             break;
         case EIcon::Plus:

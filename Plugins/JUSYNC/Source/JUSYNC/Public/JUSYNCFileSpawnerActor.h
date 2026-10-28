@@ -119,10 +119,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Placement")
     bool bUseUniformScaling;
 
-    /** Draggable/resizable box shown in the viewport. When Fit To Volume is on,
-        spawned meshes are scaled and centered to fill this volume instead of
-        using SpawnScale/grid placement. Resize it via the component's Box Extent
-        (select the actor, then the FitVolume component) or the scale gizmo. */
     UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "JUSYNC|Spawner|Placement")
     TObjectPtr<UBoxComponent> FitVolume;
 
@@ -132,15 +128,12 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Placement", meta = (EditCondition = "bFitToVolume", EditConditionHides))
     EJUSYNCFitMode FitMode;
 
-    /** Fraction (0-0.9) of the volume left as margin on each axis. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Placement", meta = (EditCondition = "bFitToVolume", EditConditionHides, ClampMin = "0.0", ClampMax = "0.9"))
     float FitPaddingFraction;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Placement", meta = (EditCondition = "bFitToVolume", EditConditionHides))
     bool bCenterInVolume;
 
-    /** Re-applies the current FitVolume to all actors spawned so far (e.g. after
-        resizing the box while a scene is live). */
     UFUNCTION(BlueprintCallable, CallInEditor, Category = "JUSYNC|Spawner|Placement")
     void RefitSpawnedActorsToVolume();
 
@@ -168,15 +161,11 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pipeline")
     bool bCollapseElementVariants;
 
-    // One-time migration marker: existing levels serialized the pre-v2 default
-    // (true), which suppressed protocol-v2 subset pieces. Default to accepting
-    // every variant/subset; the checkbox above can still opt in afterwards.
     UPROPERTY()
     bool bCollapseVariantsMigrated = false;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|LiveUpdate", meta = (ClampMin = "0.0", ClampMax = "30.0"))
     float CommitCompleteCooldownSeconds;
-
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Morph")
     bool bMorphEnabled;
@@ -253,9 +242,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|PointCloud", meta = (InlineEditConditionToggle))
     bool bUseGradientColors;
 
-    // Stable-ID pathlines are built from complete RawGeo sphere point clouds.
-    // They are an alternative rendering of those streams, not a replacement
-    // for the point-cloud actors themselves.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines")
     bool bEnablePathlines;
 
@@ -275,11 +261,6 @@ public:
         meta = (EditCondition = "bEnablePathlines", EditConditionHides, ClampMin = "1", ClampMax = "512"))
     int32 PathlineTrackExpirySamples;
 
-    /**
-     * Niagara system that draws the trails as ribbons (NS_JusyncStreamlines).
-     * When null the CPU track store still ingests - scrubbing and picking stay
-     * valid - but nothing is drawn.
-     */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
         meta = (EditCondition = "bEnablePathlines", EditConditionHides))
     TSoftObjectPtr<UNiagaraSystem> PathlineNiagaraSystem;
@@ -348,14 +329,10 @@ public:
         meta = (EditCondition = "bEnablePathlines && !bPathlineColorByScalar", EditConditionHides))
     FLinearColor PathlineFlatColor;
 
-    /** Emissive multiplier for the generated trail material (0 = no glow).
-        Live-tunable from the in-game pathline panel. */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
         meta = (ClampMin = "0", ClampMax = "4", EditCondition = "bEnablePathlines", EditConditionHides))
     float PathlineEmissiveStrength;
 
-    /** Whether the streamed LiDAR points are displayed (POINTS panel section
-        of the P menu; the spawner remembers this across future frames). */
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Points")
     bool bPointCloudsVisible;
 
@@ -376,9 +353,6 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
         meta = (EditCondition = "bEnablePathlines", EditConditionHides, ClampMin = "0.0"))
-    // Reserved for deferred incomplete-sample grace. This release ingests
-    // only complete RawGeo clouds as soon as they arrive, so the timeout is
-    // not consumed yet.
     float PathlinePendingTimeoutSeconds;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
@@ -412,9 +386,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Cache", meta = (EditCondition = "bEnableMeshCache", EditConditionHides))
     bool bCachePointClouds;
 
-    // Dynamic cache budget: let the sample cache grow/shrink with the RAM the
-    // machine actually has free instead of a fixed MB number. SampleCacheMaxMB
-    // stays the FLOOR (never worse than before), CacheBudgetMaxMB the cap.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Cache")
     bool bDynamicCacheBudget = true;
 
@@ -424,9 +395,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Cache", meta = (EditCondition = "bDynamicCacheBudget", EditConditionHides, ClampMin = "64"))
     int32 CacheBudgetMaxMB = 8192;
 
-    // Share of the process's remaining DXGI video-memory budget reserved for
-    // the warm replay-cloud pool (built clouds that skip a rebuild on scrub
-    // revisit). Same hysteresis + polling as the RAM budget.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Cache", meta = (EditCondition = "bDynamicCacheBudget", EditConditionHides, ClampMin = "10", ClampMax = "90"))
     int32 CacheVRamPercent = 70;
 
@@ -442,9 +410,6 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Playback", meta = (EditCondition = "bEnableSampleCache", EditConditionHides))
     bool bPauseLiveApplyDuringPlayback;
 
-    // Normalized scrub position across the cached window. 0 = oldest cached
-    // sample, 1 = newest/live sample. The custom Details row binds a real
-    // SSlider to this value; PostEditChangeProperty also handles direct edits.
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Playback", meta = (EditCondition = "bEnableSampleCache", EditConditionHides, UIMin = "0.0", UIMax = "1.0", ClampMin = "0.0", ClampMax = "1.0"))
     float PlaybackPosition;
 
@@ -541,10 +506,6 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Animation")
     void SetTimeStepIndex(int32 NewIndex);
 
-    // --- Recent-sample cache / local playback -------------------------------
-    // Each played stream sample is retained as a compact payload (mesh refs or
-    // point-cloud refs) in a small per-element ring. Moving the Details slider
-    // re-applies the selected cached sample to the existing live actors.
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
     void SetPlaybackPosition(float NewPosition);
 
@@ -560,18 +521,12 @@ public:
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
     void ClearCachedSamples();
 
-    /** POINTS panel forwards: push point-cloud visibility / hue-filter state
-     *  held on this actor down to the shared point-cloud spawner. */
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Points")
     void SetPointCloudsVisible(bool bVisible);
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Points")
     void UpdatePointCloudHueFilter();
 
-    /** POINTS panel forwards: push the current point-cloud display settings
-     *  (size, bias, gap fill, shape, scaling, orientation, gradient) to the
-     *  shared spawner and apply them to clouds that are already on screen.
-     *  bRecalculateNormals re-runs normal generation for live clouds. */
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Points")
     void ApplyPointCloudDisplaySettings(bool bRecalculateNormals = false);
 
@@ -584,56 +539,31 @@ public:
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner|Playback")
     int32 GetPlaybackSampleIndex() const { return PlaybackSampleIndex; }
 
-    // Sender animation time (ANARI usd::time) for a timeline entry, in
-    // seconds. Returns -1 when the sender did not provide a time.
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner|Playback")
     double GetCachedSampleTime(int32 Index) const;
 
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner|Playback")
     bool IsPlayingCachedSample() const { return bSamplePlaybackActive; }
 
-    // A looping sender replays frames it has already delivered, so the live
-    // diff sees identical hashes and never applies anything again (0 changed,
-    // 0 new) - live mode then sits on the last cached frame forever. The
-    // notification path latches that condition here; the transport panel
-    // consumes the latch (reading clears it) and starts looping the cached
-    // timeline so the morph and the pathline tips keep running.
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
     bool ConsumeSenderLoopDetected();
 
-    // Same latch, but only reports a loop that was detected within
-    // MaxAgeSeconds. A cached-panel that was closed (Tab) while the sender kept
-    // looping must NOT jump out of live mode when it is opened again; this lets
-    // it tell a fresh loop from a stale latch.
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
     bool ConsumeSenderLoopDetectedIfRecent(float MaxAgeSeconds);
 
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner|Playback")
     bool HasSenderLoopDetected() const { return bSenderLoopDetected; }
 
-    // Temporary diagnostics: dumps the cache timeline, per-key entries and the
-    // actor each key currently maps to. Safe to call from Python/BP.
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
     FString GetSampleCacheDebugString() const;
 
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner")
     FVector GetNextSpawnLocation() const;
 
-    // Element+payload identity of a rolling clip stream with the timestep mark
-    // dropped: "..._Geom__0.000000.geo" and "..._Geom__0.250000.geo" are the
-    // SAME live element. Empty for files without a per-timestep mark (their
-    // identity never rolls). The deletion sweep uses this to tell a clip
-    // rollover from a retired element; exposed so tests can pin the contract.
     static FString BuildClipStreamKey(const FString& Filename);
 
-    // Dynamic cache budget math (pure so tests can pin it). Percent is 0-100
-    // of the sender-reported free bytes, clamped to [FloorBytes, CapBytes];
-    // a zero/negative Percent (or unreadable memory) yields FloorBytes.
     static int64 ComputeCacheBudgetBytes(int64 FreeBytes, int32 Percent, int64 FloorBytes, int64 CapBytes);
 
-    // True when Value moved far enough from LastAccepted to be worth acting
-    // on (hysteresis: changes below PercentToAct% of the accepted value are
-    // ignored, so a wobbling free-RAM number cannot thrash the cache).
     static bool PassesBudgetHysteresis(int64 LastAccepted, int64 Value, int32 PercentToAct = 10);
 
 protected:
@@ -674,25 +604,15 @@ private:
     void DestroyUnreplacedMeshActors(const FString& Filename, const TArray<AActor*>& OldMeshActors, const TArray<AActor*>& ReplacementActors);
     void DestroyUnreplacedPCActors(const FString& Filename, const TArray<AActor*>& OldPCActors, const TSet<FString>& NewPCKeys);
 
-    // Fit-to-volume: scale/location derived from the mesh's local bounds and the
-    // FitVolume. ComputeFitScale returns FVector::ZeroVector when fit is off or
-    // the box is degenerate, so call sites can fall back to SpawnScale.
     FVector ComputeFitScale(const FBox& MeshBox) const;
     FVector ComputeFitLocation(const FBox& MeshBox, const FVector& Scale) const;
 
-    // Union of every fitted bounds seen for the current scene. The fit transform
-    // is derived from this accumulated union (not from each mesh/timestep), so a
-    // time-series that changes extent morphs in place instead of being rescaled
-    // and re-centred on every frame. Grows monotonically; a 2% dead band keeps
-    // floating-point noise from triggering refits.
     FBox FitUnionBounds;
     bool bHasFitUnionBounds = false;
     bool bFitLocked = false;
     bool bFitUnionGrew = false;
     void AccumulateFitBounds(const FBox& B);
 
-    // Remembered per-actor local mesh bounds so RefitSpawnedActorsToVolume can
-    // rescale live actors without a re-download.
     TMap<TWeakObjectPtr<AActor>, FBox> LastMeshLocalBounds;
 
     bool BakeLUTVertexColorCompact(FJUSYNCCompactMeshRef& Mesh, UMaterialInterface*& OutVertexMaterial);
@@ -724,29 +644,13 @@ private:
     bool QueueRefreshFile(const FString& Filename, int32 Rank, int64 Size, uint64 HashLo, uint64 HashHi, uint64 SampleId = 0);
     void UpdateTrackedFileMetadata(const FString& Filename, int32 Rank, int64 Size, uint64 HashLo, uint64 HashHi);
 
-    // Recovers the rank that owns a file. A notification can arrive without an
-    // owner, and asking the broker with rank -1 broadcasts the fetch to every
-    // worker while rank 0's own copy is never served, so a -1 file request stalls
-    // instead of falling back. Resolve it, and only then fall back to rank 0.
     int32 ResolveFileRank(const FString& Filename, int32 KnownRank) const;
     int32 DestroyFileActors(const FString& Filename);
 
-    // A rolling clip stream renames its clip file every timestep
-    // ("..._Geom__0.000000.geo" -> "..._Geom__0.250000.geo"). The live actor
-    // must survive that swap, so ownership moves from the retired filename to
-    // the live one instead of the deletion sweep destroying (and pathline-
-    // unregistering) the actor the next sample is about to morph into.
     void TransferFileActorOwnership(const FString& FromFile, const FString& ToFile);
 
-    // A deleted clip can arrive one commit BEFORE its replacement shows up in
-    // the file list (the store swaps faster than notifications). Hold the
-    // destruction; if the stream reappears under a new timestep filename the
-    // actor is transferred, only a truly retired stream is destroyed.
     void SweepPendingDeletedFiles();
 
-    // One logical element (including all "_u<k>" rebuild variants) must own a
-    // single actor. Duplicates left by the pre-fix initial spawn are retired
-    // here so an older sample cannot stay visible.
     void DeduplicateLogicalActors();
 
     TMap<FString, TPair<int32, FString>> ElementVariantWinners;
@@ -828,42 +732,24 @@ private:
     TMap<FString, AActor*> FileToActorMap;
     TMap<FString, TArray<AActor*>> FilenameToActors;
     TMap<FString, TArray<AActor*>> FilenameToPCActors;
-    // One-shot: when no PathlineMaterial is set, try the project's shared
-    // vertex-colour material so baked trail colours are actually sampled.
     bool bPathlineMaterialFallbackTried = false;
-    // ConstB of the generated trail material's emissive scale node; the
-    // panel's EM= box retunes PathlineEmissiveStrength through it.
     UPROPERTY(Transient)
     TObjectPtr<class UMaterialExpressionMultiply> TrailEmissiveExpression;
-    // MPC_Jusync, resolved on first use: the ribbons are one shared material,
-    // so their glow is a collection scalar rather than a per-instance value.
     UPROPERTY(Transient)
     TObjectPtr<class UMaterialParameterCollection> PathlineGlowCollection;
     float LastPathlineGlow = -1.0f;
     bool bPathlineGlowMissingWarned = false;
-    // Deleted clip filename -> world time at which its actors are destroyed
-    // when no successor clip for the same stream key has appeared.
     TMap<FString, float> PendingDeletedFiles;
     TMap<FString, FString> PCElementToFilename;
 
     TMap<FString, uint64> FileHashLo;
     TMap<FString, uint64> FileHashHi;
     TMap<FString, int64> FileLastSize;
-    /** Sizes actually applied to actors (not merely polled). Only consulted when the
-     *  middleware apply-check is unavailable; empty means "never dedup by size". */
     TMap<FString, int64> AppliedFileSizes;
     double LastCommitCompleteTime;
     bool bSceneDiffInFlight;
-    // A commit-complete arrived while file changes were still in flight (or a
-    // diff was already running). Do not drop it: the next diff is what retires
-    // actors whose files the sender deleted. Apply the pending diff as soon as
-    // the change queue drains instead of waiting for the 20 s backstop poll.
     bool bCommitDiffPending = false;
     bool bInitialSpawnDone;
-    // Initial spawn can be held open by a point-cloud spawn that never calls
-    // back (empty cloud, filtered enqueue, failed actor allocation). Watchdog
-    // state: when the only outstanding work is PendingAsyncPCS, force the
-    // spawn complete after a short grace period so live updates start.
     double InitialSpawnPendingSince = 0.0;
     bool bInCheckAllDownloads = false;
 
@@ -878,11 +764,6 @@ private:
     FTimerHandle BenchmarkFinalizeTimerHandle;
 
     TMap<FString, int32> SeenV2Files;
-    // Logical element (element+payload+time, rebuild uniquifier folded away) ->
-    // the clip filename currently queued/in flight for it. The sender rebuilds
-    // a prim as "<name>_u<k>", so one element alternates between filenames;
-    // without this, both variants run their own parse and an older one can land
-    // after (and overwrite) a newer sample.
     TMap<FString, FString> LogicalTrackedFile;
     FTimerHandle SpawnThrottleTimer;
 
@@ -892,9 +773,6 @@ private:
 
     TMap<FString, uint64> ActiveDownloadAborts;
 
-    // Recent live samples, grouped by logical element + payload + rank. The
-    // payload refs are shared with the live spawn path, so caching a sample
-    // does not duplicate the mesh/point-cloud buffers.
     struct FJUSYNCSampleCacheEntry
     {
         FJUSYNCCompactMeshRef Mesh;
@@ -902,69 +780,37 @@ private:
         FString Filename;
         int32 Rank = 0;
         int64 Bytes = 0;
-        // Ring ordering / duplicate bookkeeping.
         uint64 Serial = 0;
-        // Sender frame timestamp. Entries from the same frame share this id so
-        // the playback timeline can select the matching mesh and point cloud.
         uint64 SampleId = 0;
-        // Sender animation time in seconds (ANARI usd::time). -1 means unknown.
         double SampleTime = -1.0;
         uint64 HashLo = 0;
         uint64 HashHi = 0;
     };
     TMap<FString, TArray<FJUSYNCSampleCacheEntry>> SampleCache;
-    // While the user scrubs, keep only the newest live payload per key in a
-    // one-deep holding map. This freezes the playback ring (so the inspected
-    // frame cannot be evicted) without losing the sample that arrived last.
     TMap<FString, FJUSYNCSampleCacheEntry> PendingLiveSamples;
-    // Cache key -> filename of the last sample that was actually applied live.
-    // A scrub can be several samples behind, so actor identity must not follow
-    // the cached payload's older time mark.
     TMap<FString, FString> SampleCacheLiveFilename;
     int64 SampleCacheBytes = 0;
     int64 SampleCacheEntryCount = 0;
     uint64 NextSampleCacheSerial = 0;
-    // Monotonic playback sequence. Every commit/frame and every timestamp-less
-    // payload gets the next id, so numeric timeline order is arrival order even
-    // when the sender's wall clock jumps backwards or a manual refresh lands
-    // between live frames.
     uint64 NextPlaybackSampleId = 0;
-    // Sender animation time per playback id. The sender packs its ANARI
-    // usd::time (seconds * 1000) into the notification timestamp, so the
-    // dropdown can show the same 0.700 that ParaView shows instead of a
-    // synthetic 1/2/3 counter.
     TMap<uint64, double> SampleTimeById;
 
-    // Newest sender time in the sample cache and the sender-loop latch. Both
-    // are maintained from AddSampleCacheEntry / the notification dedup path.
     double NewestCachedSampleTime = -1.0;
     bool bSenderLoopDetected = false;
-    // Wall-clock stamp of the last loop latch, so a panel that reopens long
-    // after the loop can ignore it and stay live.
     double SenderLoopDetectedSeconds = 0.0;
 
-    /** Flags a sender replay: a frame whose hash was already applied comes in
-        with a dataset time behind the newest cached sample. */
     void ConsiderSenderLoop(const FString& Filename, uint64 SenderTimestamp);
 
-    // Game-thread owner of the pathline state/worker.
     TSharedPtr<FJUSYNCPathlineManager> PathlineManager;
 
-    // One Niagara component per canonical element. The spawner owns the GPU
-    // side: the manager only produces plain ribbon arrays.
     UPROPERTY(Transient)
     TMap<FString, TObjectPtr<UNiagaraComponent>> PathlineComponents;
 
     bool bPathlineSystemWarned = false;
 
-    // Live sample identity is assigned per commit/frame, not per notification:
-    // all files that arrive between two CommitComplete messages share one id,
-    // even if the sender timestamp differs by a few milliseconds.
     uint64 LiveSampleId = 0;
     uint64 LastClosedLiveSampleId = 0;
     bool bLiveSampleFrameClosed = true;
-    // While scrubbing, track the exact cached sample (not just its ring index)
-    // so live appends/evictions do not make Previous/Next jump to another frame.
     uint64 PlaybackAnchorSampleId = 0;
     bool bApplyingCachedSample = false;
 
@@ -975,39 +821,22 @@ private:
     FJUSYNCPathlineSettings BuildPathlineSettings() const;
     void SyncPathlineManager();
 
-    /** Drains finished ribbon arrays and pushes them into Niagara. */
     void SyncPathlineComponents();
 
-    /** Pushes jusync.Pathlines.Glow into MPC_Jusync.PathlineGlow, the scalar
-        every ribbon shares. Cheap once the collection matches the CVar. */
     void EnsurePathlineGlow();
 
-    /** Destroys the component for one element (and its renderer state). */
     void DestroyPathlineComponent(const FString& ElementName);
 
-    /** Destroys every streamline component. */
     void DestroyAllPathlineComponents();
 
-    /** Runtime VertexColor -> BaseColor+Emissive material so baked trail
-        colours survive without scene lighting (editor builds only). */
     UMaterialInterface* CreateEmissiveVertexColorMaterial();
     void AddSampleCacheEntry(const FString& Key, FJUSYNCSampleCacheEntry&& Entry);
     void TrimSampleCache();
 
-    // 2 s cadence re-read of free RAM (dynamic budget). Acts only through
-    // PassesBudgetHysteresis; applies the result to the sample cache and to
-    // the point cloud spawner's warm-replay pool (via its own VRAM query).
     void PollDynamicCacheBudgets(float DeltaSeconds);
 
-    // Effective sample-cache byte ceiling: dynamic value when enabled and
-    // sampled, else the static SampleCacheMaxMB floor.
     int64 GetSampleCacheBudgetBytes() const;
 
-    // Effective per-key sample ring size. Static SampleCacheSize clamp when
-    // the dynamic budget is off; with it on, the BYTE budget is what bounds
-    // memory, so the ring grows to fit (budget / avg cached entry bytes,
-    // max 1024) and a full dataset stays scrubbable instead of pinning the
-    // scrubber at 8 samples.
     int32 GetSampleCacheCountCap() const;
 
     float CacheBudgetAccum = 0.0f;
@@ -1018,8 +847,6 @@ private:
     void ApplyCachedSample(float NormalizedPosition);
     int32 GetMaxSampleCacheCount() const;
     void GetSampleTimeline(TArray<uint64>& OutSampleIds) const;
-    // Sender animation time for one sample id, -1 when unknown. Shared by the
-    // timeline (ordering) and GetCachedSampleTime (display).
     double LookupSampleTime(uint64 InSampleId) const;
     void RefreshPlaybackWindow();
     const FJUSYNCSampleCacheEntry* FindSampleForPlayback(

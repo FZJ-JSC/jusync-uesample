@@ -35,15 +35,7 @@
 
 namespace
 {
-    /**
-     * GLOW drives jusync.Spawner.CloudEmissiveFloor: the cloud's emissive
-     * floor in cd/m^2, not a 0..1 blend factor. Against a scene exposed for
-     * daylight (sun 1e5 lux - the ceiling fixtures need ~400 to read as
-     * white) the old 0..1 mapping sat entirely below the noise floor, so the
-     * handle moved and the cloud did not. Keep the slider normalized and map
-     * it onto 0..PointGlowMax with a squared curve: fine control at the
-     * bottom, a clipped blooming white at the top.
-     */
+
     constexpr float PointGlowMax = 4000.0f;
 
     float PointGlowFromSlider(float Value)
@@ -57,13 +49,6 @@ namespace
         return FMath::Clamp(FMath::Sqrt(FMath::Max(Glow, 0.0f) / PointGlowMax), 0.0f, 1.0f);
     }
 
-    /**
-     * Same idea for the ribbons: jusync.Pathlines.Glow is the emissive
-     * strength MPC_Jusync.PathlineGlow feeds into M_JusyncRibbon, not a 0..1
-     * blend. Trails are thin, so they read as lit long before a cloud does,
-     * but 200 topped out too early for the laser look: 2000 gives the same
-     * squared low-end feel with a full decade of extra headroom.
-     */
     constexpr float PathlineGlowMax = 2000.0f;
 
     float PathlineGlowFromSlider(float Value)
@@ -77,27 +62,12 @@ namespace
         return FMath::Clamp(FMath::Sqrt(FMath::Max(Glow, 0.0f) / PathlineGlowMax), 0.0f, 1.0f);
     }
 
-    /**
-     * Geometry codes from the drawing:
-     *   V1=24  W=360  H=716  H1=60  H2=52  H3=28  H4=40  H6=40
-     *   R1=12  R2=7  R3=6  S1=16  S2=12  S3=8  S7=12
-     * Every runtime measurement below is one of those values, not a new
-     * one-off, so the panel can be checked against the sheet. The header and
-     * the two cards are separate floating surfaces; the container in between
-     * is transparent so the scene shows through the S7 gaps.
-     */
     namespace Theme
     {
         const FLinearColor PanelEdge(1.0f, 1.0f, 1.0f, 0.11f);
         const FLinearColor PanelHeaderFill(0.070f, 0.080f, 0.098f, 0.95f);
-        // The floating surfaces use a smoked tint over a live backbuffer blur.
-        // Keep the alpha low enough that the scene moves through the glass,
-        // but high enough that white labels survive the bright warehouse.
         const FLinearColor GlassTint(0.035f, 0.042f, 0.055f, 0.34f);
         const FLinearColor GlassRim(1.0f, 1.0f, 1.0f, 0.20f);
-        // The pathline card floats over the bright warehouse window, not the
-        // dark floor under the point-cloud card. At 0.26 the blurred window
-        // washed out the muted row labels and hid the white slider tracks.
         const FLinearColor CardFill(0.028f, 0.034f, 0.045f, 0.36f);
         const FLinearColor CardHeaderFill(0.045f, 0.052f, 0.066f, 0.46f);
         const FLinearColor CardEdge(1.0f, 1.0f, 1.0f, 0.18f);
@@ -122,10 +92,6 @@ namespace
 
         constexpr float V1 = 24.0f;
         constexpr float W = 360.0f;
-        // 620 on the sheet held two 207 px cards. The POINT CLOUD card gained a
-        // GLOW row (40 px + 8 px gap) and the PATHLINES card has now gained its
-        // own (same 48 px), so the frame grows by exactly that much both times
-        // and the drawing stays additive rather than re-flowed.
         constexpr float H = 716.0f;
         constexpr float H1 = 60.0f;
         constexpr float H2 = 52.0f;
@@ -140,7 +106,6 @@ namespace
         constexpr float S2 = 12.0f;
         constexpr float S3 = 8.0f;
         constexpr float S4 = 20.0f;
-        // Visible gap between the free header surface and the free cards.
         constexpr float S7 = 12.0f;
         constexpr float LabelWidth = 92.0f;
         constexpr float ValueWidth = 48.0f;
@@ -178,9 +143,6 @@ namespace
             FVector2D(0.0f, 6.0f));
         const FSlateRoundedBoxBrush TrackHover(Theme::SliderTrack * 1.35f, 3.0f,
             FLinearColor::Transparent, 0.0f, FVector2D(0.0f, 6.0f));
-        // Keep the groove readable while a control is inactive. At 0.5x the
-        // empty track vanished over the bright card and only the thumbs read
-        // as stray dots.
         const FSlateRoundedBoxBrush TrackDisabled(Theme::SliderTrack * 0.9f, 3.0f,
             FLinearColor::Transparent, 0.0f, FVector2D(0.0f, 6.0f));
         const FSlateRoundedBoxBrush Thumb(Theme::SliderThumb, 7.0f,
@@ -218,10 +180,6 @@ namespace
         Style.ComboButtonStyle.ButtonStyle = Button;
         Style.ComboButtonStyle.ContentPadding = FMargin(10.0f, 0.0f, 6.0f, 0.0f);
         Style.ComboButtonStyle.DownArrowPadding = FMargin(0.0f, 0.0f, 8.0f, 0.0f);
-        // FComboBoxStyle::GetDefault() borrows the editor's combo-arrow brush.
-        // In a game/PIE context that brush resolves to an opaque white square
-        // on the right of every selector. Use the same runtime chevron as the
-        // LAYERS header instead so the combo rows stay monochrome and legible.
         if (UTexture2D* ArrowTexture = JusyncHUDIcons::GetTexture(
             JusyncHUDIcons::EIcon::ChevronDown))
         {
@@ -267,11 +225,6 @@ namespace
         return Box;
     }
 
-    /**
-     * SBackgroundBlur samples the backbuffer underneath its geometry. Keep the
-     * widget out of hit testing so the controls in the tinted layer remain the
-     * only interactive surfaces.
-     */
     UBackgroundBlur* MakeGlassBlur(UWidgetTree* Tree, float Radius, float Strength)
     {
         UBackgroundBlur* Blur = Tree->ConstructWidget<UBackgroundBlur>(
@@ -304,13 +257,6 @@ namespace
         return Button;
     }
 
-    /**
-     * Slate uses Tab and Shift+Tab for focus navigation. While a control in
-     * this panel owns focus, that navigation consumes the key before the
-     * widget's NativeOnKeyDown can pass it to the transport toggle. Escape
-     * keeps the key bubbling instead, so T still toggles the transport bar
-     * no matter which HUD control was last clicked.
-     */
     void DisableTabNavigation(UWidget* Widget)
     {
         if (!Widget)
@@ -327,10 +273,6 @@ void UJusyncPathlineWidget::BindSpawner(AJUSYNCFileSpawnerActor* InSpawner)
     Spawner = InSpawner;
     EnsureLayoutBuilt();
 
-    // The spawner defaults to fixed screen size, but older levels can carry a
-    // scaling enum of PerNodeAdaptive alongside that override. The combo must
-    // show the mode that actually drives the renderer, otherwise selecting the
-    // mode already displayed looks like a no-op.
     if (Spawner && Spawner->bCloudFixedSize)
     {
         Spawner->PointScaling = EJUSYNCPointScaling::FixedScreenSize;
@@ -491,7 +433,6 @@ void UJusyncPathlineWidget::Close()
 
 void UJusyncPathlineWidget::ApplyReveal()
 {
-    // The card slides in from the right edge, matching its top-right anchor.
     JusyncApplyPanelReveal(Reveal, WidgetTree ? WidgetTree->RootWidget : nullptr,
         FVector2D(16.0f, 0.0f), GlassBlurs);
 }
@@ -546,9 +487,6 @@ void UJusyncPathlineWidget::BuildLayout()
         UCanvasPanel::StaticClass(), TEXT("Root"));
     WidgetTree->RootWidget = Root;
 
-    // The container is intentionally invisible: the header and the two cards
-    // are their own rounded surfaces, separated by S7 so the scene shows
-    // through instead of a third enclosing panel.
     Panel = MakeRoundedBorder(TEXT("Panel"), FLinearColor::Transparent,
         FLinearColor::Transparent, 0.0f, 0.0f);
     Panel->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
@@ -562,8 +500,6 @@ void UJusyncPathlineWidget::BuildLayout()
         UVerticalBox::StaticClass(), TEXT("PanelStack"));
     Panel->AddChild(Stack);
 
-    // Every free surface gets its own blur. The S7 gaps stay outside the
-    // widget, so the scene remains sharp between the header and the cards.
     auto MakeGlassSurface = [this](UWidget* Content, const FLinearColor& Tint,
         const FLinearColor& Rim, float Radius, const FMargin& ContentPadding,
         float Strength) -> UOverlay*
@@ -593,12 +529,8 @@ void UJusyncPathlineWidget::BuildLayout()
         return Surface;
     };
 
-    // Free header surface: LAYERS + active-card count + chevron.
     UHorizontalBox* HeaderRow = WidgetTree->ConstructWidget<UHorizontalBox>(
         UHorizontalBox::StaticClass(), TEXT("LayersHeader"));
-    // Keep the panel title on the same 12 px vertical as the two card titles
-    // and their row labels. S1 still defines the 60 px header height, but the
-    // horizontal inset is S2 once the free cards use S2.
     UOverlay* Header = MakeGlassSurface(HeaderRow, Theme::GlassTint, Theme::GlassRim,
         Theme::R1, FMargin(Theme::S2, 0.0f, Theme::S2, 0.0f), Theme::GlassBlur);
     USizeBox* HeaderBox = MakeSizeBox(WidgetTree, Header, -1.0f, Theme::H1);
@@ -625,7 +557,6 @@ void UJusyncPathlineWidget::BuildLayout()
     ChevronSlot->SetPadding(FMargin(10.0f, 0.0f, 0.0f, 0.0f));
     ChevronSlot->SetVerticalAlignment(VAlign_Center);
 
-    // --------------------------------------------------- PATHLINES CARD
     UVerticalBox* PathlineCardStack = WidgetTree->ConstructWidget<UVerticalBox>(
         UVerticalBox::StaticClass(), TEXT("PathlineCardStack"));
     UOverlay* PathlineCard = MakeGlassSurface(PathlineCardStack, Theme::CardFill,
@@ -692,9 +623,6 @@ void UJusyncPathlineWidget::BuildLayout()
         0.1f, 5.0f, 0.05f, WidthSlider, WidthValueText);
     AddGap(PathlineRows);
 
-    // Self-glow of the ribbons: jusync.Pathlines.Glow, which every trail reads
-    // through MPC_Jusync.PathlineGlow. It sits under WIDTH because the two are
-    // the pair that decides whether a trail reads at all.
     AddSliderRow(PathlineRows, FText::FromString(TEXT("GLOW")), TEXT("PathlineGlowSlider"),
         0.0f, 1.0f, 0.005f, PathlineGlowSlider, PathlineGlowValueText);
     AddGap(PathlineRows);
@@ -762,7 +690,6 @@ void UJusyncPathlineWidget::BuildLayout()
     UVerticalBoxSlot* PathlineCardSlot = Stack->AddChildToVerticalBox(PathlineCard);
     PathlineCardSlot->SetPadding(FMargin(0.0f, Theme::S7, 0.0f, 0.0f));
 
-    // ------------------------------------------------- POINT CLOUD CARD
     UVerticalBox* PointCardStack = WidgetTree->ConstructWidget<UVerticalBox>(
         UVerticalBox::StaticClass(), TEXT("PointCardStack"));
     UOverlay* PointCard = MakeGlassSurface(PointCardStack, Theme::CardFill,
@@ -819,9 +746,6 @@ void UJusyncPathlineWidget::BuildLayout()
         0.001f, 1.0f, 0.001f, PointSizeSlider, PointSizeValueText);
     AddGap(PointRows);
 
-    // Self-glow: jusync.Spawner.CloudEmissiveFloor, pushed to the cloud MIDs.
-    // Unlit clouds are lit entirely by this floor, so 0 reads near-black and 1
-    // clips to white; it belongs next to the size it is usually confused with.
     AddSliderRow(PointRows, FText::FromString(TEXT("GLOW")), TEXT("PointGlowSlider"),
         0.0f, 1.0f, 0.005f, PointGlowSlider, PointGlowValueText);
     AddGap(PointRows);
@@ -1138,10 +1062,6 @@ UComboBoxString* UJusyncPathlineWidget::MakeCombo(const FName Name,
     Combo->SetContentPadding(FMargin(10.0f, 0.0f, 8.0f, 0.0f));
     Combo->SetMaxListHeight(220.0f);
     Combo->SetHasDownArrow(true);
-    // The UMG API only exposes the foreground through InitForegroundColor,
-    // which is protected. Set the backing property before the Slate widget is
-    // built so the selected value uses the same light ink as the rest of the
-    // deck instead of the editor's near-black default.
     PRAGMA_DISABLE_DEPRECATION_WARNINGS
     Combo->ForegroundColor = FSlateColor(Theme::TextPrimary);
     Combo->Font.Size = 10;
@@ -1184,12 +1104,6 @@ void UJusyncPathlineWidget::SetFloatCvar(const TCHAR* Name, float Value)
 {
     if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(Name))
     {
-        // Priority matters: ECVF_SetByConsole > ECVF_SetByCode. Any value typed
-        // at the editor console (or pinned in an ini) therefore swallows a
-        // plain Set(value) from here, the CVar never changes, Refresh reads the
-        // old value back and the slider handle snaps home - it reads as a
-        // frozen control. The panel is the authority, so write at console
-        // priority to match.
         CVar->Set(Value, ECVF_SetByConsole);
     }
 }
@@ -1295,14 +1209,9 @@ void UJusyncPathlineWidget::Refresh()
     {
         WidthValueText->SetText(FText::FromString(FString::Printf(TEXT("%.2fx"), Width)));
     }
-    // Ribbon glow lives in a CVar as well (the collection scalar is the only
-    // place the shared material can read it from), so read it back instead of
-    // echoing the handle: a console set must move the panel too.
     const float PathlineGlow = CurrentFloatCvar(TEXT("jusync.Pathlines.Glow"), 0.1f);
     if (PathlineGlowValueText)
     {
-        // HDR strength: show decimals while the trails are matte, whole
-        // numbers once they are actually emitting.
         PathlineGlowValueText->SetText(FText::FromString(PathlineGlow < 10.0f
             ? FString::Printf(TEXT("%.3f"), PathlineGlow)
             : FString::Printf(TEXT("%.0f"), PathlineGlow)));
@@ -1319,13 +1228,9 @@ void UJusyncPathlineWidget::Refresh()
     {
         PointSizeValueText->SetText(FText::FromString(FString::Printf(TEXT("%.3f"), PointSize)));
     }
-    // The glow lives in a CVar, not on the spawner, so read it back rather than
-    // echoing the slider: typing the command must move the panel too.
     const float PointGlow = CurrentFloatCvar(TEXT("jusync.Spawner.CloudEmissiveFloor"), 0.004f);
     if (PointGlowValueText)
     {
-        // The CVar is HDR: show decimals while it is a floor, whole numbers
-        // once the cloud is actually glowing.
         PointGlowValueText->SetText(FText::FromString(PointGlow < 10.0f
             ? FString::Printf(TEXT("%.3f"), PointGlow)
             : FString::Printf(TEXT("%.0f"), PointGlow)));
@@ -1531,9 +1436,6 @@ void UJusyncPathlineWidget::HandlePathlineGlowChanged(float Value)
         return;
     }
 
-    // The handle is normalized; the CVar is HDR emissive (see
-    // PathlineGlowFromSlider). The spawner pushes it into the collection on
-    // its next tick, so the trails pick it up immediately.
     SetFloatCvar(TEXT("jusync.Pathlines.Glow"), PathlineGlowFromSlider(Value));
     Refresh();
 }
@@ -1545,10 +1447,6 @@ void UJusyncPathlineWidget::SyncPointCloudFixedSizeMode()
         return;
     }
 
-    // The spawner's fixed-screen-size CVar is a streamed-cloud safety default,
-    // but it forces ScalingMethod to FixedScreenSize and makes the SCALING
-    // combo inert. Treat the panel as authoritative: keep the override only
-    // while the user has selected SCREEN.
     const bool bFixedScreenSize =
         Spawner->PointScaling == EJUSYNCPointScaling::FixedScreenSize;
     if (Spawner->bCloudFixedSize != bFixedScreenSize)
@@ -1564,9 +1462,6 @@ void UJusyncPathlineWidget::HandlePointSizeChanged(float Value)
     {
         return;
     }
-    // Upper bound matches ULidarPointCloudComponent's own default (1.0) so the
-    // panel can reach the whole native range instead of stopping at the old
-    // 0.2 ceiling.
     Spawner->PointCloudSize = FMath::Clamp(Value, 0.001f, 1.0f);
     SyncPointCloudFixedSizeMode();
     Spawner->ApplyPointCloudDisplaySettings();
@@ -1580,13 +1475,9 @@ void UJusyncPathlineWidget::HandlePointGlowChanged(float Value)
         return;
     }
 
-    // The handle is normalized; the CVar is HDR light (see PointGlowFromSlider).
     const float Glow = PointGlowFromSlider(FJusyncPathlineHUDModel::ClampPointGlow(Value));
     SetFloatCvar(TEXT("jusync.Spawner.CloudEmissiveFloor"), Glow);
 
-    // The spawner pushes the CVar into each cloud's MID on its sizing tick.
-    // Re-apply here as well so a drag changes the picture on the same frame;
-    // without a bound spawner the CVar alone still governs the next cloud.
     if (Spawner)
     {
         Spawner->ApplyPointCloudDisplaySettings();
@@ -1703,8 +1594,6 @@ void UJusyncPathlineWidget::HandlePointHueSelected(FString SelectedItem,
         }
     }
 
-    // Repaint the displayed clouds now; SetPointHueFilter also re-applies to
-    // every frame swapped in later.
     Spawner->UpdatePointCloudHueFilter();
     Refresh();
 }

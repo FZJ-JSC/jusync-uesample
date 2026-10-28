@@ -31,16 +31,10 @@
 
 namespace
 {
-    /**
-     * The visual language is the same dark glass as the rest of the runtime
-     * HUD. Geometry comes from the dimensional drawing: V1 = 24, H7 = 72,
-     * H8 = 44, R1 = 12, R2 = 7, R3 = 6, Z1 = 40.
-     */
+
     namespace Theme
     {
         const FLinearColor PanelEdge(1.0f, 1.0f, 1.0f, 0.18f);
-        // Smoked glass: the live scene comes through the backbuffer blur, but
-        // the tint stays dark enough for the white transport labels.
         const FLinearColor PanelFill(0.030f, 0.035f, 0.045f, 0.30f);
         const FLinearColor Divider(1.0f, 1.0f, 1.0f, 0.16f);
 
@@ -57,8 +51,6 @@ namespace
         const FLinearColor ChipHover(0.220f, 0.250f, 0.295f, 1.00f);
         const FLinearColor ChipPressed(0.200f, 0.450f, 0.850f, 1.00f);
         const FLinearColor ChipDisabled(0.100f, 0.110f, 0.130f, 0.45f);
-        // The LIVE chip is glass, not an opaque well: it lets the blurred bar
-        // and scene through, while a faint rim keeps its 84 px boundary clear.
         const FLinearColor LiveChipIdle(0.120f, 0.140f, 0.180f, 0.34f);
         const FLinearColor LiveChipHover(0.170f, 0.200f, 0.250f, 0.48f);
         const FLinearColor LiveChipPressed(0.210f, 0.250f, 0.310f, 0.58f);
@@ -66,8 +58,6 @@ namespace
         const FLinearColor GlassRim(1.0f, 1.0f, 1.0f, 0.16f);
         const FLinearColor WellFill(0.025f, 0.030f, 0.040f, 0.92f);
         const FLinearColor WellEdge(1.0f, 1.0f, 1.0f, 0.07f);
-        // The scrub track sits on bright warehouse glass; at 0.18 it vanished
-        // into the bar and only the thumb read as a stray dot.
         const FLinearColor SliderTrack(1.0f, 1.0f, 1.0f, 0.30f);
         const FLinearColor SliderThumb(0.88f, 0.92f, 1.00f, 1.0f);
 
@@ -81,9 +71,7 @@ namespace
         constexpr float R3 = 6.0f;
         constexpr float HUDBlur = 10.0f;
         constexpr float TransportBlur = 12.0f;
-        /** FILES/TRACKS are gone; 86 px of content between 12 px gutters. */
         constexpr float HUDWidth = 110.0f;
-        /** The transport is a centred deck, not an edge-to-edge dock. */
         constexpr float TransportWidth = 960.0f;
 
         constexpr float TitleSize = 11.0f;
@@ -143,8 +131,6 @@ namespace
             FLinearColor(0.0f, 0.0f, 0.0f, 0.25f), 1.0f, FVector2D(14.0f, 14.0f));
         const FSlateRoundedBoxBrush ThumbHover(FLinearColor(1.0f, 1.0f, 1.0f, 1.0f), 7.0f,
             FLinearColor(0.0f, 0.0f, 0.0f, 0.25f), 1.0f, FVector2D(14.0f, 14.0f));
-        // A dark disabled thumb read as a hole in the scrub bar. Keep it
-        // visibly grey so the one-sample scrubber still reads as a control.
         const FSlateRoundedBoxBrush ThumbDisabled(FLinearColor(0.80f, 0.84f, 0.90f, 0.65f), 7.0f,
             FLinearColor::Transparent, 0.0f, FVector2D(14.0f, 14.0f));
 
@@ -173,11 +159,6 @@ namespace
         return Box;
     }
 
-    /**
-     * The blur is a sibling behind the tinted border, not a child. Slate
-     * samples the backbuffer under the widget, so keeping it in a lower canvas
-     * layer leaves the rounded border and its controls crisp.
-     */
     UBackgroundBlur* MakeGlassBlur(UWidgetTree* Tree, float Radius, float Strength)
     {
         UBackgroundBlur* Blur = Tree->ConstructWidget<UBackgroundBlur>(
@@ -225,9 +206,6 @@ namespace
             Theme::ChipPressed, Theme::ChipDisabled, 8.0f));
         Button->SetClickMethod(EButtonClickMethod::Type::PreciseClick);
 
-        // Absolute 84 px composition: 15 px edge + 13 px dot + 5 px gap +
-        // 36 px caption + 15 px edge. A canvas keeps each edge fixed instead
-        // of letting the button's content slot or text advance shift the row.
         UCanvasPanel* Content = Tree->ConstructWidget<UCanvasPanel>(
             UCanvasPanel::StaticClass(), NAME_None);
 
@@ -260,12 +238,6 @@ namespace
         return Button;
     }
 
-    /**
-     * Scrub position for a cached timeline index. The spawner treats any
-     * position at or above 0.999 as "live edge" and leaves playback mode, so
-     * the newest cached frame is requested just under that threshold and the
-     * spawner rounds it back to the same index.
-     */
     float ScrubPositionForIndex(int32 Index, int32 Count)
     {
         if (Count <= 1)
@@ -288,11 +260,7 @@ void UJusyncPlaybackWidget::BindSpawner(AJUSYNCFileSpawnerActor* InSpawner)
 
 namespace
 {
-    /**
-     * Keep Tab and Shift+Tab from being eaten by Slate focus navigation while
-     * a transport control is focused, so the panel widget can still receive
-     * the toggle key and close the transport.
-     */
+
     void DisableTabNavigation(UWidget* Widget)
     {
         if (!Widget)
@@ -303,25 +271,15 @@ namespace
         Widget->SetNavigationRuleBase(EUINavigation::Previous, EUINavigationRule::Escape);
     }
 
-    /** Last window this panel pushed, so the idle guard in NativeTick does not
-     *  write the console variable on every frame. */
     int32 GPlaybackMorphWindowMs = 0;
 
-    /**
-     * Playback morph handshake. jusync.Morph.CloudBlendMs is the window the
-     * streamer morphs the displayed cloud over; the panel opens it while the
-     * cached animation runs so consecutive frames glide into each other, and
-     * closes it (0) for scrubs, single steps and LIVE, where a hard snapshot is
-     * what the user asked for. 800/FPS leaves the tail of the frame for the
-     * deferred cloud swap to land before the next frame starts.
-     */
     void SetPlaybackMorphWindow(float FramesPerSecond)
     {
         const float Fps = FMath::Clamp(FramesPerSecond, 1.0f, 240.0f);
         const int32 BlendMs = FMath::Clamp(FMath::RoundToInt(800.0f / Fps), 8, 4000);
         if (BlendMs == GPlaybackMorphWindowMs)
         {
-            return; // already pushed; the tick re-asserts every frame
+            return;
         }
         if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(
                 TEXT("jusync.Morph.CloudBlendMs")))
@@ -411,8 +369,6 @@ void UJusyncPlaybackWidget::Open()
 {
     EnsureLayoutBuilt();
 
-    // A collapsed widget does not tick, so show it first and let the first
-    // reveal step start from alpha 0 on the same frame instead of flashing.
     SetVisibility(ESlateVisibility::SelfHitTestInvisible);
     Reveal.Show();
     ApplyReveal();
@@ -426,7 +382,6 @@ void UJusyncPlaybackWidget::Close()
         return;
     }
 
-    // Keep the widget visible (and ticking) until the fade has finished.
     Reveal.Hide();
     ApplyReveal();
 }
@@ -457,21 +412,7 @@ void UJusyncPlaybackWidget::NativeTick(const FGeometry& MyGeometry, float InDelt
         }
     }
 
-    // A sender that replays its clip never produces a new live frame: every
-    // notification carries an already-applied hash, so the live diff reports
-    // "0 changed, 0 new" and the scene would sit on the last sample forever.
-    // Take the loop over: start walking the cached timeline (and its pathline
-    // display cutoff) so the morph and the ribbon tips keep running.
-    //
-    // The latch is read through the function map: Live Coding patches the
-    // JUSYNC module in place, so the project module cannot link a symbol that
-    // was added after the editor started.
     const double NowSeconds = FPlatformTime::Seconds();
-    // A collapsed panel (T) does not tick, so the latch keeps filling while
-    // the HUD is closed. Opening it must not yank the view out of live mode:
-    // the tick gap tells us the panel was hidden, the latch is discarded, and
-    // the automatic sender-loop takeover is parked until the user asks for
-    // playback (PLAY) - a panel opening is not a transport command.
     const bool bFirstTick = LastWidgetTickSeconds <= 0.0;
     const bool bWidgetWasTicking = !bFirstTick
         && (NowSeconds - LastWidgetTickSeconds) < 0.35;
@@ -517,11 +458,6 @@ void UJusyncPlaybackWidget::NativeTick(const FGeometry& MyGeometry, float InDelt
 
         if (bSenderLooped && !bWidgetWasTicking)
         {
-            // The loop was detected while the panel was closed (or before this
-            // panel existed). Opening the HUD is not a transport command: stay
-            // live instead of cutting to the oldest cached sample. The next
-            // loop that arrives while the panel is open takes over seamlessly
-            // from the frame that is already on screen.
             UE_LOG(LogTemp, Display,
                 TEXT("JUSYNC playback HUD: opened with a sender-loop signal pending - staying live"));
             bSenderLooped = false;
@@ -529,15 +465,12 @@ void UJusyncPlaybackWidget::NativeTick(const FGeometry& MyGeometry, float InDelt
 
         if (bSenderLooped && !bCachedPlaybackRunning && !bAutoLoopPlaybackSuppressed)
         {
-            StartCachedPlaybackFrom(/*bFromLiveEdge=*/true);
+            StartCachedPlaybackFrom( true);
         }
     }
 
     TickCachedPlayback(InDeltaTime);
 
-    // The morph window belongs to the running animation only: if playback was
-    // stopped from anywhere we did not route through (panel closed, PIE ending,
-    // frame count collapsing), restore exact per-frame snapshots for live data.
     if (!bCachedPlaybackRunning && GPlaybackMorphWindowMs != 0)
     {
         ClearPlaybackMorphWindow();
@@ -562,21 +495,14 @@ void UJusyncPlaybackWidget::StartCachedPlaybackFrom(bool bFromLiveEdge)
 
     if (bFromLiveEdge)
     {
-        // The scene is already showing the newest live sample. Taking over at
-        // the live edge means the first cached frame is the one on screen, so
-        // opening the transport does not cut back to frame 1; the walk then
-        // advances and wraps at the same point the sender loops.
         SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
         Spawner->SetPlaybackPosition(0.998f);
     }
     else
     {
-        // Jumping back to the oldest frame is a cut, not a transition.
         ClearPlaybackMorphWindow();
         Spawner->SetPlaybackPosition(0.0f);
 
-        // Frames advance on the morph window from here on: the cloud glides for
-        // most of the frame and the deferred swap lands in the tail.
         SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
     }
 
@@ -601,8 +527,6 @@ void UJusyncPlaybackWidget::TickCachedPlayback(float DeltaSeconds)
     }
 
     const float FrameTime = 1.0f / FMath::Clamp(Spawner->TimeStepPlaybackFPS, 1.0f, 240.0f);
-    // The rate buttons can change the playback FPS mid-loop; keep the morph
-    // window matched to the frame the panel is actually drawing.
     SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
     int32 Index = FMath::Clamp(Spawner->GetPlaybackSampleIndex(), 0, Count - 1);
     bool bAdvanced = false;
@@ -674,7 +598,6 @@ void UJusyncPlaybackWidget::BuildLayout()
         return Blur;
     };
 
-    // ---------------------------------------------------------------- HUD
     AddGlassBlur(Theme::R1, Theme::HUDBlur, FAnchors(0.0f, 0.0f, 0.0f, 0.0f),
         FVector2D(0.0f, 0.0f), FVector2D(Theme::V1, Theme::V1),
         FVector2D(Theme::HUDWidth, Theme::H8));
@@ -692,10 +615,6 @@ void UJusyncPlaybackWidget::BuildLayout()
         UHorizontalBox::StaticClass(), TEXT("HUD"));
     HUDPanel->AddChild(HUD);
 
-    // Compact live-status pill: dot + state only. FILES and TRACKS were
-    // diagnostic readouts, not transport information, so they no longer
-    // consume half of the HUD. The state group is centred so LIVE does not
-    // sit against the left edge of a shortened pill.
     auto AddHUDSpacer = [this, HUD]()
     {
         USpacer* Spacer = WidgetTree->ConstructWidget<USpacer>(
@@ -725,7 +644,6 @@ void UJusyncPlaybackWidget::BuildLayout()
 
     AddHUDSpacer();
 
-    // ----------------------------------------------------------- TRANSPORT
     AddGlassBlur(Theme::R1, Theme::TransportBlur, FAnchors(0.5f, 1.0f, 0.5f, 1.0f),
         FVector2D(0.5f, 1.0f), FVector2D(0.0f, -Theme::V1),
         FVector2D(Theme::TransportWidth, Theme::H7));
@@ -742,7 +660,6 @@ void UJusyncPlaybackWidget::BuildLayout()
         UHorizontalBox::StaticClass(), TEXT("TransportRow"));
     TransportBar->AddChild(Bar);
 
-    // Left: four 40 px transport buttons, 8 px apart.
     UHorizontalBox* Buttons = WidgetTree->ConstructWidget<UHorizontalBox>(
         UHorizontalBox::StaticClass(), TEXT("TransportButtons"));
     UHorizontalBoxSlot* ButtonsSlot = Bar->AddChildToHorizontalBox(Buttons);
@@ -772,18 +689,13 @@ void UJusyncPlaybackWidget::BuildLayout()
         JusyncHUDIcons::EIcon::Live, FText::FromString(TEXT("LIVE")),
         LOCTEXT("LiveTip", "Stop the playback and follow the live edge of the stream"),
         13.0f, 9.5f);
-    // Glass chip: translucent fill plus a faint rim, distinct from the opaque
-    // step wells but still part of the same neutral transport family.
     LiveButton->SetStyle(MakeLiveButtonStyle());
 
     AddTransportButton(PrevButton, false);
     AddTransportButton(PlayPauseButton, false);
     AddTransportButton(NextButton, false);
-    // 84 px gives the dot, its 5 px gap, the caption and 12 px side padding
-    // room to breathe; at 72 px the label sat against the rounded edge.
     AddTransportButton(LiveButton, true, 84.0f);
 
-    // Middle: step label + sender time over the scrubber.
     UVerticalBox* Middle = WidgetTree->ConstructWidget<UVerticalBox>(
         UVerticalBox::StaticClass(), TEXT("TransportMiddle"));
     UHorizontalBoxSlot* MiddleSlot = Bar->AddChildToHorizontalBox(Middle);
@@ -818,25 +730,17 @@ void UJusyncPlaybackWidget::BuildLayout()
     UVerticalBoxSlot* ScrubSlot = Middle->AddChildToVerticalBox(ScrubBox);
     ScrubSlot->SetHorizontalAlignment(HAlign_Fill);
 
-    // Right: step counter, rate stepper, loop switch.
     UHorizontalBox* Right = WidgetTree->ConstructWidget<UHorizontalBox>(
         UHorizontalBox::StaticClass(), TEXT("TransportRight"));
     UHorizontalBoxSlot* RightSlot = Bar->AddChildToHorizontalBox(Right);
     RightSlot->SetVerticalAlignment(VAlign_Center);
 
-    // Slight right bias in the padding corrects the font's left side bearing
-    // so the counter's ink, not just its advance box, sits on the well axis.
     UBorder* CountWell = MakeRoundedBorder(NAME_None, Theme::WellFill, Theme::WellEdge,
         4.0f, 1.0f, FMargin(4.0f, 0.0f, 12.0f, 0.0f));
     StepCountText = MakeLabel(TEXT("StepCountText"), FText::FromString(TEXT("---/---")));
     StyleLabel(StepCountText, Theme::ValueSize, Theme::TextPrimary);
     StepCountText->SetJustification(ETextJustify::Center);
-    // Fill the 96 px interior (112 px well minus its 16 px total inset) so the
-    // counter is centred on the well axis rather than on its text advance.
     StepCountText->SetMinDesiredWidth(96.0f);
-    // The border's default slot packs the text to the left; centre the text
-    // block inside the well so the counter reads 001/001 on the same axis as
-    // the rate and loop controls.
     if (UBorderSlot* CountTextSlot = Cast<UBorderSlot>(CountWell->AddChild(StepCountText)))
     {
         CountTextSlot->SetPadding(FMargin(0.0f));
@@ -897,10 +801,6 @@ void UJusyncPlaybackWidget::BuildLayout()
     UVerticalBoxSlot* LoopSlot = LoopStack->AddChildToVerticalBox(LoopBox);
     LoopSlot->SetHorizontalAlignment(HAlign_Center);
 
-    // The dimensional drawing specifies the loop cluster as a pill switch
-    // with a plain centred caption. A tiny circular-arrow glyph at 10 px read
-    // as a stray "C", so keep this cluster label-only and let the switch carry
-    // the state.
     UTextBlock* LoopLabel = MakeLabel(TEXT("LoopLabel"), FText::FromString(TEXT("LOOP")));
     StyleLabel(LoopLabel, 9.5f, Theme::TextMuted);
     LoopLabel->SetJustification(ETextJustify::Center);
@@ -909,9 +809,6 @@ void UJusyncPlaybackWidget::BuildLayout()
     LoopLabelSlot->SetPadding(FMargin(0.0f, 1.0f, 0.0f, 0.0f));
 
     UHorizontalBoxSlot* LoopStackSlot = Right->AddChildToHorizontalBox(LoopStack);
-    // The drawing centres the switch on the bar centreline and hangs the
-    // caption below it. The old centred 20+2+label stack put the switch 7 px
-    // high and left the caption tight to the bottom edge.
     LoopStackSlot->SetPadding(FMargin(0.0f, 13.0f, 0.0f, 0.0f));
     LoopStackSlot->SetVerticalAlignment(VAlign_Center);
 
@@ -934,9 +831,6 @@ UButton* UJusyncPlaybackWidget::MakeButton(const FName Name, const FText& Label,
         Theme::ChipDisabled, 8.0f));
     Button->SetClickMethod(EButtonClickMethod::Type::PreciseClick);
 
-    // NAME_None on purpose: ConstructWidget renames every widget into the
-    // WidgetTree under its name, and a caption reusing the button's name would
-    // try to replace the UButton with a UTextBlock.
     UTextBlock* Caption = MakeLabel(NAME_None, Label);
     StyleLabel(Caption, FontSize, Theme::TextPrimary);
     Caption->SetJustification(ETextJustify::Center);
@@ -1052,9 +946,6 @@ void UJusyncPlaybackWidget::Refresh()
         }
         else if (Count > 0)
         {
-            // Match the transport LIVE chip: the dot carries the live state,
-            // while the caption stays neutral white. Green text in the status
-            // pill made the two live indicators disagree.
             StateLabel = TEXT("LIVE");
             StateColor = Theme::TextPrimary;
             DotColor = Theme::Live;
@@ -1140,10 +1031,6 @@ void UJusyncPlaybackWidget::Refresh()
     }
     if (LiveButton)
     {
-        // Keep the chip neutral and use only the dot for the live state. A
-        // green caption on a special chip still read as a green pill at
-        // transport scale, so "LIVE" stays white and the indicator dot alone
-        // changes colour.
         LiveButton->SetIsEnabled(true);
         LiveButton->SetRenderOpacity(1.0f);
         const bool bLiveState = Spawner && bLive && Count > 0;
@@ -1160,8 +1047,6 @@ void UJusyncPlaybackWidget::Refresh()
                 LiveLabel->SetColorAndOpacity(LiveCaption);
             }
         }
-        // UButton::ColorAndOpacity tints the chip brush as well as the child
-        // content, so keep it white and tint only the glyph and caption above.
         LiveButton->SetColorAndOpacity(FLinearColor::White);
     }
     if (PlayPauseButton)
@@ -1169,9 +1054,6 @@ void UJusyncPlaybackWidget::Refresh()
         const bool bCanFreeze = Spawner && Spawner->bEnableSampleCache && Count > 0;
         PlayPauseButton->SetIsEnabled(bCanFreeze);
         PlayPauseButton->SetRenderOpacity(bCanFreeze ? 1.0f : 0.45f);
-        // Keep the transport chip monochrome. Tinting the whole button green
-        // while the cached animation runs recreates the pale pill that the
-        // LIVE button had, so only the play/pause glyph changes.
         PlayPauseButton->SetColorAndOpacity(FLinearColor::White);
     }
     if (PlayPauseIcon)
@@ -1195,7 +1077,6 @@ void UJusyncPlaybackWidget::HandleSliderChanged(float Value)
         return;
     }
 
-    // A drag is a scrub: snap to the exact cached frame, no glide.
     ClearPlaybackMorphWindow();
     Spawner->SetPlaybackPosition(Value);
     bCachedPlaybackRunning = false;
@@ -1244,8 +1125,6 @@ void UJusyncPlaybackWidget::HandleLiveClicked()
         bCachedPlaybackRunning = false;
         CachedPlaybackAccumulator = 0.0f;
         ClearPlaybackMorphWindow();
-        // LIVE is an explicit "show me the newest frame" request, so opt out of
-        // the sender-loop takeover until PLAY is pressed again.
         bAutoLoopPlaybackSuppressed = true;
         Spawner->FollowLatestSample();
         Refresh();
@@ -1264,8 +1143,6 @@ void UJusyncPlaybackWidget::HandlePlayPauseClicked()
         bCachedPlaybackRunning = false;
         CachedPlaybackAccumulator = 0.0f;
         ClearPlaybackMorphWindow();
-        // Stay parked where the user stopped it: do not let the sender-loop
-        // takeover restart playback until PLAY is pressed again.
         bAutoLoopPlaybackSuppressed = true;
         Refresh();
         return;
@@ -1277,20 +1154,15 @@ void UJusyncPlaybackWidget::HandlePlayPauseClicked()
         return;
     }
 
-    // Following live, or parked on the newest frame, restarts at the oldest
-    // cached sample; anywhere else the playback resumes from the frame shown.
     const int32 Index = FMath::Clamp(Spawner->GetPlaybackSampleIndex(), 0, Count - 1);
     if (!Spawner->IsPlayingCachedSample() || Index >= Count - 1)
     {
-        // Jumping back to the oldest frame is a cut, not a transition.
         ClearPlaybackMorphWindow();
         Spawner->SetPlaybackPosition(0.0f);
     }
 
     bAutoLoopPlaybackSuppressed = false;
 
-    // Frames advance on the morph window from here on: the cloud glides for
-    // most of the frame and the deferred swap lands in the tail.
     SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
 
     CachedPlaybackAccumulator = 0.0f;
@@ -1330,8 +1202,6 @@ void UJusyncPlaybackWidget::HandleLoopClicked()
 {
     if (Spawner)
     {
-        // The playback loop reads this flag on every step, so flipping it
-        // takes effect at the next frame boundary.
         Spawner->bLoopTimeStepAnimation = !Spawner->bLoopTimeStepAnimation;
         Refresh();
     }

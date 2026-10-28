@@ -116,8 +116,6 @@ float FJusyncPathlineHUDModel::ClampPointGlow(float Value)
 
 float FJusyncPathlineHUDModel::StepPointGlow(float Current, int32 Direction)
 {
-    // Cloud emissive floor lives near 0.004 - coarse 0.05 steps would snap
-    // it off/on, so the POINTS stepper uses fine increments.
     return ClampPointGlow(Current + 0.005f * FMath::Sign(static_cast<float>(Direction)));
 }
 

@@ -13,9 +13,6 @@
 
 namespace
 {
-    /** Hiding a panel that owns the keyboard focus (caret in one of its text
-     *  boxes) used to leave focus trapped inside an invisible widget: the
-     *  focused-path key routing died with it and the other panel looked dead. */
     void ReleaseFocusIfInside(const UUserWidget* Widget)
     {
         if (Widget && FSlateApplication::IsInitialized()
@@ -39,9 +36,6 @@ void AJusyncPlaybackHUDPlayerController::TogglePanel()
 	{
 		ReleaseFocusIfInside(PlaybackWidget);
 	}
-	// SelfHitTestInvisible: the widget itself fills the viewport, so a plain
-	// Visible root would swallow mouse clicks over the whole screen - that is
-	// why opening one panel made the other panel's buttons unclickable.
 	if (bPanelVisible)
 	{
 		PlaybackWidget->Open();
@@ -85,8 +79,6 @@ void AJusyncPlaybackHUDPlayerController::TogglePathlinePanel()
 
 void AJusyncPlaybackHUDPlayerController::ApplyPanelInputMode()
 {
-	// Either panel needs the cursor; game input is only interrupted while at
-	// least one of them is open.
 	const bool bAnyVisible = bPanelVisible || bPathlinePanelVisible;
 	SetShowMouseCursor(bAnyVisible);
 
@@ -155,9 +147,6 @@ void AJusyncPlaybackHUDPlayerController::BeginPlay()
 		UE_LOG(LogTemp, Warning, TEXT("JUSYNC pathline panel: widget creation failed"));
 	}
 
-	// The legend is the only always-on HUD surface: it lists the two toggle
-	// keys from level start, at a Z below both panels so opening a panel draws
-	// over it rather than the other way round.
 	const TSubclassOf<UJusyncShortcutHintWidget> HintClass = ShortcutHintClass
 		? ShortcutHintClass
 		: TSubclassOf<UJusyncShortcutHintWidget>(UJusyncShortcutHintWidget::StaticClass());
@@ -233,10 +222,6 @@ bool AJusyncPlaybackHUDPlayerController::HandlePanelToggleKey(const FKey& Key, b
 		return false;
 	}
 
-	// The pre-input hook, the focused widget and the controller input path can
-	// all see one physical key press. The pre-input hook runs first and records
-	// the frame; the later paths acknowledge that same press without toggling
-	// again. A fresh press on a later frame still toggles normally.
 	if (!bFromPreInput
 		&& Key == PreInputHandledKey
 		&& GFrameCounter == PreInputHandledFrame)
@@ -263,8 +248,6 @@ bool AJusyncPlaybackHUDPlayerController::HandlePanelToggleKey(const FKey& Key, b
 
 bool AJusyncPlaybackHUDPlayerController::InputKey(const FInputKeyEventArgs& Params)
 {
-	// Reached only while NO panel widget holds keyboard focus; when one does,
-	// the same toggles arrive through that widget's NativeOnKeyDown instead.
 	if (Params.Event == IE_Pressed && HandlePanelToggleKey(Params.Key))
 	{
 		return true;
@@ -275,7 +258,4 @@ bool AJusyncPlaybackHUDPlayerController::InputKey(const FInputKeyEventArgs& Para
 
 AJusyncPlaybackHUDPlayerController::AJusyncPlaybackHUDPlayerController()
 {
-	// The transport is a presentation tool: it must be reachable while the
-	// sender is streaming, so it is created up front and stays hidden until
-	// the toggle key is pressed.
 }

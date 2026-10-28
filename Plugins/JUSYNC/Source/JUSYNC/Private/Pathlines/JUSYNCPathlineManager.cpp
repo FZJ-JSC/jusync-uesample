@@ -54,9 +54,6 @@ namespace
 	struct FElementState
 	{
 		TMap<FPathlineKey, FPathlineTrack> Tracks;
-		// One previous-sample key set per source rank. Ranks arrive as separate
-		// clouds for the same logical sample, so a global set would mark the
-		// other ranks' tracks as gaps.
 		TMap<int32, TSet<FPathlineKey>> PreviousKeysByRank;
 		TArray<FColor> Lut;
 		uint64 SampleCounter = 0;
@@ -152,9 +149,6 @@ namespace
 		return static_cast<uint64>(static_cast<uint32>(Index));
 	}
 
-	// Ramp used when the stream carries no gradient file (RawGeo-only senders
-	// like ParaView never ship a .png LUT, but their scalar attribute still
-	// deserves colours instead of a flat white tube).
 	const TArray<FColor>& DefaultScalarLut()
 	{
 		static const TArray<FColor> Ramp = []
@@ -183,16 +177,12 @@ namespace
 		return Ramp;
 	}
 
-	// Hue distance on the 0-360 wheel, wrapping through red.
 	float HueDistance(float HueA, float HueB)
 	{
 		const float Delta = FMath::Abs(HueA - HueB);
 		return FMath::Min(Delta, 360.0f - Delta);
 	}
 
-	// Hue in degrees (0-360) and saturation (0-1) of a linear RGB colour.
-	// Engine ColorToHSV does not exist on FLinearColor, and the hue picker
-	// needs the float-precision colour straight from the LUT.
 	void RgbToHS(const FLinearColor& Color, float& OutHue, float& OutSaturation)
 	{
 		const float Max = FMath::Max3(Color.R, Color.G, Color.B);
@@ -232,8 +222,6 @@ namespace
 		{
 			return Flat;
 		}
-		// Prefer the colour the point cloud itself renders with; the scalar
-		// + LUT path is only the fallback for clouds that carry no colours.
 		if (Node.bHasColor)
 		{
 			return Node.Color;
@@ -287,9 +275,6 @@ struct FJUSYNCPathlineManager::FImpl
 	bool bResampleRequested = false;
 	bool bRebuildQueued = false;
 
-	// Ribbon tip smoothing while the playback cutoff advances. The newest node
-	// glides toward the next sample's position over TipBlendSeconds so the trail
-	// follows the cloud morph instead of snapping one frame at a time.
 	float TipBlendSeconds = 0.0f;
 	float TipBlendAlpha = 0.0f;
 	double TipBlendStartSeconds = 0.0;
@@ -333,8 +318,6 @@ struct FJUSYNCPathlineManager::FImpl
 		}
 
 		FElementState& Element = Elements.FindOrAdd(ElementName);
-		// A logical sample can span multiple rank clouds. Advance the absence
-		// clock and retain the last sample id only when the sample id changes.
 		if (!Element.bHasSample)
 		{
 			Element.bHasSample = true;
@@ -351,8 +334,6 @@ struct FJUSYNCPathlineManager::FImpl
 		TMap<FPathlineKey, FSamplePoint> Current;
 		Current.Reserve(Cloud->PointCount);
 
-		// VTK exporters rename arrays (particle_id -> vtk_particle_id); resolve
-		// once per sample so the per-point loop below keeps exact-name cost.
 		const FString IdAttribute =
 			FJUSYNCPathlineManager::ResolveAttributeName(*Cloud, Settings.IdAttribute);
 		const FString ScalarAttribute =
@@ -373,10 +354,6 @@ struct FJUSYNCPathlineManager::FImpl
 			FSamplePoint Point;
 			Point.Position = Cloud->GetPosition(PointIndex);
 			Point.Width = Cloud->GetWidth(PointIndex);
-			// Carry the colour the point actually renders with, when the
-			// parser baked one into the cloud. LidarPoints colours are NOT
-			// trustworthy here: the component build colours a copy and the
-			// raw default is white, which would silently beat the LUT path.
 			Point.bHasColor = false;
 			if (Cloud->bHasColors && Cloud->Colors.IsValidIndex(PointIndex))
 			{
@@ -394,9 +371,6 @@ struct FJUSYNCPathlineManager::FImpl
 		}
 		Stats.DuplicateIds += Duplicates;
 
-		// One-shot colour-pipeline probe: says whether the scalar attribute
-		// arrived and which LUT colours will be baked into trails. This is
-		// what distinguishes "no scalar" from "bad LUT" for white trails.
 		static std::atomic<bool> bScalarDiagLogged{ false };
 		if (!bScalarDiagLogged.exchange(true))
 		{
@@ -437,9 +411,6 @@ struct FJUSYNCPathlineManager::FImpl
 				*LutFirst, *LutMid, Verdict);
 		}
 
-		// Expire tracks before selection so vacant slots can be reused this
-		// sample. Only the rank that just emitted can prove an id is absent;
-		// a rank cloud that has not arrived yet must not age its tracks.
 		const int32 ExpirySamples = FMath::Max(0, Settings.TrackExpirySamples);
 		for (auto It = Element.Tracks.CreateIterator(); It; ++It)
 		{
@@ -483,7 +454,6 @@ struct FJUSYNCPathlineManager::FImpl
 		int32 SelectCount = FMath::Min(FMath::Max(0, Settings.MaxTracks), Candidates.Num());
 		if (Settings.MaxNodes > 0)
 		{
-			// A drawable track needs at least two nodes.
 			const int32 BudgetTracks = Settings.MaxNodes / 2;
 			SelectCount = FMath::Min(SelectCount, BudgetTracks);
 		}
@@ -510,8 +480,6 @@ struct FJUSYNCPathlineManager::FImpl
 					Track.Nodes.Last().SampleId == SampleId;
 				if (bSameSample)
 				{
-					// A delayed re-delivery of the same committed sample must
-					// replace the node instead of appending a zero-length step.
 					FPathlineNode& Last = Track.Nodes.Last();
 					Last.Position = Point->Position;
 					Last.Scalar = Point->Scalar;
@@ -556,8 +524,6 @@ struct FJUSYNCPathlineManager::FImpl
 			}
 		}
 
-		// Defensive global cap. With MaxNodes smaller than twice the track
-		// count the per-track clamp cannot satisfy the budget on its own.
 		if (Settings.MaxNodes > 0)
 		{
 			int64 TotalNodes = 0;
@@ -617,11 +583,6 @@ struct FJUSYNCPathlineManager::FImpl
 		TArray<const FPathlineNode*> Visible;
 		Visible.Reserve(Settings.HistorySamples + 4);
 
-		// The whole element is emitted as a single ribbon. The renderer joins
-		// points that share a RibbonID, and a per-point RibbonID cannot be read
-		// back per particle in this asset, so disjoint runs are separated by
-		// zero-width duplicate points instead: those segments are degenerate and
-		// therefore invisible, without needing a second ribbon.
 		float Order = 0.0f;
 		bool bHasPreviousRun = false;
 		FVector PreviousPosition = FVector::ZeroVector;
@@ -630,10 +591,6 @@ struct FJUSYNCPathlineManager::FImpl
 		auto ResolvePoint = [&](const FPathlineNode& Node, float& OutWidth,
 			FLinearColor& OutColor, float& OutScalar)
 		{
-			// Settings.Radius is a radius in cm; the ribbon wants a full width.
-			// Point widths are a relative size (1 = nominal), so they scale the
-			// width rather than replacing it: a missing or stray value cannot
-			// collapse the trail to a hairline or blow it up.
 			float WidthScale = 1.0f;
 			if (Settings.bUsePointWidth && Node.Width > 0.0f)
 			{
@@ -677,8 +634,6 @@ struct FJUSYNCPathlineManager::FImpl
 
 			if (bHasPreviousRun)
 			{
-				// Collapse the jump between runs into two coincident, zero-width
-				// points so the connecting segment has no area.
 				EmitPoint(PreviousPosition, 0.0f, PreviousColor, 0.0f);
 				EmitPoint(Visible[StartIndex]->Position, 0.0f, FirstColor, 0.0f);
 			}
@@ -691,9 +646,6 @@ struct FJUSYNCPathlineManager::FImpl
 				FLinearColor Color = FLinearColor::White;
 				ResolvePoint(Node, Width, Color, Scalar);
 
-				// Animated playback: glide the newest node toward where it will
-				// be at the next sample so the ribbon tip moves with the cloud
-				// morph instead of jumping once per cached frame.
 				FVector Position = Node.Position;
 				if (TipNext && TipBlendAmount > 0.0f && !TipNext->bBreak &&
 					NodeIndex == Visible.Num() - 1)
@@ -731,9 +683,6 @@ struct FJUSYNCPathlineManager::FImpl
 					break;
 				}
 			}
-			// Tracks retain more nodes than one ribbon draws so the playback
-			// cutoff can rewind into the cached timeline; the ribbon itself only
-			// shows the newest window ending at the cutoff.
 			if (Visible.Num() > Settings.HistorySamples)
 			{
 				Visible.RemoveAt(0, Visible.Num() - Settings.HistorySamples);
@@ -755,9 +704,6 @@ struct FJUSYNCPathlineManager::FImpl
 			}
 			if (Settings.bFilterByHue)
 			{
-				// Filter on the colour the track is actually drawn with, so the
-				// picker works through a gradient LUT as well as the built-in
-				// ramp (and matches what the eye sees on the cloud).
 				float Hue = 0.0f;
 				float Saturation = 0.0f;
 				RgbToHS(FLinearColor(ResolveColor(*Element, Settings, Latest)), Hue, Saturation);
@@ -773,8 +719,6 @@ struct FJUSYNCPathlineManager::FImpl
 				continue;
 			}
 
-			// A track that breaks into several runs becomes several ribbons
-			// rather than one polyline jumping across the gap.
 			int32 RunStart = 0;
 			for (int32 VisibleIndex = 1; VisibleIndex < Visible.Num(); ++VisibleIndex)
 			{
@@ -923,8 +867,6 @@ struct FJUSYNCPathlineManager::FImpl
 			return;
 		}
 
-		// The animated tip asks for a rebuild every frame; coalesce so the worker
-		// queue cannot grow without bound while one build is in flight.
 		if (bRebuildQueued)
 		{
 			return;
@@ -1074,7 +1016,6 @@ void FJUSYNCPathlineManager::RemoveElement(const FString& ElementName)
 		if (bRemoved)
 		{
 			Impl->RefreshTotalsLocked();
-			// Invalidate queued work/pending meshes for the retired element.
 			Impl->Generation.fetch_add(1);
 		}
 	}
@@ -1212,9 +1153,6 @@ void FJUSYNCPathlineManager::TickDisplayBlend()
 			const float Alpha = U * U * (3.0f - 2.0f * U);
 			if (Alpha >= 1.0f)
 			{
-				// Hold the tip at the next sample until the cutoff moves. The next
-				// step restarts the blend at 0, which is that same position, so the
-				// ribbon tip never rewinds between cached frames.
 				Impl->TipBlendAlpha = 1.0f;
 				Impl->bTipBlendActive = false;
 				bNeedsRebuild = true;
