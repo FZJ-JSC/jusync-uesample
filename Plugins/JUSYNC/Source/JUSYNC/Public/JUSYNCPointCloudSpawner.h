@@ -155,8 +155,9 @@ public:
     bool ArePointCloudsHidden() const { return bPointCloudsHidden; }
 
     /** POINTS panel: hue filter over each point's baked colour. Non-matching
-     *  points are dimmed to near-black in place; originals are restored when
-     *  the filter is cleared. Re-applied automatically on every cloud swap. */
+     *  points are painted black and cut out by the cloud material, so they
+     *  cannot form an opaque shell around the selection; the original colours
+     *  are restored when the filter is cleared. Re-applied on every swap. */
     void SetPointHueFilter(bool bEnabled, float HueDeg, float ToleranceDeg);
 
     /** POINTS panel: true shows the baked/gradient colours, false repaints
@@ -215,9 +216,15 @@ private:
     void ApplyPointCloudsHiddenToActors();
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     /** In-place colour pass for one cloud: captures originals on first use,
-     *  then shows them (filter match) or a dim grey (no match). Also used to
-     *  restore by SetPointHueFilter(false,...) and after every swap. */
+     *  then keeps matching colours and paints non-matches black. The cloud
+     *  material cuts exactly-black points out of the render, so this is what
+     *  makes the selection visible through the rest of the cloud. Also used
+     *  to restore by SetPointHueFilter(false,...) and after every swap. */
     void ApplyPointHueFilterToCloud(ULidarPointCloud* Cloud);
+    /** A SetData refresh replaces every point colour, so cached pre-filter /
+     *  pre-gradient originals for that cloud are stale and must be discarded
+     *  before the display passes run again. */
+    void InvalidateColorOriginals(ULidarPointCloud* Cloud);
     void PrunePointColorOriginals();
     /** cloud -> untouched build-time colours; only populated while filtering. */
     TMap<TWeakObjectPtr<UObject>, TArray<FColor>> PointColorOriginals;

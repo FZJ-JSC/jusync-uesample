@@ -4,7 +4,16 @@
 # which is what made streamed clouds glow. This one is Masked shading with:
 #   BaseColor   = VertexColor (lit)
 #   Emissive    = VertexColor * EmissiveFloor param (<=1 stays under bloom)
-#   OpacityMask = point disc from the sprite-corner UV written by the Lidar VS
+#   OpacityMask = lerp(1, point disc, PointShapeCircle) * point presence
+#                 The material graph's VertexColor node is float3 (no alpha),
+#                 so the Lidar VS's shape coverage cannot be read here. The
+#                 spawner pushes PointShapeCircle (0 = square, 1 = circle) from
+#                 the SHAPE buttons instead.
+#                 The hue filter cannot use bVisible: the Lidar octree caches
+#                 NumVisiblePoints and does not rebuild it for in-place point
+#                 edits. Non-matching points are therefore painted black and
+#                 cut out here by a huge color-presence gain; any non-zero
+#                 source color survives the mask.
 #
 # Requires the bUsedWithLidarPointCloud usage flag - the Lidar vertex factory only
 # compiles permutations for materials carrying it
@@ -104,7 +113,6 @@ def build_cloud_material():
     MEL.connect_material_property(emul, "", unreal.MaterialProperty.MP_EMISSIVE_COLOR)
 
     # Point disc mask from the sprite-corner UV (TexCoord0, written by the Lidar VS).
-    # The VertexColor node is float3 only (its alpha is not exposed to graph code), and
     # Distance needs both inputs the same width, hence the float2 center constant.
     tc = expr(mat, unreal.MaterialExpressionTextureCoordinate, -600, 100)
     set_prop(tc, "coordinate_index", 0)
@@ -122,10 +130,41 @@ def build_cloud_material():
     # Steep gain against clip 0.5 gives a hard disc edge.
     gain = expr(mat, unreal.MaterialExpressionConstant, -400, 600)
     set_prop(gain, "r", 64.0)
-    step = expr(mat, unreal.MaterialExpressionMultiply, -200, 400)
-    connect(sub, step, "", "A")
-    connect(gain, step, "", "B")
-    MEL.connect_material_property(step, "", unreal.MaterialProperty.MP_OPACITY_MASK)
+    disc = expr(mat, unreal.MaterialExpressionMultiply, -200, 400)
+    connect(sub, disc, "", "A")
+    connect(gain, disc, "", "B")
+
+    # Shape selector, pushed by FJUSYNCPointCloudSpawner::ApplyVisualSettings:
+    # 0 = keep the full quad (square), 1 = clip to the disc (circle).
+    shape_circle = expr(mat, unreal.MaterialExpressionScalarParameter, -600, 800)
+    set_prop(shape_circle, "parameter_name", "PointShapeCircle")
+    set_prop(shape_circle, "default_value", 1.0)
+    set_prop(shape_circle, "group", "Jusync")
+    one = expr(mat, unreal.MaterialExpressionConstant, -400, 800)
+    set_prop(one, "r", 1.0)
+    shape = expr(mat, unreal.MaterialExpressionLinearInterpolate, -200, 700)
+    connect(one, shape, "", "A")
+    connect(disc, shape, "", "B")
+    connect(shape_circle, shape, "", "Alpha")
+
+    # Presence mask: non-matching points are painted pure black by the spawner.
+    # Dot with white sums the RGB channels; x256 turns any non-zero 8-bit
+    # component into >= 1, so only exactly-black points fall below the 0.5 clip.
+    white = expr(mat, unreal.MaterialExpressionConstant3Vector, -600, 1000)
+    set_prop(white, "constant", unreal.LinearColor(1.0, 1.0, 1.0, 1.0))
+    presence = expr(mat, unreal.MaterialExpressionDotProduct, -400, 1000)
+    connect(vcol, presence, "", "A")
+    connect(white, presence, "", "B")
+    presence_gain = expr(mat, unreal.MaterialExpressionConstant, -400, 1150)
+    set_prop(presence_gain, "r", 256.0)
+    present_scaled = expr(mat, unreal.MaterialExpressionMultiply, -200, 1000)
+    connect(presence, present_scaled, "", "A")
+    connect(presence_gain, present_scaled, "", "B")
+
+    opacity = expr(mat, unreal.MaterialExpressionMultiply, 0, 850)
+    connect(shape, opacity, "", "A")
+    connect(present_scaled, opacity, "", "B")
+    MEL.connect_material_property(opacity, "", unreal.MaterialProperty.MP_OPACITY_MASK)
     set_prop(mat, "opacity_mask_clip_value", 0.5)
 
     MEL.recompile_material(mat)

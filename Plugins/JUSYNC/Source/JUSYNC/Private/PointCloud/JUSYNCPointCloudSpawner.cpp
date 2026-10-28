@@ -1505,6 +1505,14 @@ void FJUSYNCPointCloudSpawner::SetPointHueFilter(bool bEnabled, float HueDeg, fl
 
     if (!bPointHueFilter)
     {
+        // Restore clouds that were filtered but are not active right now
+        // (playback/sample caches) before throwing their snapshots away.
+        TArray<TWeakObjectPtr<UObject>> FilteredClouds;
+        PointColorOriginals.GetKeys(FilteredClouds);
+        for (const TWeakObjectPtr<UObject>& Key : FilteredClouds)
+        {
+            ApplyPointHueFilterToCloud(Cast<ULidarPointCloud>(Key.Get()));
+        }
         PointColorOriginals.Empty();
     }
     PrunePointColorOriginals();
@@ -1520,7 +1528,7 @@ void FJUSYNCPointCloudSpawner::ApplyPointHueFilterToCloud(ULidarPointCloud* Clou
     const TWeakObjectPtr<UObject> CloudKey(Cloud);
     if (!bPointHueFilter)
     {
-        // Restore the build-time colours if this cloud was dimmed before.
+        // Restore the build-time colours if this cloud was filtered before.
         if (TArray<FColor>* Originals = PointColorOriginals.Find(CloudKey))
         {
             const TArray<FColor>& Restore = *Originals;
@@ -1544,19 +1552,21 @@ void FJUSYNCPointCloudSpawner::ApplyPointHueFilterToCloud(ULidarPointCloud* Clou
     if (Originals.Num() != NumPts)
     {
         // First sight of this cloud (or a different point count): capture the
-        // untouched colours BEFORE dimming, so clearing the filter can undo.
+        // untouched colours BEFORE blacking out non-matches, so clearing the
+        // filter can undo exactly.
         Originals.Init(FColor::White, NumPts);
         int32 Capture = 0;
-        Cloud->ExecuteActionOnAllPoints([&Originals, &Capture](FLidarPointCloudPoint* P)
-        {
-            if (Originals.IsValidIndex(Capture))
+        Cloud->ExecuteActionOnAllPoints(
+            [&Originals, &Capture](FLidarPointCloudPoint* P)
             {
-                Originals[Capture] = P->Color;
-            }
-            ++Capture;
-        }, /*bVisibleOnly*/false);
+                if (Originals.IsValidIndex(Capture))
+                {
+                    Originals[Capture] = P->Color;
+                }
+                ++Capture;
+            }, /*bVisibleOnly*/false);
 
-        // Live frames replace clouds constantly; keep the map tight to the
+        // Live frames replace clouds constantly; keep the maps tight to the
         // clouds that are actually displayed or reusable.
         if (PointColorOriginals.Num() > WarmCloudCountForBudget(WarmCloudBudgetBytes, WarmCloudAvgBytes) + 8)
         {
@@ -1599,11 +1609,29 @@ void FJUSYNCPointCloudSpawner::ApplyPointHueFilterToCloud(ULidarPointCloud* Clou
             }
             const float Dist = FMath::Abs(HueDeg - SelectedHue);
             const bool bMatch = FMath::Min(Dist, 360.0f - Dist) <= Tolerance;
-            P->Color = bMatch ? Base : FColor(6, 6, 6);
+
+            // The Lidar octree caches NumVisiblePoints and ignores in-place
+            // bVisible edits, so visibility cannot make the cloud transparent.
+            // Paint non-matching points pure black instead; the masked cloud
+            // material cuts exactly-black points out of the render. This is
+            // true transparency, not a grey ghost shell.
+            P->Color = bMatch ? Base : FColor(0, 0, 0, 255);
             ++Index;
         },
         /*bVisibleOnly*/false);
     Cloud->RefreshRendering();
+}
+
+void FJUSYNCPointCloudSpawner::InvalidateColorOriginals(ULidarPointCloud* Cloud)
+{
+    if (!Cloud)
+    {
+        return;
+    }
+
+    const TWeakObjectPtr<UObject> Key(Cloud);
+    PointColorOriginals.Remove(Key);
+    GradientColorOriginals.Remove(Key);
 }
 
 void FJUSYNCPointCloudSpawner::PrunePointColorOriginals()
@@ -2060,6 +2088,16 @@ void FJUSYNCPointCloudSpawner::ApplyVisualSettings(ULidarPointCloudComponent* Co
             !FMath::IsNearlyEqual(Current, EmissiveFloor))
         {
             CloudDyn->SetScalarParameterValue(FName("EmissiveFloor"), EmissiveFloor);
+        }
+
+        // The material graph cannot read the Lidar vertex alpha (VertexColor
+        // is float3 there), so drive the square/circle silhouette explicitly.
+        const float ShapeCircle = (PointShape == ELidarPointCloudSpriteShape::Circle) ? 1.0f : 0.0f;
+        float CurrentShapeCircle = -1.0f;
+        if (!CloudDyn->GetScalarParameterValue(FName("PointShapeCircle"), CurrentShapeCircle) ||
+            !FMath::IsNearlyEqual(CurrentShapeCircle, ShapeCircle))
+        {
+            CloudDyn->SetScalarParameterValue(FName("PointShapeCircle"), ShapeCircle);
         }
     }
 }
@@ -2627,6 +2665,14 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
                 }
                 else
                 {
+                    // SetData refreshes the point colours from the incoming
+                    // frame. Re-apply the panel's colour passes here too, or
+                    // live in-place updates immediately wash the hue filter
+                    // away and the cloud looks unfiltered again. The cached
+                    // originals describe the previous frame, so drop them.
+                    InvalidateColorOriginals(LidarCloud);
+                    ApplyGradientColorsToCloud(LidarCloud);
+                    ApplyPointHueFilterToCloud(LidarCloud);
                     MaybeCalculateNormals(LidarCloud, Actor, static_cast<int32>(Entry.Points.Num()));
                 }
             }
@@ -2782,6 +2828,7 @@ void FJUSYNCPointCloudSpawner::RecolorGradientPendingActors()
         JUSYNCPadDegenerateBounds(NewPoints);
         if (Cloud && Cloud->SetData(NewPoints))
         {
+            InvalidateColorOriginals(Cloud);
             ApplyGradientColorsToCloud(Cloud);
             ApplyPointHueFilterToCloud(Cloud);
             MaybeCalculateNormals(Cloud, Actor, static_cast<int32>(NewPoints.Num()));
