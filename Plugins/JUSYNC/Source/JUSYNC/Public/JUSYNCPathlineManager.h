@@ -17,6 +17,10 @@ struct JUSYNC_API FJUSYNCPathlineSettings
 
 	int32 MaxTracks = 4096;
 	int32 HistorySamples = 128;
+	// One ribbon draws at most HistorySamples nodes, but a track keeps up to
+	// RetentionSamples so the display cutoff can be rewound through the cached
+	// timeline. Clamped by MaxNodes at ingest.
+	int32 RetentionSamples = 256;
 	int32 MaxNodes = 524288;
 	// A track that is not present in N consecutive emitted samples is removed.
 	int32 TrackExpirySamples = 32;
@@ -156,6 +160,16 @@ public:
 
 	void SetDisplaySampleId(uint64 SampleId);
 	uint64 GetDisplaySampleId() const;
+
+	/**
+	 * Ribbon tip smoothing for animated playback. While the display cutoff keeps
+	 * advancing, the newest node of every trail glides toward its next sample
+	 * over this window instead of snapping once per cached frame. 0 restores
+	 * exact, per-sample snapshots (scrubs). Call TickDisplayBlend() every frame
+	 * while animating.
+	 */
+	void SetDisplayTipBlendSeconds(float Seconds);
+	void TickDisplayBlend();
 
 	// Queue a rebuild from retained state (playback scrub or visual change).
 	void RequestRebuild();

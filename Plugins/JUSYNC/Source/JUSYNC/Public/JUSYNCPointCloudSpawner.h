@@ -82,8 +82,12 @@ public:
     // 200 ms morph from the live frame. Playback mode also lets the spawner
     // discard live builds that were already in flight when the user scrubbed.
     void SetPlaybackMode(bool bEnabled) { bPlaybackMode = bEnabled; }
+    bool IsPlaybackMode() const { return bPlaybackMode; }
     void EnterPlaybackMode();
     void PreparePointCloudForPlayback(const FString& Key);
+    // Captures the positions currently on screen as the morph anchor, so a
+    // playback step can glide from what the user sees instead of snapping.
+    void SeedCloudDisplayPos(const FString& Key, AActor* InActor = nullptr);
 
     virtual void Tick(float DeltaTime) override;
     virtual ETickableTickType GetTickableTickType() const override { return ETickableTickType::Conditional; }

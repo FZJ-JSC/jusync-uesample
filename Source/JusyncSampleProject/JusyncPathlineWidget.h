@@ -55,6 +55,9 @@ private:
 	void HandleWidthChanged(float Value);
 
 	UFUNCTION()
+	void HandlePathlineGlowChanged(float Value);
+
+	UFUNCTION()
 	void HandlePointSizeChanged(float Value);
 
 	UFUNCTION()
@@ -165,6 +168,14 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UTextBlock> WidthValueText;
+
+	/** jusync.Pathlines.Glow: the ribbons' emissive strength. They share one
+	 *  material, so this is a collection scalar rather than a per-actor value. */
+	UPROPERTY(Transient)
+	TObjectPtr<USlider> PathlineGlowSlider;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> PathlineGlowValueText;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UComboBoxString> ColorCombo;

@@ -285,12 +285,23 @@ struct FJUSYNCPathlineManager::FImpl
 
 	uint64 DisplaySampleId = TNumericLimits<uint64>::Max();
 	bool bResampleRequested = false;
+	bool bRebuildQueued = false;
+
+	// Ribbon tip smoothing while the playback cutoff advances. The newest node
+	// glides toward the next sample's position over TipBlendSeconds so the trail
+	// follows the cloud morph instead of snapping one frame at a time.
+	float TipBlendSeconds = 0.0f;
+	float TipBlendAlpha = 0.0f;
+	double TipBlendStartSeconds = 0.0;
+	bool bTipBlendActive = false;
 
 	void ClearLocked()
 	{
 		Elements.Reset();
 		Stats = FJUSYNCPathlineStats();
 		DisplaySampleId = TNumericLimits<uint64>::Max();
+		bTipBlendActive = false;
+		TipBlendAlpha = 0.0f;
 		Generation.fetch_add(1);
 	}
 
@@ -530,7 +541,7 @@ struct FJUSYNCPathlineManager::FImpl
 		}
 		Element.Tracks = MoveTemp(NextTracks);
 
-		int32 EffectiveHistory = FMath::Max(2, Settings.HistorySamples);
+		int32 EffectiveHistory = FMath::Max(2, FMath::Max(Settings.HistorySamples, Settings.RetentionSamples));
 		if (Settings.MaxNodes > 0 && Element.Tracks.Num() > 0)
 		{
 			EffectiveHistory = FMath::Clamp(
@@ -601,6 +612,7 @@ struct FJUSYNCPathlineManager::FImpl
 
 		const float BaseRadius = FMath::Max(0.001f, Settings.Radius * Settings.RadiusScale);
 		const float ColorRange = Settings.ColorMax - Settings.ColorMin;
+		const float TipBlend = FMath::Clamp(TipBlendAlpha, 0.0f, 1.0f);
 
 		TArray<const FPathlineNode*> Visible;
 		Visible.Reserve(Settings.HistorySamples + 4);
@@ -618,13 +630,16 @@ struct FJUSYNCPathlineManager::FImpl
 		auto ResolvePoint = [&](const FPathlineNode& Node, float& OutWidth,
 			FLinearColor& OutColor, float& OutScalar)
 		{
-			float Radius = BaseRadius;
+			// Settings.Radius is a radius in cm; the ribbon wants a full width.
+			// Point widths are a relative size (1 = nominal), so they scale the
+			// width rather than replacing it: a missing or stray value cannot
+			// collapse the trail to a hairline or blow it up.
+			float WidthScale = 1.0f;
 			if (Settings.bUsePointWidth && Node.Width > 0.0f)
 			{
-				Radius *= 0.5f * Node.Width;
+				WidthScale = FMath::Clamp(Node.Width, 0.1f, 8.0f);
 			}
-			// Settings.Radius is a radius; ribbon width is a full width.
-			OutWidth = FMath::Max(Radius * 2.0f, 0.002f);
+			OutWidth = FMath::Max(BaseRadius * 2.0f * WidthScale, 0.01f);
 
 			OutScalar = 0.0f;
 			if (Node.bHasScalar && !FMath::IsNearlyZero(ColorRange))
@@ -647,7 +662,8 @@ struct FJUSYNCPathlineManager::FImpl
 			Order += 1.0f;
 		};
 
-		auto EmitRun = [&](int32 StartIndex, int32 EndIndex)
+		auto EmitRun = [&](int32 StartIndex, int32 EndIndex,
+			const FPathlineNode* TipNext, float TipBlendAmount)
 		{
 			if (EndIndex <= StartIndex)
 			{
@@ -674,10 +690,24 @@ struct FJUSYNCPathlineManager::FImpl
 				float Scalar = 0.0f;
 				FLinearColor Color = FLinearColor::White;
 				ResolvePoint(Node, Width, Color, Scalar);
-				EmitPoint(Node.Position, Width, Color, Scalar);
+
+				// Animated playback: glide the newest node toward where it will
+				// be at the next sample so the ribbon tip moves with the cloud
+				// morph instead of jumping once per cached frame.
+				FVector Position = Node.Position;
+				if (TipNext && TipBlendAmount > 0.0f && !TipNext->bBreak &&
+					NodeIndex == Visible.Num() - 1)
+				{
+					Position = FMath::Lerp(Node.Position, TipNext->Position, TipBlendAmount);
+				}
+				EmitPoint(Position, Width, Color, Scalar);
 			}
 
 			PreviousPosition = Visible[EndIndex]->Position;
+			if (TipNext && TipBlendAmount > 0.0f && EndIndex == Visible.Num() - 1)
+			{
+				PreviousPosition = FMath::Lerp(Visible[EndIndex]->Position, TipNext->Position, TipBlendAmount);
+			}
 			float UnusedWidth = 0.0f;
 			float UnusedScalar = 0.0f;
 			ResolvePoint(*Visible[EndIndex], UnusedWidth, PreviousColor, UnusedScalar);
@@ -688,12 +718,25 @@ struct FJUSYNCPathlineManager::FImpl
 		{
 			const FPathlineTrack& Track = TrackPair.Value;
 			Visible.Reset();
+			const FPathlineNode* TipNext = nullptr;
 			for (const FPathlineNode& Node : Track.Nodes)
 			{
 				if (Node.SampleId <= CutoffSampleId)
 				{
 					Visible.Add(&Node);
 				}
+				else if (!TipNext)
+				{
+					TipNext = &Node;
+					break;
+				}
+			}
+			// Tracks retain more nodes than one ribbon draws so the playback
+			// cutoff can rewind into the cached timeline; the ribbon itself only
+			// shows the newest window ending at the cutoff.
+			if (Visible.Num() > Settings.HistorySamples)
+			{
+				Visible.RemoveAt(0, Visible.Num() - Settings.HistorySamples);
 			}
 			if (Visible.Num() == 0)
 			{
@@ -737,11 +780,11 @@ struct FJUSYNCPathlineManager::FImpl
 			{
 				if (Visible[VisibleIndex]->bBreak)
 				{
-					EmitRun(RunStart, VisibleIndex - 1);
+					EmitRun(RunStart, VisibleIndex - 1, nullptr, 0.0f);
 					RunStart = VisibleIndex;
 				}
 			}
-			EmitRun(RunStart, Visible.Num() - 1);
+			EmitRun(RunStart, Visible.Num() - 1, TipNext, TipBlend);
 		}
 
 		Stats.VisibleTracks = OutVisibleTracks;
@@ -823,6 +866,7 @@ struct FJUSYNCPathlineManager::FImpl
 
 		if (Item->Type == FWorkItem::EType::RebuildAll)
 		{
+			bRebuildQueued = false;
 			RebuildAllAndPost(Item->Generation);
 			return;
 		}
@@ -878,6 +922,14 @@ struct FJUSYNCPathlineManager::FImpl
 		{
 			return;
 		}
+
+		// The animated tip asks for a rebuild every frame; coalesce so the worker
+		// queue cannot grow without bound while one build is in flight.
+		if (bRebuildQueued)
+		{
+			return;
+		}
+		bRebuildQueued = true;
 
 		TSharedPtr<FWorkItem> Item = MakeShared<FWorkItem>();
 		Item->Type = FWorkItem::EType::RebuildAll;
@@ -1118,6 +1170,10 @@ void FJUSYNCPathlineManager::SetDisplaySampleId(uint64 SampleId)
 		if (Impl->DisplaySampleId != SampleId)
 		{
 			Impl->DisplaySampleId = SampleId;
+			Impl->TipBlendAlpha = 0.0f;
+			Impl->bTipBlendActive =
+				Impl->TipBlendSeconds > 0.0f && SampleId != TNumericLimits<uint64>::Max();
+			Impl->TipBlendStartSeconds = FPlatformTime::Seconds();
 			bChanged = true;
 		}
 	}
@@ -1131,6 +1187,49 @@ uint64 FJUSYNCPathlineManager::GetDisplaySampleId() const
 {
 	FScopeLock Lock(&Impl->StateLock);
 	return Impl->DisplaySampleId;
+}
+
+void FJUSYNCPathlineManager::SetDisplayTipBlendSeconds(float Seconds)
+{
+	FScopeLock Lock(&Impl->StateLock);
+	Impl->TipBlendSeconds = FMath::Clamp(Seconds, 0.0f, 4.0f);
+	if (Impl->TipBlendSeconds <= 0.0f)
+	{
+		Impl->bTipBlendActive = false;
+		Impl->TipBlendAlpha = 0.0f;
+	}
+}
+
+void FJUSYNCPathlineManager::TickDisplayBlend()
+{
+	bool bNeedsRebuild = false;
+	{
+		FScopeLock Lock(&Impl->StateLock);
+		if (Impl->bTipBlendActive)
+		{
+			const float Elapsed = static_cast<float>(FPlatformTime::Seconds() - Impl->TipBlendStartSeconds);
+			const float U = FMath::Clamp(Elapsed / FMath::Max(Impl->TipBlendSeconds, 0.001f), 0.0f, 1.0f);
+			const float Alpha = U * U * (3.0f - 2.0f * U);
+			if (Alpha >= 1.0f)
+			{
+				// Hold the tip at the next sample until the cutoff moves. The next
+				// step restarts the blend at 0, which is that same position, so the
+				// ribbon tip never rewinds between cached frames.
+				Impl->TipBlendAlpha = 1.0f;
+				Impl->bTipBlendActive = false;
+				bNeedsRebuild = true;
+			}
+			else if (!FMath::IsNearlyEqual(Alpha, Impl->TipBlendAlpha, 0.004f))
+			{
+				Impl->TipBlendAlpha = Alpha;
+				bNeedsRebuild = true;
+			}
+		}
+	}
+	if (bNeedsRebuild)
+	{
+		Impl->QueueRebuildAll();
+	}
 }
 
 void FJUSYNCPathlineManager::RequestRebuild()

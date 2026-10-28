@@ -317,11 +317,15 @@ namespace
      */
     void SetPlaybackMorphWindow(float FramesPerSecond)
     {
+        const float Fps = FMath::Clamp(FramesPerSecond, 1.0f, 240.0f);
+        const int32 BlendMs = FMath::Clamp(FMath::RoundToInt(800.0f / Fps), 8, 4000);
+        if (BlendMs == GPlaybackMorphWindowMs)
+        {
+            return; // already pushed; the tick re-asserts every frame
+        }
         if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(
                 TEXT("jusync.Morph.CloudBlendMs")))
         {
-            const float Fps = FMath::Clamp(FramesPerSecond, 1.0f, 240.0f);
-            const int32 BlendMs = FMath::Clamp(FMath::RoundToInt(800.0f / Fps), 8, 4000);
             CVar->Set(BlendMs, ECVF_SetByConsole);
             GPlaybackMorphWindowMs = BlendMs;
         }
@@ -406,12 +410,89 @@ void UJusyncPlaybackWidget::EnsureLayoutBuilt()
 void UJusyncPlaybackWidget::NativeOnInitialized()
 {
     Super::NativeOnInitialized();
+    bAutoLoopPlaybackSuppressed = false;
     EnsureLayoutBuilt();
 }
 
 void UJusyncPlaybackWidget::NativeTick(const FGeometry& MyGeometry, float InDeltaTime)
 {
     Super::NativeTick(MyGeometry, InDeltaTime);
+
+    // A sender that replays its clip never produces a new live frame: every
+    // notification carries an already-applied hash, so the live diff reports
+    // "0 changed, 0 new" and the scene would sit on the last sample forever.
+    // Take the loop over: start walking the cached timeline (and its pathline
+    // display cutoff) so the morph and the ribbon tips keep running.
+    //
+    // The latch is read through the function map: Live Coding patches the
+    // JUSYNC module in place, so the project module cannot link a symbol that
+    // was added after the editor started.
+    const double NowSeconds = FPlatformTime::Seconds();
+    // A collapsed panel (Tab) does not tick, so the latch keeps filling while
+    // the HUD is closed. Opening it must not yank the view out of live mode:
+    // the tick gap tells us the panel was hidden, the latch is discarded, and
+    // the automatic sender-loop takeover is parked until the user asks for
+    // playback (PLAY) - a panel opening is not a transport command.
+    const bool bFirstTick = LastWidgetTickSeconds <= 0.0;
+    const bool bWidgetWasTicking = !bFirstTick
+        && (NowSeconds - LastWidgetTickSeconds) < 0.35;
+    LastWidgetTickSeconds = NowSeconds;
+
+    if (Spawner)
+    {
+        static UFunction* SenderLoopFunction = nullptr;
+        static UFunction* SenderLoopRecentFunction = nullptr;
+        if (!SenderLoopFunction || SenderLoopFunction->GetOuter() != Spawner->GetClass())
+        {
+            SenderLoopFunction = Spawner->FindFunction(TEXT("ConsumeSenderLoopDetectedIfRecent"));
+            SenderLoopRecentFunction = SenderLoopFunction;
+            if (!SenderLoopRecentFunction)
+            {
+                SenderLoopFunction = Spawner->FindFunction(TEXT("ConsumeSenderLoopDetected"));
+            }
+        }
+
+        bool bSenderLooped = false;
+        if (SenderLoopRecentFunction)
+        {
+            struct FConsumeRecentLoopParams
+            {
+                float MaxAgeSeconds = 0.0f;
+                bool ReturnValue = false;
+            };
+            FConsumeRecentLoopParams Params;
+            Params.MaxAgeSeconds = 1.5f;
+            Spawner->ProcessEvent(SenderLoopRecentFunction, &Params);
+            bSenderLooped = Params.ReturnValue;
+        }
+        else if (SenderLoopFunction)
+        {
+            struct FConsumeSenderLoopParams
+            {
+                bool ReturnValue = false;
+            };
+            FConsumeSenderLoopParams Params;
+            Spawner->ProcessEvent(SenderLoopFunction, &Params);
+            bSenderLooped = Params.ReturnValue;
+        }
+
+        if (bSenderLooped && !bWidgetWasTicking)
+        {
+            // The loop was detected while the panel was closed (or before this
+            // panel existed). Opening the HUD is not a transport command: stay
+            // live instead of cutting to the oldest cached sample. The next
+            // loop that arrives while the panel is open takes over seamlessly
+            // from the frame that is already on screen.
+            UE_LOG(LogTemp, Display,
+                TEXT("JUSYNC playback HUD: opened with a sender-loop signal pending - staying live"));
+            bSenderLooped = false;
+        }
+
+        if (bSenderLooped && !bCachedPlaybackRunning && !bAutoLoopPlaybackSuppressed)
+        {
+            StartCachedPlaybackFrom(/*bFromLiveEdge=*/true);
+        }
+    }
 
     TickCachedPlayback(InDeltaTime);
 
@@ -433,6 +514,38 @@ void UJusyncPlaybackWidget::NativeTick(const FGeometry& MyGeometry, float InDelt
     Refresh();
 }
 
+void UJusyncPlaybackWidget::StartCachedPlaybackFrom(bool bFromLiveEdge)
+{
+    if (!Spawner || Spawner->GetCachedSampleCount() <= 1)
+    {
+        return;
+    }
+
+    if (bFromLiveEdge)
+    {
+        // The scene is already showing the newest live sample. Taking over at
+        // the live edge means the first cached frame is the one on screen, so
+        // opening the transport does not cut back to frame 1; the walk then
+        // advances and wraps at the same point the sender loops.
+        SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
+        Spawner->SetPlaybackPosition(0.998f);
+    }
+    else
+    {
+        // Jumping back to the oldest frame is a cut, not a transition.
+        ClearPlaybackMorphWindow();
+        Spawner->SetPlaybackPosition(0.0f);
+
+        // Frames advance on the morph window from here on: the cloud glides for
+        // most of the frame and the deferred swap lands in the tail.
+        SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
+    }
+
+    CachedPlaybackAccumulator = 0.0f;
+    bCachedPlaybackRunning = true;
+    Refresh();
+}
+
 void UJusyncPlaybackWidget::TickCachedPlayback(float DeltaSeconds)
 {
     if (!bCachedPlaybackRunning || !Spawner)
@@ -449,6 +562,9 @@ void UJusyncPlaybackWidget::TickCachedPlayback(float DeltaSeconds)
     }
 
     const float FrameTime = 1.0f / FMath::Clamp(Spawner->TimeStepPlaybackFPS, 1.0f, 240.0f);
+    // The rate buttons can change the playback FPS mid-loop; keep the morph
+    // window matched to the frame the panel is actually drawing.
+    SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
     int32 Index = FMath::Clamp(Spawner->GetPlaybackSampleIndex(), 0, Count - 1);
     bool bAdvanced = false;
 
@@ -1088,6 +1204,9 @@ void UJusyncPlaybackWidget::HandleLiveClicked()
         bCachedPlaybackRunning = false;
         CachedPlaybackAccumulator = 0.0f;
         ClearPlaybackMorphWindow();
+        // LIVE is an explicit "show me the newest frame" request, so opt out of
+        // the sender-loop takeover until PLAY is pressed again.
+        bAutoLoopPlaybackSuppressed = true;
         Spawner->FollowLatestSample();
         Refresh();
     }
@@ -1105,6 +1224,9 @@ void UJusyncPlaybackWidget::HandlePlayPauseClicked()
         bCachedPlaybackRunning = false;
         CachedPlaybackAccumulator = 0.0f;
         ClearPlaybackMorphWindow();
+        // Stay parked where the user stopped it: do not let the sender-loop
+        // takeover restart playback until PLAY is pressed again.
+        bAutoLoopPlaybackSuppressed = true;
         Refresh();
         return;
     }
@@ -1124,6 +1246,8 @@ void UJusyncPlaybackWidget::HandlePlayPauseClicked()
         ClearPlaybackMorphWindow();
         Spawner->SetPlaybackPosition(0.0f);
     }
+
+    bAutoLoopPlaybackSuppressed = false;
 
     // Frames advance on the morph window from here on: the cloud glides for
     // most of the frame and the deferred swap lands in the tail.

@@ -58,8 +58,28 @@ namespace
     }
 
     /**
+     * Same idea for the ribbons: jusync.Pathlines.Glow is the emissive
+     * strength MPC_Jusync.PathlineGlow feeds into M_JusyncRibbon, not a 0..1
+     * blend. Trails are thin, so they read as lit long before a cloud does,
+     * but 200 topped out too early for the laser look: 2000 gives the same
+     * squared low-end feel with a full decade of extra headroom.
+     */
+    constexpr float PathlineGlowMax = 2000.0f;
+
+    float PathlineGlowFromSlider(float Value)
+    {
+        const float V = FMath::Clamp(Value, 0.0f, 1.0f);
+        return PathlineGlowMax * V * V;
+    }
+
+    float PathlineGlowToSlider(float Glow)
+    {
+        return FMath::Clamp(FMath::Sqrt(FMath::Max(Glow, 0.0f) / PathlineGlowMax), 0.0f, 1.0f);
+    }
+
+    /**
      * Geometry codes from the drawing:
-     *   V1=24  W=360  H=668  H1=60  H2=52  H3=28  H4=40  H6=40
+     *   V1=24  W=360  H=716  H1=60  H2=52  H3=28  H4=40  H6=40
      *   R1=12  R2=7  R3=6  S1=16  S2=12  S3=8  S7=12
      * Every runtime measurement below is one of those values, not a new
      * one-off, so the panel can be checked against the sheet. The header and
@@ -103,9 +123,10 @@ namespace
         constexpr float V1 = 24.0f;
         constexpr float W = 360.0f;
         // 620 on the sheet held two 207 px cards. The POINT CLOUD card gained a
-        // GLOW row (40 px + 8 px gap), so the frame grows by exactly that much
+        // GLOW row (40 px + 8 px gap) and the PATHLINES card has now gained its
+        // own (same 48 px), so the frame grows by exactly that much both times
         // and the drawing stays additive rather than re-flowed.
-        constexpr float H = 668.0f;
+        constexpr float H = 716.0f;
         constexpr float H1 = 60.0f;
         constexpr float H2 = 52.0f;
         constexpr float H3 = 28.0f;
@@ -123,7 +144,7 @@ namespace
         constexpr float S7 = 12.0f;
         constexpr float LabelWidth = 92.0f;
         constexpr float ValueWidth = 48.0f;
-        constexpr float CardContentHeight = 207.0f;
+        constexpr float CardContentHeight = 255.0f;
         constexpr float PointCardContentHeight = 255.0f;
     }
 
@@ -338,6 +359,7 @@ void UJusyncPathlineWidget::EnsureLayoutBuilt()
              static_cast<UWidget*>(PointsSwitch.Get()),
              static_cast<UWidget*>(HistorySlider.Get()),
              static_cast<UWidget*>(WidthSlider.Get()),
+             static_cast<UWidget*>(PathlineGlowSlider.Get()),
              static_cast<UWidget*>(PointSizeSlider.Get()),
              static_cast<UWidget*>(PointGlowSlider.Get()),
              static_cast<UWidget*>(ColorCombo.Get()),
@@ -373,6 +395,11 @@ void UJusyncPathlineWidget::EnsureLayoutBuilt()
     if (WidthSlider)
     {
         WidthSlider->OnValueChanged.AddDynamic(this, &UJusyncPathlineWidget::HandleWidthChanged);
+    }
+    if (PathlineGlowSlider)
+    {
+        PathlineGlowSlider->OnValueChanged.AddDynamic(this,
+            &UJusyncPathlineWidget::HandlePathlineGlowChanged);
     }
     if (PointSizeSlider)
     {
@@ -626,6 +653,13 @@ void UJusyncPathlineWidget::BuildLayout()
     AddGap(PathlineRows);
     AddSliderRow(PathlineRows, FText::FromString(TEXT("WIDTH")), TEXT("WidthSlider"),
         0.1f, 5.0f, 0.05f, WidthSlider, WidthValueText);
+    AddGap(PathlineRows);
+
+    // Self-glow of the ribbons: jusync.Pathlines.Glow, which every trail reads
+    // through MPC_Jusync.PathlineGlow. It sits under WIDTH because the two are
+    // the pair that decides whether a trail reads at all.
+    AddSliderRow(PathlineRows, FText::FromString(TEXT("GLOW")), TEXT("PathlineGlowSlider"),
+        0.0f, 1.0f, 0.005f, PathlineGlowSlider, PathlineGlowValueText);
     AddGap(PathlineRows);
 
     UHorizontalBox* PathlineRow3 = WidgetTree->ConstructWidget<UHorizontalBox>(
@@ -1224,6 +1258,18 @@ void UJusyncPathlineWidget::Refresh()
     {
         WidthValueText->SetText(FText::FromString(FString::Printf(TEXT("%.2fx"), Width)));
     }
+    // Ribbon glow lives in a CVar as well (the collection scalar is the only
+    // place the shared material can read it from), so read it back instead of
+    // echoing the handle: a console set must move the panel too.
+    const float PathlineGlow = CurrentFloatCvar(TEXT("jusync.Pathlines.Glow"), 0.1f);
+    if (PathlineGlowValueText)
+    {
+        // HDR strength: show decimals while the trails are matte, whole
+        // numbers once they are actually emitting.
+        PathlineGlowValueText->SetText(FText::FromString(PathlineGlow < 10.0f
+            ? FString::Printf(TEXT("%.3f"), PathlineGlow)
+            : FString::Printf(TEXT("%.0f"), PathlineGlow)));
+    }
     if (MaxValueText)
     {
         MaxValueText->SetText(FText::AsNumber(MaxTracks));
@@ -1262,6 +1308,11 @@ void UJusyncPathlineWidget::Refresh()
     {
         WidthSlider->SetIsEnabled(bOn);
         WidthSlider->SetRenderOpacity(bOn ? 1.0f : 0.55f);
+    }
+    if (PathlineGlowSlider)
+    {
+        PathlineGlowSlider->SetIsEnabled(bOn);
+        PathlineGlowSlider->SetRenderOpacity(bOn ? 1.0f : 0.55f);
     }
     if (PointSizeSlider)
     {
@@ -1359,6 +1410,10 @@ void UJusyncPathlineWidget::Refresh()
     {
         WidthSlider->SetValue(Width);
     }
+    if (PathlineGlowSlider)
+    {
+        PathlineGlowSlider->SetValue(PathlineGlowToSlider(PathlineGlow));
+    }
     if (PointSizeSlider)
     {
         PointSizeSlider->SetValue(PointSize);
@@ -1429,6 +1484,20 @@ void UJusyncPathlineWidget::HandleWidthChanged(float Value)
         return;
     }
     Spawner->PathlineRadiusScale = FMath::Clamp(Value, 0.1f, 5.0f);
+    Refresh();
+}
+
+void UJusyncPathlineWidget::HandlePathlineGlowChanged(float Value)
+{
+    if (bApplyingFromCode)
+    {
+        return;
+    }
+
+    // The handle is normalized; the CVar is HDR emissive (see
+    // PathlineGlowFromSlider). The spawner pushes it into the collection on
+    // its next tick, so the trails pick it up immediately.
+    SetFloatCvar(TEXT("jusync.Pathlines.Glow"), PathlineGlowFromSlider(Value));
     Refresh();
 }
 

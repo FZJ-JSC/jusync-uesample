@@ -47,13 +47,16 @@ public:
 	 */
 	bool HandlePanelToggleKey(const FKey& Key, bool bFromPreInput = false);
 
+	/** Show/hide the playback transport, the same action the Tab key runs. */
+	UFUNCTION(BlueprintCallable, Category = "JUSYNC|Playback HUD")
+	void TogglePanel();
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual bool InputKey(const FInputKeyEventArgs& Params) override;
 
 private:
-	void TogglePanel();
 	void TogglePathlinePanel();
 	void ApplyPanelInputMode();
 

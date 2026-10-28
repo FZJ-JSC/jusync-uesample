@@ -72,6 +72,8 @@ static bool JUSYNCRequestFileToString(const FString& Filename, int32 Rank, FStri
 #include "Materials/MaterialExpressionMultiply.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialExpressionVertexColor.h"
+#include "Materials/MaterialParameterCollection.h"
+#include "Kismet/KismetMaterialLibrary.h"
 #include "Async/Async.h"
 #include "Tasks/Task.h"
 #include "JUSYNCElementNames.h"
@@ -106,10 +108,18 @@ static TAutoConsoleVariable<int32> CVarJusyncPathlineMaxNodes(
     ECVF_Default);
 
 static TAutoConsoleVariable<float> CVarJusyncPathlineRadius(
-    TEXT("jusync.Pathlines.Radius"), 0.02f,
+    TEXT("jusync.Pathlines.Radius"), 0.0f,
     TEXT("Overrides PathlineRadius (cm) on every spawner when > 0, so trail\n")
     TEXT("thickness can be tuned live from the console. 0 = use the spawner's\n")
-    TEXT("details-panel value."),
+    TEXT("details-panel value (the default: the actor property wins)."),
+    ECVF_Default);
+
+static TAutoConsoleVariable<float> CVarJusyncPathlineGlow(
+    TEXT("jusync.Pathlines.Glow"), 0.1f,
+    TEXT("Emissive strength of the pathline ribbons: 0 keeps them matte and\n")
+    TEXT("scene-lit only, 20+ makes them bloom. Ribbons are one shared\n")
+    TEXT("material, so the value is applied to MPC_Jusync.PathlineGlow and\n")
+    TEXT("every trail picks it up. The in-game GLOW slider drives this."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarJusyncPathlineTubeSides(
@@ -292,7 +302,9 @@ int64 AJUSYNCFileSpawnerActor::GetSampleCacheBudgetBytes() const
     {
         return FloorBytes;
     }
-    return DynamicSampleCacheBytes;
+    // A dynamic budget may dip below the floor on a tight machine; the floor is
+    // a promise (scrubbing needs a timeline, not two frames), so keep it.
+    return FMath::Max(FloorBytes, DynamicSampleCacheBytes);
 }
 
 int32 AJUSYNCFileSpawnerActor::GetSampleCacheCountCap() const
@@ -618,7 +630,10 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     PathlineMaxNodes = 524288;
     PathlineTrackExpirySamples = 64;
     PathlineNiagaraSystem = nullptr;
-    PathlineRadius = 0.02f;
+    // Ribbon radius in centimetres: the trail is 2x this wide at 1.00x on the
+    // HUD width slider. 1 cm gives a 2 cm ribbon, which reads at warehouse
+    // scale; the old 0.02 default produced a 0.4 mm trail.
+    PathlineRadius = 1.0f;
     PathlineRadiusScale = 1.0f;
     bPathlineUsePointWidth = false;
     PathlineIdAttribute = TEXT("particle_id");
@@ -1127,6 +1142,7 @@ void AJUSYNCFileSpawnerActor::Tick(float DeltaSeconds)
 {
     Super::Tick(DeltaSeconds);
 
+    EnsurePathlineGlow();
     SyncPathlineManager();
     SweepPendingDeletedFiles();
     PollDynamicCacheBudgets(DeltaSeconds);
@@ -1189,6 +1205,11 @@ FJUSYNCPathlineSettings AJUSYNCFileSpawnerActor::BuildPathlineSettings() const
     Settings.bEnabled = bEnablePathlines;
     Settings.MaxTracks = FMath::Max(1, PathlineMaxTracks);
     Settings.HistorySamples = FMath::Max(2, PathlineHistorySamples);
+    // Keep a deeper per-track history than one ribbon draws: scrubbing the
+    // playback cutoff rewinds through it, and the ribbon shows the newest
+    // HistorySamples nodes at or before the cutoff.
+    Settings.RetentionSamples = FMath::Max(Settings.HistorySamples,
+        FMath::Max(64, PathlineHistorySamples * 8));
     Settings.MaxNodes = FMath::Max(0, PathlineMaxNodes);
     if (const int32 TrackCap = CVarJusyncPathlineMaxTracks.GetValueOnGameThread(); TrackCap > 0)
     {
@@ -1245,17 +1266,21 @@ namespace
 	{
 		// Ribbons are culled by particle bounds, and world-space trails are far
 		// larger than the default heuristic assumes: pin fixed bounds so they
-		// cannot disappear at an awkward camera angle.
-		FBox Bounds(ForceInit);
+		// cannot disappear at an awkward camera angle. The positions are world
+		// space (the emitter is not local-space) but SetSystemFixedBounds takes
+		// local space, so convert through the component transform - otherwise
+		// the box sits at twice the component offset and culls the trail away.
+		const FTransform ComponentToWorld = Component->GetComponentTransform();
+		FBox LocalBounds(ForceInit);
 		for (const FVector& Position : Arrays.Positions)
 		{
-			Bounds += Position;
+			LocalBounds += ComponentToWorld.InverseTransformPositionNoScale(Position);
 		}
-		if (Bounds.IsValid)
+		if (LocalBounds.IsValid)
 		{
-			const double Extent = Bounds.GetExtent().GetMax();
+			const double Extent = LocalBounds.GetExtent().GetMax();
 			Component->SetSystemFixedBounds(
-				Bounds.ExpandBy(FMath::Max(1.0, Extent * 0.1)));
+				LocalBounds.ExpandBy(FMath::Max(1.0, Extent * 0.1)));
 		}
 
 		UNiagaraDataInterfaceArrayFunctionLibrary::SetNiagaraArrayPosition(
@@ -1301,6 +1326,39 @@ void AJUSYNCFileSpawnerActor::DestroyAllPathlineComponents()
 		}
 	}
 	PathlineComponents.Empty();
+}
+
+void AJUSYNCFileSpawnerActor::EnsurePathlineGlow()
+{
+    // The ribbons all share M_JusyncRibbon, which reads its emissive strength
+    // from a collection scalar: there is no per-component material to poke,
+    // unlike the point clouds. Push the CVar only when it actually moved.
+    const float Glow = CVarJusyncPathlineGlow.GetValueOnGameThread();
+    if (FMath::IsNearlyEqual(Glow, LastPathlineGlow, 1e-4f))
+    {
+        return;
+    }
+
+    if (!PathlineGlowCollection)
+    {
+        PathlineGlowCollection = LoadObject<UMaterialParameterCollection>(
+            nullptr, TEXT("/Game/Materials/MPC_Jusync.MPC_Jusync"));
+        if (!PathlineGlowCollection)
+        {
+            if (!bPathlineGlowMissingWarned)
+            {
+                bPathlineGlowMissingWarned = true;
+                UE_LOG(LogTemp, Warning, TEXT(
+                    "[Spawner] MPC_Jusync is missing, so jusync.Pathlines.Glow "
+                    "has no effect on the ribbons."));
+            }
+            return;
+        }
+    }
+
+    UKismetMaterialLibrary::SetScalarParameterValue(
+        this, PathlineGlowCollection, FName(TEXT("PathlineGlow")), Glow);
+    LastPathlineGlow = Glow;
 }
 
 void AJUSYNCFileSpawnerActor::SyncPathlineComponents()
@@ -1349,8 +1407,18 @@ void AJUSYNCFileSpawnerActor::SyncPathlineComponents()
 
 	UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
 	FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr;
-	const FVector PathlineSpawnLocation = PCSpawner ? PCSpawner->GetSpawnLocation() : FVector::ZeroVector;
-	const float PathlineSpawnScale = PCSpawner ? PCSpawner->GetSpawnScale() : 1.0f;
+
+	// Point clouds arrive in the file's own (raw) coordinate space and are then
+	// re-scaled and re-centred into the level by their actor transform (spawn
+	// location + fit-volume scale). The ribbon emitter runs world-space, so
+	// Niagara takes every uploaded position literally: drawing the raw numbers
+	// puts the trails at the world origin, thousands of units from their
+	// points. Bake the element actor's transform into the positions instead, so
+	// trails land on their cloud and ribbon widths stay in centimetres.
+	FTransform FallbackTransform(
+		FQuat::Identity,
+		PCSpawner ? PCSpawner->GetSpawnLocation() : FVector::ZeroVector,
+		FVector(PCSpawner ? PCSpawner->GetSpawnScale() : 1.0f));
 
 	for (const FJUSYNCPathlineManager::FCompletedArrays& Result : Completed)
 	{
@@ -1379,8 +1447,20 @@ void AJUSYNCFileSpawnerActor::SyncPathlineComponents()
 			Component->SetAsset(System);
 		}
 
-		Component->SetWorldLocation(PathlineSpawnLocation);
-		Component->SetWorldScale3D(FVector(PathlineSpawnScale));
+		FTransform CloudTransform = FallbackTransform;
+		if (PCSpawner)
+		{
+			if (const AActor* ElementActor = PCSpawner->FindActorByElementKey(Result.ElementName))
+			{
+				CloudTransform = ElementActor->GetActorTransform();
+			}
+		}
+
+		// Positions are world-space once transformed, so the component itself
+		// stays at unit scale: scaling it would shrink the ribbon width without
+		// moving the particles.
+		Component->SetWorldLocation(CloudTransform.GetLocation());
+		Component->SetWorldScale3D(FVector::OneVector);
 
 		if (Result.Arrays->Num() == 0)
 		{
@@ -1391,6 +1471,11 @@ void AJUSYNCFileSpawnerActor::SyncPathlineComponents()
 		if (!System)
 		{
 			continue;
+		}
+
+		for (FVector& Position : Result.Arrays->Positions)
+		{
+			Position = CloudTransform.TransformPosition(Position);
 		}
 
 		PushStreamlineArrays(Component, *Result.Arrays);
@@ -1491,6 +1576,10 @@ void AJUSYNCFileSpawnerActor::SyncPathlineManager()
         RebuildPathlinesFromSampleCache();
     }
 
+    // Animated playback: advance the ribbon tip glide set up by ApplyCachedSample
+    // so the trails move with the cloud morph instead of snapping per sample.
+    PathlineManager->TickDisplayBlend();
+
     SyncPathlineComponents();
 
     const FJUSYNCPathlineStats Stats = PathlineManager->GetStats();
@@ -1512,10 +1601,11 @@ void AJUSYNCFileSpawnerActor::SyncPathlineManager()
             LastStatsLogTime = NowSeconds;
             UE_LOG(LogTemp, Display,
                 TEXT("[Spawner] Pathlines: active=%d visible=%d nodes=%lld ignored=%lld dropped=%lld "
-                     "dupIds=%lld elements=%d ingest=%.2fms build=%.2fms"),
+                     "dupIds=%lld elements=%d ingest=%.2fms build=%.2fms display=%llu"),
                 Stats.ActiveTracks, Stats.VisibleTracks, Stats.TotalNodes, Stats.IgnoredSamples,
                 Stats.DroppedSamples, Stats.DuplicateIds, PathlineManager->GetElementKeys().Num(),
-                Stats.LastIngestMs, Stats.LastBuildMs);
+                Stats.LastIngestMs, Stats.LastBuildMs,
+                static_cast<unsigned long long>(PathlineManager->GetDisplaySampleId()));
         }
     }
 }
@@ -2995,6 +3085,8 @@ void AJUSYNCFileSpawnerActor::ClearSampleCache()
     PendingLiveSamples.Empty();
     SampleCacheLiveFilename.Empty();
     SampleTimeById.Empty();
+    NewestCachedSampleTime = -1.0;
+    bSenderLoopDetected = false;
     SampleCacheBytes = 0;
     SampleCacheEntryCount = 0;
     NextSampleCacheSerial = 0;
@@ -3317,6 +3409,11 @@ void AJUSYNCFileSpawnerActor::AddSampleCacheEntry(const FString& Key, FJUSYNCSam
         SampleCacheBytes += Entry.Bytes;
         Existing = MoveTemp(Entry);
 
+        if (Existing.SampleTime > NewestCachedSampleTime)
+        {
+            NewestCachedSampleTime = Existing.SampleTime;
+        }
+
         if (!bSamplePlaybackActive || !bPauseLiveApplyDuringPlayback)
         {
             SampleCacheLiveFilename.Add(Key, Existing.Filename);
@@ -3352,6 +3449,11 @@ void AJUSYNCFileSpawnerActor::AddSampleCacheEntry(const FString& Key, FJUSYNCSam
     SampleCacheEntryCount++;
     List.Add(MoveTemp(Entry));
 
+    if (List.Last().SampleTime > NewestCachedSampleTime)
+    {
+        NewestCachedSampleTime = List.Last().SampleTime;
+    }
+
     if (!bSamplePlaybackActive || !bPauseLiveApplyDuringPlayback)
     {
         SampleCacheLiveFilename.Add(Key, List.Last().Filename);
@@ -3366,6 +3468,91 @@ void AJUSYNCFileSpawnerActor::AddSampleCacheEntry(const FString& Key, FJUSYNCSam
     }
 
     TrimSampleCache();
+}
+
+void AJUSYNCFileSpawnerActor::ConsiderSenderLoop(const FString& Filename, uint64 SenderTimestamp)
+{
+    if (!bEnableSampleCache)
+    {
+        return;
+    }
+
+    double NotifyTime = JUSYNCDecodeSenderTime(SenderTimestamp);
+    if (NotifyTime < 0.0)
+    {
+        NotifyTime = JUSYNCTimeFromFilename(Filename);
+    }
+    if (NotifyTime < 0.0)
+    {
+        return;
+    }
+
+    TArray<uint64> Timeline;
+    GetSampleTimeline(Timeline);
+    if (Timeline.Num() < 8)
+    {
+        // Too short to tell a replay apart from the initial burst arriving out
+        // of order; wait until a real timeline exists.
+        return;
+    }
+
+    double OldestTime = TNumericLimits<double>::Max();
+    double NewestTime = -1.0;
+    for (uint64 Id : Timeline)
+    {
+        const double Time = LookupSampleTime(Id);
+        if (Time >= 0.0)
+        {
+            OldestTime = FMath::Min(OldestTime, Time);
+            NewestTime = FMath::Max(NewestTime, Time);
+        }
+    }
+
+    const double Span = NewestTime - OldestTime;
+    if (Span < 1.0)
+    {
+        return;
+    }
+
+    // A replay restarts near the beginning of the clip after the newest frame
+    // has been seen. Anything else (a late download landing behind the head, a
+    // seek back a frame or two) is normal streaming and must not hijack the
+    // transport.
+    const bool bRestartedNearStart = NotifyTime <= OldestTime + 0.25 * Span;
+    const bool bBehindNewest = (NewestTime - NotifyTime) >= 0.5 * Span;
+    if (!bRestartedNearStart || !bBehindNewest)
+    {
+        return;
+    }
+
+    if (!bSenderLoopDetected)
+    {
+        UE_LOG(LogTemp, Display,
+            TEXT("[Playback] Sender loop detected: frame t=%.3fs (already applied) arrived while the newest cached sample is t=%.3fs - cached timeline will loop"),
+            NotifyTime, NewestTime);
+    }
+    bSenderLoopDetected = true;
+    SenderLoopDetectedSeconds = FPlatformTime::Seconds();
+}
+
+bool AJUSYNCFileSpawnerActor::ConsumeSenderLoopDetected()
+{
+    const bool bWasDetected = bSenderLoopDetected;
+    bSenderLoopDetected = false;
+    return bWasDetected;
+}
+
+bool AJUSYNCFileSpawnerActor::ConsumeSenderLoopDetectedIfRecent(float MaxAgeSeconds)
+{
+    if (!bSenderLoopDetected)
+    {
+        return false;
+    }
+
+    const bool bRecent = MaxAgeSeconds <= 0.0f
+        || (FPlatformTime::Seconds() - SenderLoopDetectedSeconds) <= MaxAgeSeconds;
+    bSenderLoopDetected = false;
+    return bRecent;
 }
 
 uint64 AJUSYNCFileSpawnerActor::CacheParsedSample(const FJUSYNCParsedFileResult& Result, bool bIsInitial)
@@ -3589,6 +3776,13 @@ void AJUSYNCFileSpawnerActor::ApplyCachedSample(float NormalizedPosition)
     const uint64 SelectedSampleId = Timeline[TimelineIndex];
     if (PathlineManager)
     {
+        // Animated playback glides the ribbon tips over the same window the
+        // cloud morph uses; a scrub (window 0) keeps exact per-sample snapshots.
+        const IConsoleVariable* CloudBlend = IConsoleManager::Get().FindConsoleVariable(
+            TEXT("jusync.Morph.CloudBlendMs"));
+        const int32 PlaybackBlendMs = CloudBlend ? CloudBlend->GetInt() : 0;
+        PathlineManager->SetDisplayTipBlendSeconds(
+            (bSamplePlaybackActive && PlaybackBlendMs > 0) ? PlaybackBlendMs / 1000.0f : 0.0f);
         PathlineManager->SetDisplaySampleId(SelectedSampleId);
     }
 
@@ -5931,6 +6125,13 @@ void AJUSYNCFileSpawnerActor::HandleFileUpdateNotification(const FString& Filena
         UE_LOG(LogTemp, Log, TEXT("[LiveUpdate] Blocking: initial spawn not done yet (file='%s')"), *Filename);
         return;
     }
+
+    // Every notification carries the sender's dataset time, including the
+    // scene/primstage files that are still re-sent once a replay has started
+    // (the broker stops re-notifying clip frames whose hashes did not change).
+    // Track the timeline here, before the clip-only filters below, so a sender
+    // that restarts its clip is noticed even when no new geometry arrives.
+    ConsiderSenderLoop(Filename, SampleId);
 
     const uint64 OldHashLo = FileHashLo.FindRef(Filename);
     const uint64 OldHashHi = FileHashHi.FindRef(Filename);

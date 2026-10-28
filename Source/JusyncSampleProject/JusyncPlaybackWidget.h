@@ -93,6 +93,13 @@ private:
 	 */
 	void TickCachedPlayback(float DeltaSeconds);
 
+	/**
+	 * Starts the cached walk. bFromLiveEdge takes over from the frame that is
+	 * already on screen (no cut, used by the sender-loop takeover); false cuts
+	 * to the oldest cached frame first.
+	 */
+	void StartCachedPlaybackFrom(bool bFromLiveEdge);
+
 	UPROPERTY(Transient)
 	TObjectPtr<AJUSYNCFileSpawnerActor> Spawner;
 
@@ -160,7 +167,17 @@ private:
 	bool bCachedPlaybackRunning = false;
 	float CachedPlaybackAccumulator = 0.0f;
 
+	/** Set when the user parks the transport on LIVE or PAUSE, so the sender
+	 *  loop takeover does not immediately restart playback behind their back.
+	 *  Pressing PLAY (or restarting PIE) clears it again. */
+	bool bAutoLoopPlaybackSuppressed = false;
+
 	float RefreshAccumulator = 0.0f;
+
+	/** Wall clock of the previous NativeTick. A collapsed panel does not tick, so
+	 *  a large gap means the HUD was closed (Tab) and any sender-loop latch it
+	 *  reads afterwards is stale - it must not restart cached playback. */
+	double LastWidgetTickSeconds = 0.0;
 
 	static constexpr float RefreshIntervalSeconds = 0.1f;
 };

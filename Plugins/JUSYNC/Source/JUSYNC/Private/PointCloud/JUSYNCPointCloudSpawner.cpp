@@ -1018,7 +1018,12 @@ void FJUSYNCPointCloudSpawner::OnAsyncCloudBuildFinished(const FString& Key, uin
         {
             UE_LOG(LogTemp, Warning, TEXT("JUSYNC Spawner: async build for '%s' %s (%.1f ms)"),
                    *Key, bSuccess ? TEXT("discarded") : TEXT("FAILED"), BuildMs);
-            if (IsValid(Actor) && !F.bEverSwapped)
+            // Only hand the actor back to the pool when it is NOT the actor
+            // currently mapped to this element. Releasing a mapped actor
+            // cleared ElementToActor, and the next cached frame then allocated
+            // a brand new actor instead of updating in place (which is what
+            // broke playback morphing).
+            if (IsValid(Actor) && !F.bEverSwapped && FindActorByElementKey(Key) != Actor)
             {
                 ReleaseActor(Actor);
                 InFlightBuilds.Remove(Key);
@@ -1145,6 +1150,41 @@ void FJUSYNCPointCloudSpawner::EnterPlaybackMode()
     }
 }
 
+void FJUSYNCPointCloudSpawner::SeedCloudDisplayPos(const FString& Key, AActor* InActor)
+{
+    if (CloudDisplayPos.Contains(Key))
+    {
+        return;
+    }
+
+    AActor* Actor = InActor ? InActor : FindActorByElementKey(Key);
+    if (ALidarPointCloudActor* LidarActor = Cast<ALidarPointCloudActor>(Actor))
+    {
+        if (ULidarPointCloudComponent* Comp = LidarActor->GetPointCloudComponent())
+        {
+            if (ULidarPointCloud* Cloud = Comp->GetPointCloud())
+            {
+                // CloudDisplayPos must hold PAYLOAD-space positions: the swap
+                // path stores F.RampPos (payload) and StartCloudSmoothMorph
+                // compares `payload + -LocationOffset` against the raw octree
+                // walk. Storing the raw walk here matched nothing (Held ==
+                // point count), so every playback frame fell back to the
+                // index-based ramp and never glided.
+                const FVector3f Offset = (FVector3f)Cloud->LocationOffset;
+                TArray<FVector3f> Displayed;
+                Displayed.Reserve(Cloud->GetNumPoints());
+                Cloud->ExecuteActionOnAllPoints(
+                    [&](FLidarPointCloudPoint* P) { Displayed.Add(P->Location + Offset); },
+                    /*bVisibleOnly*/false);
+                if (Displayed.Num() > 0)
+                {
+                    CloudDisplayPos.Add(Key, MoveTemp(Displayed));
+                }
+            }
+        }
+    }
+}
+
 void FJUSYNCPointCloudSpawner::PreparePointCloudForPlayback(const FString& Key)
 {
     // A scrub is an explicit jump, not a continuation of the live animation.
@@ -1163,35 +1203,6 @@ void FJUSYNCPointCloudSpawner::PreparePointCloudForPlayback(const FString& Key)
     // 300/300-unmatched ramp fallbacks and killed playback morphing.
     CloudLastArrival.Remove(Key);
 
-    // Seed the morph anchor from the cloud currently on screen. Without this,
-    // the first cached selection in playback mode has no CloudDisplayPos and
-    // every later selection also snaps because ShouldStartCloudRamp() never
-    // becomes true.
-    if (!CloudDisplayPos.Contains(Key))
-    {
-        if (AActor* Actor = FindActorByElementKey(Key))
-        {
-            if (ALidarPointCloudActor* LidarActor = Cast<ALidarPointCloudActor>(Actor))
-            {
-                if (ULidarPointCloudComponent* Comp = LidarActor->GetPointCloudComponent())
-                {
-                    if (ULidarPointCloud* Cloud = Comp->GetPointCloud())
-                    {
-                        TArray<FVector3f> Displayed;
-                        Displayed.Reserve(Cloud->GetNumPoints());
-                        Cloud->ExecuteActionOnAllPoints(
-                            [&](FLidarPointCloudPoint* P) { Displayed.Add(P->Location); },
-                            /*bVisibleOnly*/false);
-                        if (Displayed.Num() > 0)
-                        {
-                            CloudDisplayPos.Add(Key, MoveTemp(Displayed));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     if (TSharedRef<FInFlightCloudBuild>* Found = InFlightBuilds.Find(Key))
     {
         FInFlightCloudBuild& F = **Found;
@@ -1209,9 +1220,14 @@ void FJUSYNCPointCloudSpawner::PreparePointCloudForPlayback(const FString& Key)
         }
         else if (F.bDeferred)
         {
-            // The build already finished and is only waiting out its morph
-            // window; land-and-discard it now so the slot is free.
-            F.bChainAborted = true;
+            // A finished build that was only waiting out its morph window is
+            // landed NOW instead of being discarded. Discarding it used to
+            // release the actor whenever the slot had never swapped, which
+            // cleared the element->actor mapping; every later cached frame then
+            // had to spawn a fresh actor (FindActorByElementKey returned null,
+            // inPlace=0) so playback could never morph in place and the frame
+            // on screen never advanced at all.
+            F.EarliestApply = 0.0;
             const uint64 Generation = F.Generation;
             OnAsyncCloudBuildFinished(Key, Generation, true);
             InFlightBuilds.Remove(Key);
@@ -1221,6 +1237,12 @@ void FJUSYNCPointCloudSpawner::PreparePointCloudForPlayback(const FString& Key)
             InFlightBuilds.Remove(Key);
         }
     }
+
+    // Seed the morph anchor from the cloud that is actually on screen, i.e.
+    // after any deferred build has landed above. Without this, the first cached
+    // selection in playback mode has no CloudDisplayPos and every later
+    // selection also snaps.
+    SeedCloudDisplayPos(Key);
 }
 
 void FJUSYNCPointCloudSpawner::TickCloudRamps(double NowSeconds)
@@ -2683,7 +2705,11 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
         // samples, but only for entries explicitly marked as playback morphs;
         // ordinary live entries are still dropped while the playback window is
         // frozen.
-        const bool bAllowCloudMorph = !bPlaybackMode || Entry.bPlaybackMorph;
+        // Playback morphing is decided here, from the live console variable and
+        // the playback flag, rather than from a flag carried through the queue:
+        // the window being open *is* the user asking for a glide.
+        const bool bPlaybackMorphNow = bPlaybackMode && CVarJusyncCloudBlendMs.GetValueOnGameThread() > 0;
+        const bool bAllowCloudMorph = !bPlaybackMode || bPlaybackMorphNow;
         if (CVarJusyncAsyncCloudBuild.GetValueOnGameThread() > 0
             && Entry.Points.Num() > 0 && !Entry.bNeedsRecolor && bAllowCloudMorph)
         {
@@ -2697,27 +2723,49 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
             const double NowSeconds = FPlatformTime::Seconds();
             const FString Key = Entry.Key;
 
-            if (bAllowCloudMorph && bInPlaceUpdate && ShouldStartCloudRamp(Key, NowSeconds))
+            // Capture the pose on screen as the morph anchor. Playback frames
+            // need it for their explicit glide; live frames need it too - a
+            // live burst enqueues several frames before the first build swaps,
+            // so without seeding here CloudDisplayPos stayed empty and every
+            // live update snapped straight to the new cloud.
+            SeedCloudDisplayPos(Key, Actor);
+            const bool bWantMorph = bPlaybackMorphNow
+                ? CloudDisplayPos.Contains(Key)
+                : ShouldStartCloudRamp(Key, NowSeconds);
+            if (bAllowCloudMorph && bInPlaceUpdate && bWantMorph)
             {
                 AbortDeferredSwap(Key);
                 RampChains.Remove(Key);
 
                 const int32 ForcedMs = CVarJusyncCloudBlendMs.GetValueOnGameThread();
                 const double MaxBlend = FMath::Max(CVarJusyncCloudMaxBlendMs.GetValueOnGameThread(), 8) / 1000.0;
-                const bool bPlaybackMorph = bPlaybackMode && Entry.bPlaybackMorph;
+                const bool bPlaybackMorph = bPlaybackMorphNow;
                 // Playback ignores the CloudMaxBlendMs cap on purpose: at 1 fps
                 // the window is most of a second, so the frame glides for its
                 // whole duration instead of finishing in 200 ms and freezing.
+                const double ArrivalGap = NowSeconds - CloudLastArrival.FindRef(Key);
+                // Live streaming arrives as discrete frames: glide for most of
+                // the gap so the stepping becomes continuous motion. A burst
+                // (many samples landing in one frame) still gets a short glide,
+                // so the scene settles smoothly instead of snapping per file.
+                const double LiveBlend = FMath::Clamp(ArrivalGap * 0.9, 0.12, FMath::Max(0.45, MaxBlend));
                 const double BlendSeconds = bPlaybackMorph
                     ? FMath::Max(ForcedMs, 8) / 1000.0
                     : (ForcedMs > 0
                         ? ForcedMs / 1000.0
-                        : FMath::Clamp(NowSeconds - CloudLastArrival.FindRef(Key), 0.008, MaxBlend));
+                        : LiveBlend);
                 CloudLastArrival.Add(Key, NowSeconds);
 
-                if (CVarJusyncCloudSmooth.GetValueOnGameThread() > 0
-                    && StartCloudSmoothMorph(Key, Entry, Actor, NowSeconds, BlendSeconds))
+                const bool bSmoothStarted = CVarJusyncCloudSmooth.GetValueOnGameThread() > 0
+                    && StartCloudSmoothMorph(Key, Entry, Actor, NowSeconds, BlendSeconds);
+                if (bSmoothStarted)
                 {
+                    if (bPlaybackMorph)
+                    {
+                        UE_LOG(LogTemp, Display,
+                            TEXT("[Playback] morph '%s' %d pts over %.0fms"),
+                            *Key, Entry.Points.Num(), BlendSeconds * 1000.0);
+                    }
                     StartAsyncCloudBuild(Key, MoveTemp(Entry), Actor, NowSeconds + BlendSeconds);
                 }
                 else
@@ -2740,6 +2788,13 @@ void FJUSYNCPointCloudSpawner::DrainReadyQueueLocked()
             {
                 CloudLastArrival.Add(Key, NowSeconds);
                 RampChains.Remove(Key);
+                if (bPlaybackMorphNow)
+                {
+                    UE_LOG(LogTemp, Warning,
+                        TEXT("[Playback] morph skipped '%s': inPlace=%d allowMorph=%d anchor=%d pts=%d"),
+                        *Key, bInPlaceUpdate ? 1 : 0, bAllowCloudMorph ? 1 : 0,
+                        CloudDisplayPos.FindRef(Key).Num(), Entry.Points.Num());
+                }
                 StartAsyncCloudBuild(Key, MoveTemp(Entry), Actor);
             }
             ItemsProcessed++;

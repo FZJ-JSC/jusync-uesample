@@ -592,6 +592,25 @@ public:
     UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner|Playback")
     bool IsPlayingCachedSample() const { return bSamplePlaybackActive; }
 
+    // A looping sender replays frames it has already delivered, so the live
+    // diff sees identical hashes and never applies anything again (0 changed,
+    // 0 new) - live mode then sits on the last cached frame forever. The
+    // notification path latches that condition here; the transport panel
+    // consumes the latch (reading clears it) and starts looping the cached
+    // timeline so the morph and the pathline tips keep running.
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
+    bool ConsumeSenderLoopDetected();
+
+    // Same latch, but only reports a loop that was detected within
+    // MaxAgeSeconds. A cached-panel that was closed (Tab) while the sender kept
+    // looping must NOT jump out of live mode when it is opened again; this lets
+    // it tell a fresh loop from a stale latch.
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
+    bool ConsumeSenderLoopDetectedIfRecent(float MaxAgeSeconds);
+
+    UFUNCTION(BlueprintPure, Category = "JUSYNC|Spawner|Playback")
+    bool HasSenderLoopDetected() const { return bSenderLoopDetected; }
+
     // Temporary diagnostics: dumps the cache timeline, per-key entries and the
     // actor each key currently maps to. Safe to call from Python/BP.
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
@@ -816,6 +835,12 @@ private:
     // panel's EM= box retunes PathlineEmissiveStrength through it.
     UPROPERTY(Transient)
     TObjectPtr<class UMaterialExpressionMultiply> TrailEmissiveExpression;
+    // MPC_Jusync, resolved on first use: the ribbons are one shared material,
+    // so their glow is a collection scalar rather than a per-instance value.
+    UPROPERTY(Transient)
+    TObjectPtr<class UMaterialParameterCollection> PathlineGlowCollection;
+    float LastPathlineGlow = -1.0f;
+    bool bPathlineGlowMissingWarned = false;
     // Deleted clip filename -> world time at which its actors are destroyed
     // when no successor clip for the same stream key has appeared.
     TMap<FString, float> PendingDeletedFiles;
@@ -910,6 +935,18 @@ private:
     // synthetic 1/2/3 counter.
     TMap<uint64, double> SampleTimeById;
 
+    // Newest sender time in the sample cache and the sender-loop latch. Both
+    // are maintained from AddSampleCacheEntry / the notification dedup path.
+    double NewestCachedSampleTime = -1.0;
+    bool bSenderLoopDetected = false;
+    // Wall-clock stamp of the last loop latch, so a panel that reopens long
+    // after the loop can ignore it and stay live.
+    double SenderLoopDetectedSeconds = 0.0;
+
+    /** Flags a sender replay: a frame whose hash was already applied comes in
+        with a dataset time behind the newest cached sample. */
+    void ConsiderSenderLoop(const FString& Filename, uint64 SenderTimestamp);
+
     // Game-thread owner of the pathline state/worker.
     TSharedPtr<FJUSYNCPathlineManager> PathlineManager;
 
@@ -940,6 +977,10 @@ private:
 
     /** Drains finished ribbon arrays and pushes them into Niagara. */
     void SyncPathlineComponents();
+
+    /** Pushes jusync.Pathlines.Glow into MPC_Jusync.PathlineGlow, the scalar
+        every ribbon shares. Cheap once the collection matches the CVar. */
+    void EnsurePathlineGlow();
 
     /** Destroys the component for one element (and its renderer state). */
     void DestroyPathlineComponent(const FString& ElementName);
