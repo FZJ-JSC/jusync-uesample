@@ -36,6 +36,28 @@
 namespace
 {
     /**
+     * GLOW drives jusync.Spawner.CloudEmissiveFloor: the cloud's emissive
+     * floor in cd/m^2, not a 0..1 blend factor. Against a scene exposed for
+     * daylight (sun 1e5 lux - the ceiling fixtures need ~400 to read as
+     * white) the old 0..1 mapping sat entirely below the noise floor, so the
+     * handle moved and the cloud did not. Keep the slider normalized and map
+     * it onto 0..PointGlowMax with a squared curve: fine control at the
+     * bottom, a clipped blooming white at the top.
+     */
+    constexpr float PointGlowMax = 4000.0f;
+
+    float PointGlowFromSlider(float Value)
+    {
+        const float V = FMath::Clamp(Value, 0.0f, 1.0f);
+        return PointGlowMax * V * V;
+    }
+
+    float PointGlowToSlider(float Glow)
+    {
+        return FMath::Clamp(FMath::Sqrt(FMath::Max(Glow, 0.0f) / PointGlowMax), 0.0f, 1.0f);
+    }
+
+    /**
      * Geometry codes from the drawing:
      *   V1=24  W=360  H=668  H1=60  H2=52  H3=28  H4=40  H6=40
      *   R1=12  R2=7  R3=6  S1=16  S2=12  S3=8  S7=12
@@ -1219,7 +1241,11 @@ void UJusyncPathlineWidget::Refresh()
     const float PointGlow = CurrentFloatCvar(TEXT("jusync.Spawner.CloudEmissiveFloor"), 0.004f);
     if (PointGlowValueText)
     {
-        PointGlowValueText->SetText(FText::FromString(FString::Printf(TEXT("%.3f"), PointGlow)));
+        // The CVar is HDR: show decimals while it is a floor, whole numbers
+        // once the cloud is actually glowing.
+        PointGlowValueText->SetText(FText::FromString(PointGlow < 10.0f
+            ? FString::Printf(TEXT("%.3f"), PointGlow)
+            : FString::Printf(TEXT("%.0f"), PointGlow)));
     }
     if (QualityValueText)
     {
@@ -1339,7 +1365,7 @@ void UJusyncPathlineWidget::Refresh()
     }
     if (PointGlowSlider)
     {
-        PointGlowSlider->SetValue(PointGlow);
+        PointGlowSlider->SetValue(PointGlowToSlider(PointGlow));
     }
     if (ColorCombo)
     {
@@ -1448,7 +1474,8 @@ void UJusyncPathlineWidget::HandlePointGlowChanged(float Value)
         return;
     }
 
-    const float Glow = FJusyncPathlineHUDModel::ClampPointGlow(Value);
+    // The handle is normalized; the CVar is HDR light (see PointGlowFromSlider).
+    const float Glow = PointGlowFromSlider(FJusyncPathlineHUDModel::ClampPointGlow(Value));
     SetFloatCvar(TEXT("jusync.Spawner.CloudEmissiveFloor"), Glow);
 
     // The spawner pushes the CVar into each cloud's MID on its sizing tick.
