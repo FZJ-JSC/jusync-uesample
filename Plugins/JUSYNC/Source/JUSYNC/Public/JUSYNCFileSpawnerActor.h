@@ -401,7 +401,7 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Playback")
     bool bEnableSampleCache;
 
-    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Playback", meta = (EditCondition = "bEnableSampleCache", EditConditionHides, ClampMin = "1", ClampMax = "64"))
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Playback", meta = (EditCondition = "bEnableSampleCache", EditConditionHides, ClampMin = "1", ClampMax = "512"))
     int32 SampleCacheSize;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Playback", meta = (EditCondition = "bEnableSampleCache", EditConditionHides, ClampMin = "16"))
@@ -787,12 +787,17 @@ private:
         uint64 HashHi = 0;
     };
     TMap<FString, TArray<FJUSYNCSampleCacheEntry>> SampleCache;
-    TMap<FString, FJUSYNCSampleCacheEntry> PendingLiveSamples;
+    // Multi-map: one sender burst can deliver many samples for the same element key
+    // while playback is active, and a plain TMap kept only the last one.
+    TMultiMap<FString, FJUSYNCSampleCacheEntry> PendingLiveSamples;
     TMap<FString, FString> SampleCacheLiveFilename;
     int64 SampleCacheBytes = 0;
     int64 SampleCacheEntryCount = 0;
     uint64 NextSampleCacheSerial = 0;
     uint64 NextPlaybackSampleId = 0;
+    // Sample ids are derived from the sender time (see CacheParsedSample), so an
+    // id sorts like its timestep. This map only records the time for ids that came
+    // from somewhere else (sender frame id).
     TMap<uint64, double> SampleTimeById;
 
     double NewestCachedSampleTime = -1.0;

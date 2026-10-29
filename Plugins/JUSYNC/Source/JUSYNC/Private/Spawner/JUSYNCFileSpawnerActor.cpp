@@ -285,7 +285,7 @@ int64 AJUSYNCFileSpawnerActor::GetSampleCacheBudgetBytes() const
 
 int32 AJUSYNCFileSpawnerActor::GetSampleCacheCountCap() const
 {
-    const int32 StaticCap = FMath::Clamp(SampleCacheSize, 1, 64);
+    const int32 StaticCap = FMath::Clamp(SampleCacheSize, 1, 512);
     if (!bDynamicCacheBudget || DynamicSampleCacheBytes <= 0)
     {
         return StaticCap;
@@ -525,6 +525,9 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     BrokerEndpoint = TEXT("tcp://localhost:5556");
     RequestTimeoutMs = 5000;
     BandwidthBytesPerSecond = 10737418240.0f;
+    // 1000 keeps the 911-byte clip .usda sidecars out: they carry no geometry,
+    // and queueing them makes the initial pipeline churn through 120 failed
+    // downloads (twice, with retries) before the real .geo payloads land.
     MinimumFileSizeBytes = 1000;
     bFilterUSDOnly = true;
     bClipsOnly = true;
@@ -555,7 +558,7 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     LiveUpdatePollInterval = 20.0f;
     bAutoRefreshMeshes = true;
     LastCommitCompleteTime = 0.0;
-    CommitCompleteCooldownSeconds = 0.15f;
+    CommitCompleteCooldownSeconds = 0.02f;
     bSceneDiffInFlight = false;
     bCommitDiffPending = false;
     bInitialSpawnDone = false;
@@ -662,8 +665,10 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     bCachePointClouds = true;
 
     bEnableSampleCache = true;
-    SampleCacheSize = 8;
-    SampleCacheMaxMB = 512;
+    // A sender burst (ParaView time series) delivers far more than 8 samples; the
+    // old cap silently evicted most of the series before it could be scrubbed.
+    SampleCacheSize = 256;
+    SampleCacheMaxMB = 2048;
     bPauseLiveApplyDuringPlayback = true;
     PlaybackPosition = 1.0f;
     CachedSampleCount = 0;
@@ -3347,47 +3352,56 @@ uint64 AJUSYNCFileSpawnerActor::CacheParsedSample(const FJUSYNCParsedFileResult&
     }
 
     uint64 EffectiveSampleId = Result.SampleId;
-    if (EffectiveSampleId == 0)
-    {
-        if (bIsInitial || !bInitialSpawnDone)
-        {
-            EffectiveSampleId = 1;
-            NextPlaybackSampleId = FMath::Max(NextPlaybackSampleId, static_cast<uint64>(1));
-        }
-        else
-        {
-            EffectiveSampleId = ++NextPlaybackSampleId;
-        }
-    }
-    else
+    double EffectiveSampleTime = -1.0;
+    if (EffectiveSampleId != 0)
     {
         NextPlaybackSampleId = FMath::Max(NextPlaybackSampleId, EffectiveSampleId);
     }
-
-    if (!bEnableSampleCache)
+    // Per-file time wins over the sender timestamp: one CommitComplete can carry a
+    // whole time series, and every file in that frame shares its timestamp.
+    for (const FJUSYNCPointCloudRef& PC : Result.CompactPointClouds)
     {
-        return EffectiveSampleId;
-    }
-
-    double EffectiveSampleTime = -1.0;
-    if (const double* SentTime = SampleTimeById.Find(EffectiveSampleId))
-    {
-        EffectiveSampleTime = *SentTime;
-    }
-    if (EffectiveSampleTime < 0.0)
-    {
-        for (const FJUSYNCPointCloudRef& PC : Result.CompactPointClouds)
+        if (PC && PC->Time >= 0.0)
         {
-            if (PC && PC->Time >= 0.0)
-            {
-                EffectiveSampleTime = PC->Time;
-                break;
-            }
+            EffectiveSampleTime = PC->Time;
+            break;
         }
     }
     if (EffectiveSampleTime < 0.0)
     {
         EffectiveSampleTime = JUSYNCTimeFromFilename(Result.Filename);
+    }
+    if (EffectiveSampleTime < 0.0 && EffectiveSampleId != 0)
+    {
+        if (const double* SentTime = SampleTimeById.Find(EffectiveSampleId))
+        {
+            EffectiveSampleTime = *SentTime;
+        }
+    }
+
+    // The id has to *sort* like the timestep it belongs to, because playback and
+    // the pathline builder both cut history with `SampleId <= cutoff`. Ids handed
+    // out in arrival order break that: a late frame gets a higher id than a newer
+    // one, so ribbons cut the wrong nodes and playback walks the series backwards.
+    // Deriving the id from the time makes id order == time order by construction,
+    // and folds every file of one timestep (same time) onto one id for free.
+    if (EffectiveSampleTime >= 0.0)
+    {
+        const int64 TimeKey = FMath::RoundToInt64(EffectiveSampleTime * 1.0e6);
+        if (TimeKey >= 0)
+        {
+            EffectiveSampleId = static_cast<uint64>(TimeKey) + 1;
+        }
+    }
+    if (EffectiveSampleId == 0)
+    {
+        EffectiveSampleId = ++NextPlaybackSampleId;
+    }
+    NextPlaybackSampleId = FMath::Max(NextPlaybackSampleId, EffectiveSampleId);
+
+    if (!bEnableSampleCache)
+    {
+        return EffectiveSampleId;
     }
 
     const int32 Rank = FMath::Max(Result.Rank, 0);
@@ -3511,7 +3525,7 @@ void AJUSYNCFileSpawnerActor::FlushPendingLiveSamples()
         return;
     }
 
-    TMap<FString, FJUSYNCSampleCacheEntry> Pending = MoveTemp(PendingLiveSamples);
+    TMultiMap<FString, FJUSYNCSampleCacheEntry> Pending = MoveTemp(PendingLiveSamples);
     PendingLiveSamples.Empty();
 
     for (TPair<FString, FJUSYNCSampleCacheEntry>& Pair : Pending)
@@ -3737,7 +3751,11 @@ void AJUSYNCFileSpawnerActor::HideUnselectedPlaybackActors(const TSet<AActor*>& 
 
 void AJUSYNCFileSpawnerActor::SetPlaybackPosition(float NewPosition)
 {
-    PlaybackPosition = FMath::Clamp(NewPosition, 0.0f, 1.0f);
+    const float Clamped = FMath::Clamp(NewPosition, 0.0f, 1.0f);
+    // QSlider-style UIs land a hair short of the end (0.9989 in this level), which
+    // used to leave the spawner in scrub mode forever: live samples kept arriving
+    // but were only buffered, never applied. Treat the last 0.2% as "follow live".
+    PlaybackPosition = (Clamped >= 0.998f) ? 1.0f : Clamped;
 
     if (!bInitialSpawnDone)
     {
@@ -4489,13 +4507,10 @@ void AJUSYNCFileSpawnerActor::DownloadGradientPng(UJUSYNCSubsystem* Subsystem)
     {
         if (GradientPngRankMap.Num() > 0)
         {
-            for (auto It = GradientPngRankMap.CreateConstIterator(); It; ++It)
-            {
-                PngPath = It.Key();
-                PngRank = It.Value().Rank;
-                PngSize = It.Value().Size;
-                break;
-            }
+            const auto& FirstPng = *GradientPngRankMap.CreateConstIterator();
+            PngPath = FirstPng.Key;
+            PngRank = FirstPng.Value.Rank;
+            PngSize = FirstPng.Value.Size;
         }
     }
     else

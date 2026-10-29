@@ -634,12 +634,9 @@ void AJUSYNCBenchmarkActor::DownloadGradientPng(UJUSYNCSubsystem* Subsystem)
     int32 PngRank = 0;
     if (GradientPngRankMap.Num() > 0)
     {
-        for (auto It = GradientPngRankMap.CreateConstIterator(); It; ++It)
-        {
-            PngPath = It.Key();
-            PngRank = It.Value();
-            break;
-        }
+        const auto& FirstPng = *GradientPngRankMap.CreateConstIterator();
+        PngPath = FirstPng.Key;
+        PngRank = FirstPng.Value;
     }
 
     if (PngPath.IsEmpty()) return;

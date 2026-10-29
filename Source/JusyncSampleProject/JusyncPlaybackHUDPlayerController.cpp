@@ -103,10 +103,10 @@ void AJusyncPlaybackHUDPlayerController::BeginPlay()
 		return;
 	}
 
-	for (TActorIterator<AJUSYNCFileSpawnerActor> It(GetWorld()); It; ++It)
+	TActorIterator<AJUSYNCFileSpawnerActor> It(GetWorld());
+	if (It)
 	{
 		Spawner = *It;
-		break;
 	}
 
 	if (!Spawner)

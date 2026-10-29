@@ -59,7 +59,6 @@ namespace
 		uint64 SampleCounter = 0;
 		uint64 LastSampleId = 0;
 		bool bHasSample = false;
-		bool bPendingBreak = false;
 	};
 
 	struct FSamplePoint
@@ -474,33 +473,54 @@ struct FJUSYNCPathlineManager::FImpl
 			{
 				const bool bWasPrevious = Element.PreviousKeysByRank.Contains(Rank) &&
 					Element.PreviousKeysByRank[Rank].Contains(Key);
-				const bool bBreak = Element.bPendingBreak ||
-					(Track.Nodes.Num() > 0 && !bWasPrevious);
-				const bool bSameSample = Track.Nodes.Num() > 0 &&
-					Track.Nodes.Last().SampleId == SampleId;
-				if (bSameSample)
+				const bool bGap = Track.Nodes.Num() > 0 && !bWasPrevious;
+
+				// Parallel downloads and cached replays hand us timesteps out of
+				// order. Appending by arrival left the history unsorted, and both
+				// the display cutoff walk and the run splitting assume ascending
+				// sample ids - that is what made tails jump and ribbons morph badly.
+				int32 InsertAt = 0;
 				{
-					FPathlineNode& Last = Track.Nodes.Last();
-					Last.Position = Point->Position;
-					Last.Scalar = Point->Scalar;
-					Last.Width = Point->Width;
-					Last.bHasScalar = Point->bHasScalar;
-					Last.Color = Point->Color;
-					Last.bHasColor = Point->bHasColor;
-					Last.bBreak = Last.bBreak || bBreak;
+					int32 Lo = 0;
+					int32 Hi = Track.Nodes.Num();
+					while (Lo < Hi)
+					{
+						const int32 Mid = (Lo + Hi) / 2;
+						if (Track.Nodes[Mid].SampleId < SampleId)
+						{
+							Lo = Mid + 1;
+						}
+						else
+						{
+							Hi = Mid;
+						}
+					}
+					InsertAt = Lo;
+				}
+
+				FPathlineNode Node;
+				Node.Position = Point->Position;
+				Node.Scalar = Point->Scalar;
+				Node.Width = Point->Width;
+				Node.bHasScalar = Point->bHasScalar;
+				Node.Color = Point->Color;
+				Node.bHasColor = Point->bHasColor;
+				Node.SampleId = SampleId;
+				// Only a node appended after everything else can start a new run;
+				// a node slotted between two known samples continues the track.
+				Node.bBreak = InsertAt >= Track.Nodes.Num() && bGap;
+
+				if (Track.Nodes.IsValidIndex(InsertAt) &&
+					Track.Nodes[InsertAt].SampleId == SampleId)
+				{
+					const bool bKeepBreak = InsertAt == Track.Nodes.Num() - 1 &&
+						(Track.Nodes[InsertAt].bBreak || bGap);
+					Track.Nodes[InsertAt] = Node;
+					Track.Nodes[InsertAt].bBreak = bKeepBreak;
 				}
 				else
 				{
-					FPathlineNode Node;
-					Node.Position = Point->Position;
-					Node.Scalar = Point->Scalar;
-					Node.Width = Point->Width;
-					Node.bHasScalar = Point->bHasScalar;
-					Node.Color = Point->Color;
-					Node.bHasColor = Point->bHasColor;
-					Node.SampleId = SampleId;
-					Node.bBreak = bBreak;
-					Track.Nodes.Add(Node);
+					Track.Nodes.Insert(Node, InsertAt);
 				}
 				Track.LastSeenCounter = ThisCounter;
 			}
@@ -556,7 +576,6 @@ struct FJUSYNCPathlineManager::FImpl
 		{
 			RankPreviousKeys.Add(Pair.Key);
 		}
-		Element.bPendingBreak = false;
 
 		RefreshTotalsLocked();
 		Stats.LastIngestMs = (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
@@ -1051,33 +1070,33 @@ void FJUSYNCPathlineManager::EnqueueSample(const FString& ElementName,
 	Item->SampleId = SampleId;
 	Item->Lut = Lut;
 
-	bool bDropped = false;
 	bool bStartWorker = false;
+	bool bDropped = false;
 	{
 		FScopeLock Lock(&Impl->QueueLock);
 		if (Impl->Queue.Num() >= 64)
 		{
+			// Drop the oldest queued timestep, not the incoming one: the older
+			// sample is already superseded and discarding the newest made the
+			// displayed ribbons lag behind the stream under a fast sender.
+			Impl->Queue.RemoveAt(0, 1, EAllowShrinking::No);
 			bDropped = true;
 		}
-		else
+		Impl->Queue.Add(Item);
+		if (!Impl->bWorkerRunning.exchange(true))
 		{
-			Impl->Queue.Add(Item);
-			if (!Impl->bWorkerRunning.exchange(true))
-			{
-				bStartWorker = true;
-			}
+			bStartWorker = true;
 		}
 	}
 
 	if (bDropped)
 	{
+		// A single skipped timestep does not mean the tracks broke - the next
+		// sample still continues them. Marking a break here (and previously on
+		// every element, not just this one) fragmented continuous tracks and is
+		// what littered the viewport with short ribbons.
 		FScopeLock Lock(&Impl->StateLock);
-		for (TPair<FString, FElementState>& Pair : Impl->Elements)
-		{
-			Pair.Value.bPendingBreak = true;
-		}
 		++Impl->Stats.DroppedSamples;
-		return;
 	}
 
 	if (bStartWorker)

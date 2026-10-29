@@ -245,9 +245,10 @@ namespace
             return 0.0f;
         }
         const int32 Last = Count - 1;
-        return Index >= Last
-            ? 0.9989f
-            : static_cast<float>(Index) / static_cast<float>(Last);
+        // The newest cached sample is the live edge: position 1.0 puts the spawner
+        // back in live mode. A value just below 1.0 (the old 0.9989) parked it in
+        // scrub mode for good, and every later sender timestep was only buffered.
+        return static_cast<float>(FMath::Clamp(Index, 0, Last)) / static_cast<float>(Last);
     }
 }
 
@@ -496,7 +497,10 @@ void UJusyncPlaybackWidget::StartCachedPlaybackFrom(bool bFromLiveEdge)
     if (bFromLiveEdge)
     {
         SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
-        Spawner->SetPlaybackPosition(0.998f);
+        // Park one sample before the live edge so this run has a step to play and
+        // then lands on live, instead of sitting one hair below the end forever.
+        const int32 Count = Spawner->GetCachedSampleCount();
+        Spawner->SetPlaybackPosition(ScrubPositionForIndex(FMath::Max(0, Count - 2), Count));
     }
     else
     {
@@ -507,6 +511,8 @@ void UJusyncPlaybackWidget::StartCachedPlaybackFrom(bool bFromLiveEdge)
     }
 
     CachedPlaybackAccumulator = 0.0f;
+    // Any new sample aborts the replay in Tick; see TickCachedPlayback.
+    CachedPlaybackStartCount = Spawner->GetCachedSampleCount();
     bCachedPlaybackRunning = true;
     Refresh();
 }
@@ -523,6 +529,19 @@ void UJusyncPlaybackWidget::TickCachedPlayback(float DeltaSeconds)
     {
         bCachedPlaybackRunning = false;
         ClearPlaybackMorphWindow();
+        return;
+    }
+
+    if (Count != CachedPlaybackStartCount)
+    {
+        // The sender kept streaming after the replay started. Follow it instead of
+        // walking a buffer that is growing faster than the replay can consume it -
+        // that left every new timestep buffered and invisible.
+        bCachedPlaybackRunning = false;
+        CachedPlaybackAccumulator = 0.0f;
+        ClearPlaybackMorphWindow();
+        Spawner->FollowLatestSample();
+        Refresh();
         return;
     }
 

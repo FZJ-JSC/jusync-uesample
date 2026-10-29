@@ -145,6 +145,9 @@ private:
 
 	bool bCachedPlaybackRunning = false;
 	float CachedPlaybackAccumulator = 0.0f;
+	// Sample count when the replay started; a growing count means the sender is
+	// still streaming, and replaying the buffer would just hide the live frames.
+	int32 CachedPlaybackStartCount = 0;
 
 	bool bAutoLoopPlaybackSuppressed = false;
 

@@ -1076,8 +1076,9 @@ bool UJUSYNCSubsystem::StartReceiving()
     }
 
     return Result == 1;
-#endif
+#else
     return false;
+#endif
 }
 
 void UJUSYNCSubsystem::StopReceiving()
@@ -4844,8 +4845,9 @@ bool UJUSYNCSubsystem::ConnectToBroker(const FString& BrokerEndpoint, int32 Time
         UE_LOG(LogJUSYNC, Error, TEXT("Failed to connect to broker (Result: %d)"), Result);
         return false;
     }
-#endif
+#else
     return false;
+#endif
 }
 
 void UJUSYNCSubsystem::DisconnectFromBroker()
@@ -4875,8 +4877,9 @@ bool UJUSYNCSubsystem::IsBrokerConnected() const
 
     UE_LOG(LogJUSYNC, Log, TEXT("Broker connection status: %s"), bConnected ? TEXT("CONNECTED") : TEXT("DISCONNECTED"));
     return bConnected;
-#endif
+#else
     return false;
+#endif
 }
 
 bool UJUSYNCSubsystem::RequestFileList(int32 TargetRank, int32 TimeoutMs, TArray<FString>& OutFiles)
@@ -5549,8 +5552,9 @@ bool UJUSYNCSubsystem::RequestWorkerStatus(int32 TargetRank, int32 TimeoutMs, TA
         OutWorkerStatus.Empty();
         return false;
     }
-#endif
+#else
     return false;
+#endif
 }
 
 bool UJUSYNCSubsystem::RequestWorkerCount(int32 TimeoutMs, int32& OutWorkerCount)
@@ -5587,8 +5591,9 @@ bool UJUSYNCSubsystem::RequestWorkerCount(int32 TimeoutMs, int32& OutWorkerCount
     }
 
     return bResult == 1;
-#endif
+#else
     return false;
+#endif
 }
 
 bool UJUSYNCSubsystem::RequestTotalWorkerCount(int32 TimeoutMs, int32& OutTotalCount)
@@ -5625,8 +5630,9 @@ bool UJUSYNCSubsystem::RequestTotalWorkerCount(int32 TimeoutMs, int32& OutTotalC
     }
 
     return Result == 1;
-#endif
+#else
     return false;
+#endif
 }
 
 bool UJUSYNCSubsystem::RequestWorkerCountExcludingRank0(int32 TimeoutMs, int32& OutWorkerCount)
@@ -5663,8 +5669,9 @@ bool UJUSYNCSubsystem::RequestWorkerCountExcludingRank0(int32 TimeoutMs, int32& 
     }
 
     return Result == 1;
-#endif
+#else
     return false;
+#endif
 }
 
 void UJUSYNCSubsystem::CreateMaterialFromTexture_Async(UTexture2D* Texture, URealtimeMeshComponent* TargetComponent)
