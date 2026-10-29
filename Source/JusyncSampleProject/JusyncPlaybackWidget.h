@@ -8,6 +8,7 @@
 class AJUSYNCFileSpawnerActor;
 class UBorder;
 class UButton;
+class UCanvasPanel;
 class UImage;
 class UTextBlock;
 class USlider;
@@ -65,17 +66,17 @@ private:
 	void BuildLayout();
 	void ApplyReveal();
 	UTextBlock* MakeLabel(const FName Name, const FText& Label);
-	UButton* MakeButton(const FName Name, const FText& Label, const FText& Tooltip,
-		TObjectPtr<UTextBlock>* OutCaption = nullptr, float FontSize = 13.0f);
 	UBorder* MakeRoundedBorder(const FName Name, const FLinearColor& Fill,
 		const FLinearColor& Outline, float Radius, float OutlineWidth,
 		const FMargin& InPadding = FMargin(0.0f));
-	UButton* MakeSwitch(const FName Name, const FText& Tooltip, TObjectPtr<UBorder>& OutThumb);
+	UButton* MakeSwitch(const FName Name, TObjectPtr<UBorder>& OutThumb);
 	void SetSwitchState(UButton* Button, UBorder* Thumb, bool bOn);
 
 	void Refresh();
 
 	void TickCachedPlayback(float DeltaSeconds);
+
+	void TickSliderVisual(float DeltaSeconds);
 
 	void StartCachedPlaybackFrom(bool bFromLiveEdge);
 
@@ -96,6 +97,33 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<USlider> ScrubSlider;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UCanvasPanel> ScrubVisual;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UImage> ScrubTrack;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UImage> ScrubFill;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UImage> ScrubThumb;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UImage> ScrubThumbRing;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UBorder> ScrubBubble;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UTextBlock> ScrubBubbleText;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UImage> ScrubGlow;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UImage> ScrubRipple;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UTextBlock> StepText;
@@ -139,6 +167,9 @@ private:
 	bool bApplyingFromCode = false;
 	bool bDraggingSlider = false;
 	bool bLayoutBuilt = false;
+
+	float ScrubThumbScale = 1.0f;
+	float ScrubBubbleAlpha = 0.0f;
 
 	FJusyncPanelReveal Reveal;
 	TArray<FJusyncGlassBlur> GlassBlurs;

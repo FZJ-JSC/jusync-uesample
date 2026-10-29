@@ -611,6 +611,12 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     PathlineColorMax = 1.0f;
     PathlineFlatColor = FLinearColor::White;
     PathlineEmissiveStrength = 0.05f;
+    PathlineFlowSpeed = 0.15f;
+    PathlineFlowStrength = 6.0f;
+    PathlineFlowSharpness = 3.5f;
+    PathlineSegmentSubdiv = 6;
+    PathlineCometArrowWidth = 3.0f;
+    PathlineCometArrowSpan = 0.10f;
     PathlineSelectionSeed = 1337;
     PathlinePendingTimeoutSeconds = 2.0f;
     PathlineMaterial = nullptr;
@@ -1187,6 +1193,12 @@ FJUSYNCPathlineSettings AJUSYNCFileSpawnerActor::BuildPathlineSettings() const
     Settings.ColorMin = FMath::Min(PathlineColorMin, PathlineColorMax);
     Settings.ColorMax = FMath::Max(PathlineColorMin, PathlineColorMax);
     Settings.FlatColor = PathlineFlatColor;
+    Settings.FlowSpeed = FMath::Max(0.0f, PathlineFlowSpeed);
+    Settings.FlowStrength = FMath::Max(0.0f, PathlineFlowStrength);
+    Settings.FlowSharpness = FMath::Max(0.5f, PathlineFlowSharpness);
+    Settings.SegmentSubdiv = FMath::Clamp(PathlineSegmentSubdiv, 1, 16);
+    Settings.CometArrowWidth = FMath::Max(0.0f, PathlineCometArrowWidth);
+    Settings.CometArrowSpan = FMath::Clamp(PathlineCometArrowSpan, 0.02f, 0.5f);
     Settings.SelectionSeed = static_cast<uint64>(FMath::Max(0, PathlineSelectionSeed));
     Settings.Material = PathlineMaterial;
     return Settings;
@@ -1261,7 +1273,13 @@ void AJUSYNCFileSpawnerActor::DestroyAllPathlineComponents()
 
 void AJUSYNCFileSpawnerActor::EnsurePathlineGlow()
 {
-    const float Glow = CVarJusyncPathlineGlow.GetValueOnGameThread();
+    const double Now = FPlatformTime::Seconds();
+    const double Delta = LastPathlinePulseTime > 0.0 ? Now - LastPathlinePulseTime : 0.0;
+    LastPathlinePulseTime = Now;
+    PathlinePulseEnergy *= FMath::Exp(-static_cast<float>(Delta) * 2.5f);
+
+    const float Glow = CVarJusyncPathlineGlow.GetValueOnGameThread() *
+        (1.0f + 0.9f * PathlinePulseEnergy);
     if (FMath::IsNearlyEqual(Glow, LastPathlineGlow, 1e-4f))
     {
         return;
@@ -1394,6 +1412,7 @@ void AJUSYNCFileSpawnerActor::SyncPathlineComponents()
 		}
 
 		PushStreamlineArrays(Component, *Result.Arrays);
+		PathlinePulseEnergy = 1.0f;
 	}
 }
 
@@ -2929,6 +2948,7 @@ void AJUSYNCFileSpawnerActor::ClearSampleCache()
     PlaybackPosition = 1.0f;
     bSamplePlaybackActive = false;
     bApplyingCachedSample = false;
+    ApplyPlaybackMorphWindow(0);
 
     UJUSYNCSubsystem* Subsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
     if (FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr)
@@ -3535,6 +3555,39 @@ void AJUSYNCFileSpawnerActor::FlushPendingLiveSamples()
     }
 }
 
+int32 AJUSYNCFileSpawnerActor::ResolvePlaybackMorphMs() const
+{
+    // 0 on CloudBlendMs means "one playback step"; shave a little off it so a
+    // morph settles before the next sample retargets it instead of being kept in
+    // flight forever.
+    const int32 StepMs = (bEnableTimeStepAnimation && TimeStepPlaybackFPS > 0.0f)
+        ? FMath::RoundToInt(1000.0f / TimeStepPlaybackFPS)
+        : 0;
+    const int32 WindowMs = CloudBlendMs > 0
+        ? CloudBlendMs
+        : FMath::RoundToInt(static_cast<float>(StepMs) * 0.9f);
+    return FMath::Clamp(WindowMs, 8, 4000);
+}
+
+void AJUSYNCFileSpawnerActor::ApplyPlaybackMorphWindow(int32 WindowMs)
+{
+    if (WindowMs == PlaybackMorphWindowMs)
+    {
+        return;
+    }
+    PlaybackMorphWindowMs = WindowMs;
+
+    auto SetMorphCVar = [](const TCHAR* Name, int32 Value)
+    {
+        if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(Name))
+        {
+            CVar->Set(Value, ECVF_SetByCode);
+        }
+    };
+    SetMorphCVar(TEXT("jusync.Morph.CloudBlendMs"), WindowMs > 0 ? WindowMs : CloudBlendMs);
+    SetMorphCVar(TEXT("jusync.Morph.MeshBlendMs"), WindowMs > 0 ? WindowMs : MeshBlendMs);
+}
+
 void AJUSYNCFileSpawnerActor::ApplyCachedSample(float NormalizedPosition)
 {
     if (!bEnableSampleCache || SampleCache.Num() == 0 || bApplyingCachedSample)
@@ -3554,13 +3607,17 @@ void AJUSYNCFileSpawnerActor::ApplyCachedSample(float NormalizedPosition)
         ? 0
         : FMath::Clamp(FMath::RoundToInt(Position * static_cast<float>(Timeline.Num() - 1)), 0, Timeline.Num() - 1);
     const uint64 SelectedSampleId = Timeline[TimelineIndex];
+
+    // Clouds read the morph cvars when their queue is processed, which happens
+    // after this call returns; saving and restoring the window around the loop
+    // below would leave them on the live "auto" value. Keep it applied for as
+    // long as playback lasts instead.
+    ApplyPlaybackMorphWindow(bSamplePlaybackActive ? ResolvePlaybackMorphMs() : 0);
+
     if (PathlineManager)
     {
-        const IConsoleVariable* CloudBlend = IConsoleManager::Get().FindConsoleVariable(
-            TEXT("jusync.Morph.CloudBlendMs"));
-        const int32 PlaybackBlendMs = CloudBlend ? CloudBlend->GetInt() : 0;
         PathlineManager->SetDisplayTipBlendSeconds(
-            (bSamplePlaybackActive && PlaybackBlendMs > 0) ? PlaybackBlendMs / 1000.0f : 0.0f);
+            bSamplePlaybackActive ? static_cast<float>(PlaybackMorphWindowMs) / 1000.0f : 0.0f);
         PathlineManager->SetDisplaySampleId(SelectedSampleId);
     }
 
@@ -3568,14 +3625,6 @@ void AJUSYNCFileSpawnerActor::ApplyCachedSample(float NormalizedPosition)
     FJUSYNCPointCloudSpawner* PCSpawner = Subsystem ? Subsystem->GetPointCloudSpawner() : nullptr;
 
     bApplyingCachedSample = true;
-
-    IConsoleVariable* MeshBlendCVar = IConsoleManager::Get().FindConsoleVariable(
-        TEXT("jusync.Morph.MeshBlendMs"));
-    const int32 SavedMeshBlendMs = MeshBlendCVar ? MeshBlendCVar->GetInt() : 0;
-    if (MeshBlendCVar)
-    {
-        MeshBlendCVar->Set(200, ECVF_SetByCode);
-    }
 
     TSet<AActor*> AppliedActors;
 
@@ -3705,11 +3754,6 @@ void AJUSYNCFileSpawnerActor::ApplyCachedSample(float NormalizedPosition)
     HideUnselectedPlaybackActors(AppliedActors);
 
     DeduplicateLogicalActors();
-
-    if (MeshBlendCVar)
-    {
-        MeshBlendCVar->Set(SavedMeshBlendMs, ECVF_SetByCode);
-    }
 
     bApplyingCachedSample = false;
     PlaybackAnchorSampleId = SelectedSampleId;

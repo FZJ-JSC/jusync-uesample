@@ -1,6 +1,7 @@
 #include "JusyncPlaybackWidget.h"
 
 #include "JusyncHUDIcons.h"
+#include "JusyncHUDFlipbook.h"
 #include "JusyncPlaybackHUDModel.h"
 #include "JusyncPlaybackHUDPlayerController.h"
 #include "JUSYNCFileSpawnerActor.h"
@@ -24,7 +25,6 @@
 #include "Components/VerticalBox.h"
 #include "Components/VerticalBoxSlot.h"
 #include "Components/Widget.h"
-#include "HAL/IConsoleManager.h"
 #include "Styling/SlateTypes.h"
 
 #define LOCTEXT_NAMESPACE "JusyncPlaybackWidget"
@@ -79,6 +79,22 @@ namespace
         constexpr float IconSize = 15.0f;
     }
 
+    namespace Scrub
+    {
+        // SetIndentHandle() maps the value to HalfThumb + Value * (Width - Thumb)
+        // off the style's thumb size, so the drawn thumb must use the same size or
+        // it drifts away from the cursor towards the ends of the track.
+        constexpr float ThumbSize = 18.0f;
+        constexpr float TrackHeight = 6.0f;
+        constexpr float TrackY = 28.0f;
+        // Leaves room for the drag bubble above the track without colliding with
+        // the step/time row above the slider.
+        constexpr float Height = 42.0f;
+        constexpr float BubbleWidth = 54.0f;
+        constexpr float BubbleHeight = 18.0f;
+        constexpr float BubbleY = 9.0f;
+    }
+
     void StyleLabel(UTextBlock* Text, float Size, const FLinearColor& Color)
     {
         FSlateFontInfo Font = Text->GetFont();
@@ -120,27 +136,24 @@ namespace
 
     FSliderStyle MakeSliderStyle()
     {
+        // The slider is input only. ScrubVisual draws the track, the fill and the
+        // handle, because those have to follow the value exactly and carry the
+        // flipbook ornaments; the slider's own brushes stay invisible.
         FSliderStyle Style = FSliderStyle::GetDefault();
-        const FSlateRoundedBoxBrush Track(Theme::SliderTrack, 3.0f, FLinearColor::Transparent, 0.0f,
-            FVector2D(0.0f, 6.0f));
-        const FSlateRoundedBoxBrush TrackHover(Theme::SliderTrack * 1.35f, 3.0f,
-            FLinearColor::Transparent, 0.0f, FVector2D(0.0f, 6.0f));
-        const FSlateRoundedBoxBrush TrackDisabled(Theme::SliderTrack * 0.8f, 3.0f,
-            FLinearColor::Transparent, 0.0f, FVector2D(0.0f, 6.0f));
-        const FSlateRoundedBoxBrush Thumb(Theme::SliderThumb, 7.0f,
-            FLinearColor(0.0f, 0.0f, 0.0f, 0.25f), 1.0f, FVector2D(14.0f, 14.0f));
-        const FSlateRoundedBoxBrush ThumbHover(FLinearColor(1.0f, 1.0f, 1.0f, 1.0f), 7.0f,
-            FLinearColor(0.0f, 0.0f, 0.0f, 0.25f), 1.0f, FVector2D(14.0f, 14.0f));
-        const FSlateRoundedBoxBrush ThumbDisabled(FLinearColor(0.80f, 0.84f, 0.90f, 0.65f), 7.0f,
-            FLinearColor::Transparent, 0.0f, FVector2D(14.0f, 14.0f));
+        const FSlateRoundedBoxBrush HiddenBar(FLinearColor::Transparent, 0.0f,
+            FLinearColor::Transparent, 0.0f, FVector2D(0.0f, 10.0f));
+        // The handle size still drives the value mapping (SetIndentHandle), so
+        // it must match the drawn handle or the thumb lags the cursor.
+        const FSlateRoundedBoxBrush HiddenThumb(FLinearColor::Transparent, 0.0f,
+            FLinearColor::Transparent, 0.0f, FVector2D(18.0f, 18.0f));
 
-        Style.NormalBarImage = Track;
-        Style.HoveredBarImage = TrackHover;
-        Style.DisabledBarImage = TrackDisabled;
-        Style.NormalThumbImage = Thumb;
-        Style.HoveredThumbImage = ThumbHover;
-        Style.DisabledThumbImage = ThumbDisabled;
-        Style.BarThickness = 6.0f;
+        Style.NormalBarImage = HiddenBar;
+        Style.HoveredBarImage = HiddenBar;
+        Style.DisabledBarImage = HiddenBar;
+        Style.NormalThumbImage = HiddenThumb;
+        Style.HoveredThumbImage = HiddenThumb;
+        Style.DisabledThumbImage = HiddenThumb;
+        Style.BarThickness = 10.0f;
         return Style;
     }
 
@@ -172,11 +185,10 @@ namespace
     }
 
     UButton* MakeIconButton(UWidgetTree* Tree, const FName Name,
-        JusyncHUDIcons::EIcon Icon, const FText& Tooltip, float IconSize,
+        JusyncHUDIcons::EIcon Icon, float IconSize,
         UImage** OutIcon = nullptr)
     {
         UButton* Button = Tree->ConstructWidget<UButton>(UButton::StaticClass(), Name);
-        Button->SetToolTipText(Tooltip);
         Button->SetStyle(MakeButtonStyle(Theme::ChipIdle, Theme::ChipHover,
             Theme::ChipPressed, Theme::ChipDisabled, 8.0f));
         Button->SetClickMethod(EButtonClickMethod::Type::PreciseClick);
@@ -197,11 +209,10 @@ namespace
     }
 
     UButton* MakeIconLabelButton(UWidgetTree* Tree, const FName Name,
-        JusyncHUDIcons::EIcon Icon, const FText& Label, const FText& Tooltip,
+        JusyncHUDIcons::EIcon Icon, const FText& Label,
         float IconSize, float FontSize)
     {
         UButton* Button = Tree->ConstructWidget<UButton>(UButton::StaticClass(), Name);
-        Button->SetToolTipText(Tooltip);
         Button->SetStyle(MakeButtonStyle(Theme::ChipIdle, Theme::ChipHover,
             Theme::ChipPressed, Theme::ChipDisabled, 8.0f));
         Button->SetClickMethod(EButtonClickMethod::Type::PreciseClick);
@@ -272,33 +283,6 @@ namespace
         Widget->SetNavigationRuleBase(EUINavigation::Previous, EUINavigationRule::Escape);
     }
 
-    int32 GPlaybackMorphWindowMs = 0;
-
-    void SetPlaybackMorphWindow(float FramesPerSecond)
-    {
-        const float Fps = FMath::Clamp(FramesPerSecond, 1.0f, 240.0f);
-        const int32 BlendMs = FMath::Clamp(FMath::RoundToInt(800.0f / Fps), 8, 4000);
-        if (BlendMs == GPlaybackMorphWindowMs)
-        {
-            return;
-        }
-        if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(
-                TEXT("jusync.Morph.CloudBlendMs")))
-        {
-            CVar->Set(BlendMs, ECVF_SetByConsole);
-            GPlaybackMorphWindowMs = BlendMs;
-        }
-    }
-
-    void ClearPlaybackMorphWindow()
-    {
-        GPlaybackMorphWindowMs = 0;
-        if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(
-                TEXT("jusync.Morph.CloudBlendMs")))
-        {
-            CVar->Set(0, ECVF_SetByConsole);
-        }
-    }
 }
 
 void UJusyncPlaybackWidget::EnsureLayoutBuilt()
@@ -404,6 +388,9 @@ void UJusyncPlaybackWidget::NativeTick(const FGeometry& MyGeometry, float InDelt
 {
     Super::NativeTick(MyGeometry, InDeltaTime);
 
+    JusyncHUDFlipbook::Tick();
+    TickSliderVisual(InDeltaTime);
+
     if (Reveal.Tick(InDeltaTime))
     {
         ApplyReveal();
@@ -472,11 +459,6 @@ void UJusyncPlaybackWidget::NativeTick(const FGeometry& MyGeometry, float InDelt
 
     TickCachedPlayback(InDeltaTime);
 
-    if (!bCachedPlaybackRunning && GPlaybackMorphWindowMs != 0)
-    {
-        ClearPlaybackMorphWindow();
-    }
-
     RefreshAccumulator += InDeltaTime;
     if (RefreshAccumulator < RefreshIntervalSeconds)
     {
@@ -496,7 +478,6 @@ void UJusyncPlaybackWidget::StartCachedPlaybackFrom(bool bFromLiveEdge)
 
     if (bFromLiveEdge)
     {
-        SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
         // Park one sample before the live edge so this run has a step to play and
         // then lands on live, instead of sitting one hair below the end forever.
         const int32 Count = Spawner->GetCachedSampleCount();
@@ -504,10 +485,8 @@ void UJusyncPlaybackWidget::StartCachedPlaybackFrom(bool bFromLiveEdge)
     }
     else
     {
-        ClearPlaybackMorphWindow();
         Spawner->SetPlaybackPosition(0.0f);
 
-        SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
     }
 
     CachedPlaybackAccumulator = 0.0f;
@@ -515,6 +494,81 @@ void UJusyncPlaybackWidget::StartCachedPlaybackFrom(bool bFromLiveEdge)
     CachedPlaybackStartCount = Spawner->GetCachedSampleCount();
     bCachedPlaybackRunning = true;
     Refresh();
+}
+
+void UJusyncPlaybackWidget::TickSliderVisual(float DeltaSeconds)
+{
+    if (!ScrubVisual || !ScrubSlider || !ScrubTrack || !ScrubFill || !ScrubThumb)
+    {
+        return;
+    }
+
+    const FVector2D LocalSize = ScrubVisual->GetCachedGeometry().GetLocalSize();
+    constexpr float ThumbSize = Scrub::ThumbSize;
+    if (LocalSize.X <= ThumbSize || LocalSize.Y <= 0.0f)
+    {
+        return;
+    }
+
+    const float HalfThumb = ThumbSize * 0.5f;
+    const float TrackLength = LocalSize.X - ThumbSize;
+    const float Value = FMath::Clamp(ScrubSlider->GetValue(), 0.0f, 1.0f);
+    // Same mapping the slider uses for its own invisible handle, so the drawn
+    // thumb sits exactly under the cursor instead of drifting at the ends.
+    const float CenterX = HalfThumb + TrackLength * Value;
+
+    const bool bHovered = ScrubSlider->IsHovered();
+    const float TargetScale = bDraggingSlider ? 1.16f : (bHovered ? 1.08f : 1.0f);
+    ScrubThumbScale = FMath::FInterpTo(ScrubThumbScale, TargetScale, DeltaSeconds, 16.0f);
+
+    auto Place = [](UImage* Image, const FVector2D& Position, const FVector2D& Size)
+    {
+        if (Image)
+        {
+            if (UCanvasPanelSlot* Slot = Cast<UCanvasPanelSlot>(Image->Slot))
+            {
+                Slot->SetPosition(Position);
+                Slot->SetSize(Size);
+            }
+        }
+    };
+
+    Place(ScrubTrack, FVector2D(HalfThumb, Scrub::TrackY),
+        FVector2D(TrackLength, Scrub::TrackHeight));
+    Place(ScrubFill, FVector2D(HalfThumb, Scrub::TrackY),
+        FVector2D(TrackLength * Value, Scrub::TrackHeight));
+
+    const FVector2D ThumbCenter(CenterX, Scrub::TrackY);
+    const float OrnamentScale = FMath::Lerp(1.0f, ScrubThumbScale, 0.55f);
+    Place(ScrubThumb, ThumbCenter, FVector2D(ThumbSize * ScrubThumbScale, ThumbSize * ScrubThumbScale));
+    Place(ScrubThumbRing, ThumbCenter, FVector2D(24.0f * ScrubThumbScale, 24.0f * ScrubThumbScale));
+    Place(ScrubGlow, ThumbCenter, FVector2D(52.0f * OrnamentScale, 52.0f * OrnamentScale));
+    Place(ScrubRipple, ThumbCenter, FVector2D(72.0f, 72.0f));
+
+    if (ScrubBubble)
+    {
+        const float TargetAlpha = (bDraggingSlider || bHovered) ? 1.0f : 0.0f;
+        ScrubBubbleAlpha = FMath::FInterpTo(ScrubBubbleAlpha, TargetAlpha, DeltaSeconds, 14.0f);
+        if (ScrubBubbleAlpha <= 0.01f)
+        {
+            if (ScrubBubble->GetVisibility() != ESlateVisibility::Collapsed)
+            {
+                ScrubBubble->SetVisibility(ESlateVisibility::Collapsed);
+            }
+        }
+        else
+        {
+            ScrubBubble->SetVisibility(ESlateVisibility::HitTestInvisible);
+            ScrubBubble->SetRenderOpacity(ScrubBubbleAlpha);
+            if (UCanvasPanelSlot* BubbleSlot = Cast<UCanvasPanelSlot>(ScrubBubble->Slot))
+            {
+                const float HalfBubble = Scrub::BubbleWidth * 0.5f;
+                const float BubbleX = FMath::Clamp(CenterX, HalfBubble,
+                    FMath::Max(HalfBubble, LocalSize.X - HalfBubble));
+                BubbleSlot->SetPosition(FVector2D(BubbleX, Scrub::BubbleY));
+            }
+        }
+    }
 }
 
 void UJusyncPlaybackWidget::TickCachedPlayback(float DeltaSeconds)
@@ -528,7 +582,6 @@ void UJusyncPlaybackWidget::TickCachedPlayback(float DeltaSeconds)
     if (Count <= 1)
     {
         bCachedPlaybackRunning = false;
-        ClearPlaybackMorphWindow();
         return;
     }
 
@@ -539,14 +592,12 @@ void UJusyncPlaybackWidget::TickCachedPlayback(float DeltaSeconds)
         // that left every new timestep buffered and invisible.
         bCachedPlaybackRunning = false;
         CachedPlaybackAccumulator = 0.0f;
-        ClearPlaybackMorphWindow();
         Spawner->FollowLatestSample();
         Refresh();
         return;
     }
 
     const float FrameTime = 1.0f / FMath::Clamp(Spawner->TimeStepPlaybackFPS, 1.0f, 240.0f);
-    SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
     int32 Index = FMath::Clamp(Spawner->GetPlaybackSampleIndex(), 0, Count - 1);
     bool bAdvanced = false;
 
@@ -565,7 +616,6 @@ void UJusyncPlaybackWidget::TickCachedPlayback(float DeltaSeconds)
             {
                 Index = Count - 1;
                 bCachedPlaybackRunning = false;
-                ClearPlaybackMorphWindow();
             }
         }
         bAdvanced = true;
@@ -686,27 +736,27 @@ void UJusyncPlaybackWidget::BuildLayout()
 
     auto AddTransportButton = [this, Buttons](UButton* Button, bool bLast, float Width = Theme::Z1)
     {
-        USizeBox* Box = MakeSizeBox(WidgetTree, Button, Width, Theme::Z1);
+        UWidget* Content = Button;
+        if (UCanvasPanel* Wrapped = JusyncHUDFlipbook::WrapButton(WidgetTree, Button))
+        {
+            Content = Wrapped;
+        }
+        USizeBox* Box = MakeSizeBox(WidgetTree, Content, Width, Theme::Z1);
         UHorizontalBoxSlot* Slot = Buttons->AddChildToHorizontalBox(Box);
         Slot->SetPadding(FMargin(0.0f, 0.0f, bLast ? 0.0f : 8.0f, 0.0f));
         Slot->SetVerticalAlignment(VAlign_Center);
     };
 
     PrevButton = MakeIconButton(WidgetTree, TEXT("PrevButton"),
-        JusyncHUDIcons::EIcon::Previous,
-        LOCTEXT("PrevTip", "Step one cached sample backwards"), 18.0f);
+        JusyncHUDIcons::EIcon::Previous, 18.0f);
     NextButton = MakeIconButton(WidgetTree, TEXT("NextButton"),
-        JusyncHUDIcons::EIcon::Next,
-        LOCTEXT("NextTip", "Step one cached sample forwards"), 18.0f);
+        JusyncHUDIcons::EIcon::Next, 18.0f);
     UImage* PlayPauseImage = nullptr;
     PlayPauseButton = MakeIconButton(WidgetTree, TEXT("PlayPauseButton"),
-        JusyncHUDIcons::EIcon::Play,
-        LOCTEXT("PlayPauseTip", "Play the cached samples at the current rate, or pause on the frame shown"),
-        18.0f, &PlayPauseImage);
+        JusyncHUDIcons::EIcon::Play, 18.0f, &PlayPauseImage);
     PlayPauseIcon = PlayPauseImage;
     LiveButton = MakeIconLabelButton(WidgetTree, TEXT("LiveButton"),
         JusyncHUDIcons::EIcon::Live, FText::FromString(TEXT("LIVE")),
-        LOCTEXT("LiveTip", "Stop the playback and follow the live edge of the stream"),
         13.0f, 9.5f);
     LiveButton->SetStyle(MakeLiveButtonStyle());
 
@@ -743,9 +793,98 @@ void UJusyncPlaybackWidget::BuildLayout()
     ScrubSlider->SetMinValue(0.0f);
     ScrubSlider->SetMaxValue(1.0f);
     ScrubSlider->SetStepSize(0.0f);
-    ScrubSlider->SetIndentHandle(false);
+    ScrubSlider->SetIndentHandle(true);
     ScrubSlider->SetWidgetStyle(MakeSliderStyle());
-    USizeBox* ScrubBox = MakeSizeBox(WidgetTree, ScrubSlider, -1.0f, 16.0f);
+
+    constexpr float ScrubThumbSize = Scrub::ThumbSize;
+    constexpr float ScrubVisualHeight = Scrub::Height;
+
+    ScrubVisual = WidgetTree->ConstructWidget<UCanvasPanel>(
+        UCanvasPanel::StaticClass(), TEXT("ScrubVisual"));
+    ScrubVisual->SetVisibility(ESlateVisibility::SelfHitTestInvisible);
+
+    auto AddScrubBar = [this](UImage* Image, int32 ZOrder)
+    {
+        Image->SetVisibility(ESlateVisibility::HitTestInvisible);
+        UCanvasPanelSlot* Slot = ScrubVisual->AddChildToCanvas(Image);
+        Slot->SetAnchors(FAnchors(0.0f, 0.0f));
+        Slot->SetAlignment(FVector2D(0.0f, 0.5f));
+        Slot->SetPosition(FVector2D(ScrubThumbSize * 0.5f, Scrub::TrackY));
+        Slot->SetSize(FVector2D(0.0f, Scrub::TrackHeight));
+        Slot->SetZOrder(ZOrder);
+        return Image;
+    };
+
+    auto AddScrubOrnament = [this](UImage* Image, float Size, int32 ZOrder)
+    {
+        Image->SetVisibility(ESlateVisibility::HitTestInvisible);
+        UCanvasPanelSlot* Slot = ScrubVisual->AddChildToCanvas(Image);
+        Slot->SetAnchors(FAnchors(0.0f, 0.0f));
+        Slot->SetAlignment(FVector2D(0.5f, 0.5f));
+        Slot->SetPosition(FVector2D(0.0f, Scrub::TrackY));
+        Slot->SetSize(FVector2D(Size, Size));
+        Slot->SetZOrder(ZOrder);
+        return Image;
+    };
+
+    ScrubTrack = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass(), TEXT("ScrubTrack"));
+    ScrubTrack->SetBrush(FSlateRoundedBoxBrush(FLinearColor(1.0f, 1.0f, 1.0f, 0.10f), 3.0f,
+        FLinearColor(1.0f, 1.0f, 1.0f, 0.07f), 1.0f, FVector2D(0.0f, Scrub::TrackHeight)));
+    AddScrubBar(ScrubTrack, 0);
+
+    ScrubFill = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass(), TEXT("ScrubFill"));
+    ScrubFill->SetBrush(FSlateRoundedBoxBrush(Theme::Accent, 3.0f,
+        FLinearColor(1.0f, 1.0f, 1.0f, 0.32f), 1.0f, FVector2D(0.0f, Scrub::TrackHeight)));
+    AddScrubBar(ScrubFill, 1);
+
+    ScrubGlow = AddScrubOrnament(
+        JusyncHUDFlipbook::MakeImage(WidgetTree, JusyncHUDFlipbook::EClip::Glow,
+            FLinearColor(Theme::Accent.R, Theme::Accent.G, Theme::Accent.B, 0.85f)),
+        52.0f, 2);
+    JusyncHUDFlipbook::Play(ScrubGlow, JusyncHUDFlipbook::EClip::Glow);
+
+    ScrubRipple = AddScrubOrnament(
+        JusyncHUDFlipbook::MakeImage(WidgetTree, JusyncHUDFlipbook::EClip::Ripple,
+            FLinearColor(1.0f, 1.0f, 1.0f, 0.85f)),
+        72.0f, 3);
+
+    ScrubThumbRing = AddScrubOrnament(WidgetTree->ConstructWidget<UImage>(
+        UImage::StaticClass(), TEXT("ScrubThumbRing")), 24.0f, 4);
+    ScrubThumbRing->SetBrush(FSlateRoundedBoxBrush(FLinearColor(0.05f, 0.07f, 0.10f, 0.55f),
+        12.0f, Theme::Accent, 1.5f, FVector2D(24.0f, 24.0f)));
+
+    ScrubThumb = WidgetTree->ConstructWidget<UImage>(UImage::StaticClass(), TEXT("ScrubThumb"));
+    ScrubThumb->SetBrush(FSlateRoundedBoxBrush(Theme::SliderThumb, ScrubThumbSize * 0.5f,
+        FLinearColor(0.0f, 0.0f, 0.0f, 0.30f), 1.0f,
+        FVector2D(ScrubThumbSize, ScrubThumbSize)));
+    AddScrubOrnament(ScrubThumb, ScrubThumbSize, 5);
+
+    ScrubBubble = MakeRoundedBorder(TEXT("ScrubBubble"), FLinearColor(0.055f, 0.065f, 0.085f, 0.94f),
+        Theme::Accent, 5.0f, 1.0f);
+    ScrubBubble->SetVisibility(ESlateVisibility::Collapsed);
+    ScrubBubble->SetRenderOpacity(0.0f);
+    ScrubBubbleText = MakeLabel(TEXT("ScrubBubbleText"), FText::FromString(TEXT("---")));
+    StyleLabel(ScrubBubbleText, 10.0f, Theme::TextPrimary);
+    ScrubBubbleText->SetJustification(ETextJustify::Center);
+    if (UBorderSlot* BubbleTextSlot = Cast<UBorderSlot>(ScrubBubble->AddChild(ScrubBubbleText)))
+    {
+        BubbleTextSlot->SetPadding(FMargin(0.0f));
+        BubbleTextSlot->SetHorizontalAlignment(HAlign_Center);
+        BubbleTextSlot->SetVerticalAlignment(VAlign_Center);
+    }
+    UCanvasPanelSlot* BubbleSlot = ScrubVisual->AddChildToCanvas(ScrubBubble);
+    BubbleSlot->SetAnchors(FAnchors(0.0f, 0.0f));
+    BubbleSlot->SetAlignment(FVector2D(0.5f, 0.5f));
+    BubbleSlot->SetPosition(FVector2D(0.0f, Scrub::BubbleY));
+    BubbleSlot->SetSize(FVector2D(Scrub::BubbleWidth, Scrub::BubbleHeight));
+    BubbleSlot->SetZOrder(6);
+
+    UCanvasPanelSlot* ScrubSliderSlot = ScrubVisual->AddChildToCanvas(ScrubSlider);
+    ScrubSliderSlot->SetAnchors(FAnchors(0.0f, 0.0f, 1.0f, 1.0f));
+    ScrubSliderSlot->SetOffsets(FMargin(0.0f));
+    ScrubSliderSlot->SetZOrder(10);
+
+    USizeBox* ScrubBox = MakeSizeBox(WidgetTree, ScrubVisual, -1.0f, ScrubVisualHeight);
     UVerticalBoxSlot* ScrubSlot = Middle->AddChildToVerticalBox(ScrubBox);
     ScrubSlot->SetHorizontalAlignment(HAlign_Fill);
 
@@ -778,11 +917,9 @@ void UJusyncPlaybackWidget::BuildLayout()
     RateWell->AddChild(RateRow);
 
     RateMinusButton = MakeIconButton(WidgetTree, TEXT("RateMinus"),
-        JusyncHUDIcons::EIcon::Minus,
-        LOCTEXT("RateMinusTip", "Lower the time-step playback rate"), 12.0f);
+        JusyncHUDIcons::EIcon::Minus, 12.0f);
     RatePlusButton = MakeIconButton(WidgetTree, TEXT("RatePlus"),
-        JusyncHUDIcons::EIcon::Plus,
-        LOCTEXT("RatePlusTip", "Raise the time-step playback rate"), 12.0f);
+        JusyncHUDIcons::EIcon::Plus, 12.0f);
     RateMinusButton->SetStyle(MakeButtonStyle(FLinearColor::Transparent,
         FLinearColor(1.0f, 1.0f, 1.0f, 0.08f), FLinearColor(1.0f, 1.0f, 1.0f, 0.14f),
         FLinearColor::Transparent, 4.0f));
@@ -790,7 +927,8 @@ void UJusyncPlaybackWidget::BuildLayout()
         FLinearColor(1.0f, 1.0f, 1.0f, 0.08f), FLinearColor(1.0f, 1.0f, 1.0f, 0.14f),
         FLinearColor::Transparent, 4.0f));
 
-    USizeBox* RateMinusBox = MakeSizeBox(WidgetTree, RateMinusButton, 24.0f, Theme::H3);
+    USizeBox* RateMinusBox = MakeSizeBox(WidgetTree,
+        JusyncHUDFlipbook::WrapButton(WidgetTree, RateMinusButton, true, 10.0f), 24.0f, Theme::H3);
     UHorizontalBoxSlot* RateMinusSlot = RateRow->AddChildToHorizontalBox(RateMinusBox);
     RateMinusSlot->SetVerticalAlignment(VAlign_Center);
 
@@ -802,7 +940,8 @@ void UJusyncPlaybackWidget::BuildLayout()
     RateValueSlot->SetHorizontalAlignment(HAlign_Center);
     RateValueSlot->SetVerticalAlignment(VAlign_Center);
 
-    USizeBox* RatePlusBox = MakeSizeBox(WidgetTree, RatePlusButton, 24.0f, Theme::H3);
+    USizeBox* RatePlusBox = MakeSizeBox(WidgetTree,
+        JusyncHUDFlipbook::WrapButton(WidgetTree, RatePlusButton, true, 10.0f), 24.0f, Theme::H3);
     UHorizontalBoxSlot* RatePlusSlot = RateRow->AddChildToHorizontalBox(RatePlusBox);
     RatePlusSlot->SetVerticalAlignment(VAlign_Center);
 
@@ -813,10 +952,9 @@ void UJusyncPlaybackWidget::BuildLayout()
 
     UVerticalBox* LoopStack = WidgetTree->ConstructWidget<UVerticalBox>(
         UVerticalBox::StaticClass(), TEXT("LoopStack"));
-    LoopSwitch = MakeSwitch(TEXT("LoopSwitch"),
-        LOCTEXT("LoopTip", "Loop the cached playback when it reaches the newest cached frame"),
-        LoopThumb);
-    USizeBox* LoopBox = MakeSizeBox(WidgetTree, LoopSwitch, 36.0f, 20.0f);
+    LoopSwitch = MakeSwitch(TEXT("LoopSwitch"), LoopThumb);
+    USizeBox* LoopBox = MakeSizeBox(WidgetTree,
+        JusyncHUDFlipbook::WrapButton(WidgetTree, LoopSwitch, true, 8.0f), 36.0f, 20.0f);
     UVerticalBoxSlot* LoopSlot = LoopStack->AddChildToVerticalBox(LoopBox);
     LoopSlot->SetHorizontalAlignment(HAlign_Center);
 
@@ -841,33 +979,6 @@ UTextBlock* UJusyncPlaybackWidget::MakeLabel(const FName Name, const FText& Labe
     return Text;
 }
 
-UButton* UJusyncPlaybackWidget::MakeButton(const FName Name, const FText& Label,
-    const FText& Tooltip, TObjectPtr<UTextBlock>* OutCaption, float FontSize)
-{
-    UButton* Button = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass(), Name);
-    Button->SetToolTipText(Tooltip);
-    Button->SetStyle(MakeButtonStyle(Theme::ChipIdle, Theme::ChipHover, Theme::ChipPressed,
-        Theme::ChipDisabled, 8.0f));
-    Button->SetClickMethod(EButtonClickMethod::Type::PreciseClick);
-
-    UTextBlock* Caption = MakeLabel(NAME_None, Label);
-    StyleLabel(Caption, FontSize, Theme::TextPrimary);
-    Caption->SetJustification(ETextJustify::Center);
-    Button->AddChild(Caption);
-    if (OutCaption)
-    {
-        *OutCaption = Caption;
-    }
-
-    if (UButtonSlot* CaptionSlot = Cast<UButtonSlot>(Caption->Slot))
-    {
-        CaptionSlot->SetPadding(FMargin(0.0f));
-        CaptionSlot->SetHorizontalAlignment(HAlign_Center);
-        CaptionSlot->SetVerticalAlignment(VAlign_Center);
-    }
-    return Button;
-}
-
 UBorder* UJusyncPlaybackWidget::MakeRoundedBorder(const FName Name, const FLinearColor& Fill,
     const FLinearColor& Outline, float Radius, float OutlineWidth, const FMargin& InPadding)
 {
@@ -877,11 +988,10 @@ UBorder* UJusyncPlaybackWidget::MakeRoundedBorder(const FName Name, const FLinea
     return Border;
 }
 
-UButton* UJusyncPlaybackWidget::MakeSwitch(const FName Name, const FText& Tooltip,
+UButton* UJusyncPlaybackWidget::MakeSwitch(const FName Name,
     TObjectPtr<UBorder>& OutThumb)
 {
     UButton* Button = WidgetTree->ConstructWidget<UButton>(UButton::StaticClass(), Name);
-    Button->SetToolTipText(Tooltip);
     Button->SetStyle(MakeButtonStyle(FLinearColor::White, FLinearColor::White,
         FLinearColor(0.85f, 0.85f, 0.85f, 1.0f), FLinearColor(0.3f, 0.3f, 0.3f, 0.5f), 10.0f));
     Button->SetClickMethod(EButtonClickMethod::Type::PreciseClick);
@@ -1013,6 +1123,12 @@ void UJusyncPlaybackWidget::Refresh()
             ? FString::Printf(TEXT("%.2f S"), SampleTime)
             : TEXT("--")));
     }
+    if (ScrubBubbleText)
+    {
+        ScrubBubbleText->SetText(FText::FromString(Count > 0
+            ? FString::Printf(TEXT("%03d"), Index + 1)
+            : TEXT("--")));
+    }
     if (RateValueText)
     {
         const int32 Rate = Spawner
@@ -1096,7 +1212,6 @@ void UJusyncPlaybackWidget::HandleSliderChanged(float Value)
         return;
     }
 
-    ClearPlaybackMorphWindow();
     Spawner->SetPlaybackPosition(Value);
     bCachedPlaybackRunning = false;
     CachedPlaybackAccumulator = 0.0f;
@@ -1106,6 +1221,7 @@ void UJusyncPlaybackWidget::HandleSliderChanged(float Value)
 void UJusyncPlaybackWidget::HandleSliderCaptureBegin()
 {
     bDraggingSlider = true;
+    JusyncHUDFlipbook::Play(ScrubRipple, JusyncHUDFlipbook::EClip::Ripple, 1.0f);
 }
 
 void UJusyncPlaybackWidget::HandleSliderCaptureEnd()
@@ -1119,7 +1235,6 @@ void UJusyncPlaybackWidget::HandlePrevClicked()
     {
         bCachedPlaybackRunning = false;
         CachedPlaybackAccumulator = 0.0f;
-        ClearPlaybackMorphWindow();
         Spawner->PlaybackPreviousSample();
         Refresh();
     }
@@ -1131,7 +1246,6 @@ void UJusyncPlaybackWidget::HandleNextClicked()
     {
         bCachedPlaybackRunning = false;
         CachedPlaybackAccumulator = 0.0f;
-        ClearPlaybackMorphWindow();
         Spawner->PlaybackNextSample();
         Refresh();
     }
@@ -1143,7 +1257,6 @@ void UJusyncPlaybackWidget::HandleLiveClicked()
     {
         bCachedPlaybackRunning = false;
         CachedPlaybackAccumulator = 0.0f;
-        ClearPlaybackMorphWindow();
         bAutoLoopPlaybackSuppressed = true;
         Spawner->FollowLatestSample();
         Refresh();
@@ -1161,7 +1274,6 @@ void UJusyncPlaybackWidget::HandlePlayPauseClicked()
     {
         bCachedPlaybackRunning = false;
         CachedPlaybackAccumulator = 0.0f;
-        ClearPlaybackMorphWindow();
         bAutoLoopPlaybackSuppressed = true;
         Refresh();
         return;
@@ -1176,15 +1288,17 @@ void UJusyncPlaybackWidget::HandlePlayPauseClicked()
     const int32 Index = FMath::Clamp(Spawner->GetPlaybackSampleIndex(), 0, Count - 1);
     if (!Spawner->IsPlayingCachedSample() || Index >= Count - 1)
     {
-        ClearPlaybackMorphWindow();
         Spawner->SetPlaybackPosition(0.0f);
     }
 
     bAutoLoopPlaybackSuppressed = false;
 
-    SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
 
     CachedPlaybackAccumulator = 0.0f;
+    // TickCachedPlayback reads a changed sample count as "the sender kept
+    // streaming" and jumps to live, so this replay must record the count it
+    // starts from - otherwise the button lands on the last timestep instantly.
+    CachedPlaybackStartCount = Count;
     bCachedPlaybackRunning = true;
     Refresh();
 }
@@ -1197,7 +1311,6 @@ void UJusyncPlaybackWidget::HandleRateMinus()
         Spawner->TimeStepPlaybackFPS = static_cast<float>(FMath::Clamp(Current - 1, 1, 240));
         if (bCachedPlaybackRunning)
         {
-            SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
         }
         Refresh();
     }
@@ -1211,7 +1324,6 @@ void UJusyncPlaybackWidget::HandleRatePlus()
         Spawner->TimeStepPlaybackFPS = static_cast<float>(FMath::Clamp(Current + 1, 1, 240));
         if (bCachedPlaybackRunning)
         {
-            SetPlaybackMorphWindow(Spawner->TimeStepPlaybackFPS);
         }
         Refresh();
     }

@@ -333,6 +333,30 @@ public:
         meta = (ClampMin = "0", ClampMax = "4", EditCondition = "bEnablePathlines", EditConditionHides))
     float PathlineEmissiveStrength;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
+        meta = (ClampMin = "0.0", ClampMax = "4.0", EditCondition = "bEnablePathlines", EditConditionHides))
+    float PathlineFlowSpeed;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
+        meta = (ClampMin = "0.0", ClampMax = "24.0", EditCondition = "bEnablePathlines", EditConditionHides))
+    float PathlineFlowStrength;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
+        meta = (ClampMin = "0.5", ClampMax = "12.0", EditCondition = "bEnablePathlines", EditConditionHides))
+    float PathlineFlowSharpness;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
+        meta = (ClampMin = "1", ClampMax = "16", EditCondition = "bEnablePathlines", EditConditionHides))
+    int32 PathlineSegmentSubdiv;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
+        meta = (ClampMin = "0.0", ClampMax = "8.0", EditCondition = "bEnablePathlines", EditConditionHides))
+    float PathlineCometArrowWidth;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Pathlines",
+        meta = (ClampMin = "0.02", ClampMax = "0.5", EditCondition = "bEnablePathlines", EditConditionHides))
+    float PathlineCometArrowSpan;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Points")
     bool bPointCloudsVisible;
 
@@ -738,6 +762,10 @@ private:
     UPROPERTY(Transient)
     TObjectPtr<class UMaterialParameterCollection> PathlineGlowCollection;
     float LastPathlineGlow = -1.0f;
+    // Each pushed array set feeds this; it decays every tick so the ribbons
+    // brighten while the stream is busy and settle when it idles.
+    float PathlinePulseEnergy = 0.0f;
+    double LastPathlinePulseTime = 0.0;
     bool bPathlineGlowMissingWarned = false;
     TMap<FString, float> PendingDeletedFiles;
     TMap<FString, FString> PCElementToFilename;
@@ -850,6 +878,9 @@ private:
     void ClearSampleCache();
     void FlushPendingLiveSamples();
     void ApplyCachedSample(float NormalizedPosition);
+    int32 ResolvePlaybackMorphMs() const;
+    void ApplyPlaybackMorphWindow(int32 WindowMs);
+    int32 PlaybackMorphWindowMs = 0;
     int32 GetMaxSampleCacheCount() const;
     void GetSampleTimeline(TArray<uint64>& OutSampleIds) const;
     double LookupSampleTime(uint64 InSampleId) const;

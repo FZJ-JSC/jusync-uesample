@@ -12,6 +12,10 @@
 
 namespace
 {
+	// 30 Hz keeps the flow band smooth at 0.55 bands/s while the rebuild stays
+	// well under a millisecond for a few thousand nodes.
+	constexpr double FlowRebuildIntervalSeconds = 1.0 / 30.0;
+
 	struct FPathlineKey
 	{
 		int32 Rank = 0;
@@ -49,6 +53,7 @@ namespace
 		FPathlineKey Key;
 		TArray<FPathlineNode> Nodes;
 		uint64 LastSeenCounter = 0;
+		double FirstSeenSeconds = 0.0;
 	};
 
 	struct FElementState
@@ -271,6 +276,10 @@ struct FJUSYNCPathlineManager::FImpl
 	std::atomic<uint64> Generation{ 0 };
 
 	uint64 DisplaySampleId = TNumericLimits<uint64>::Max();
+	// Sample that was on screen when the current tip blend was armed. The build
+	// interpolates the nodes between it and DisplaySampleId, which is what makes
+	// the trail advance and retract instead of popping in either direction.
+	uint64 BlendFromSampleId = TNumericLimits<uint64>::Max();
 	bool bResampleRequested = false;
 	bool bRebuildQueued = false;
 
@@ -279,11 +288,16 @@ struct FJUSYNCPathlineManager::FImpl
 	double TipBlendStartSeconds = 0.0;
 	bool bTipBlendActive = false;
 
+	// Flow moves with wall time, so it needs its own rebuild cadence; nothing
+	// else re-emits the trail while the sender is idle.
+	double LastFlowRebuildSeconds = 0.0;
+
 	void ClearLocked()
 	{
 		Elements.Reset();
 		Stats = FJUSYNCPathlineStats();
 		DisplaySampleId = TNumericLimits<uint64>::Max();
+		BlendFromSampleId = TNumericLimits<uint64>::Max();
 		bTipBlendActive = false;
 		TipBlendAlpha = 0.0f;
 		Generation.fetch_add(1);
@@ -588,7 +602,7 @@ struct FJUSYNCPathlineManager::FImpl
 		OutArrays.Reset();
 		OutVisibleTracks = 0;
 
-		const FElementState* Element = Elements.Find(ElementName);
+		FElementState* Element = Elements.Find(ElementName);
 		if (!Element || !Settings.bEnabled)
 		{
 			Stats.LastBuildMs = (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
@@ -597,10 +611,51 @@ struct FJUSYNCPathlineManager::FImpl
 
 		const float BaseRadius = FMath::Max(0.001f, Settings.Radius * Settings.RadiusScale);
 		const float ColorRange = Settings.ColorMax - Settings.ColorMin;
-		const float TipBlend = FMath::Clamp(TipBlendAlpha, 0.0f, 1.0f);
+		const float BlendAlpha = FMath::Clamp(TipBlendAlpha, 0.0f, 1.0f);
+		const double NowSeconds = FPlatformTime::Seconds();
+
+		// Interpolation window between the sample that was displayed and the one
+		// being shown now. Only the nodes between the two cutoffs move, so a step
+		// forward grows the trail out of its old tip and a step back retracts it,
+		// instead of the newest segment popping in one direction only.
+		// Callers already hold StateLock.
+		uint64 BlendFromCutoff = CutoffSampleId;
+		if (BlendAlpha > 0.0f && TipBlendSeconds > 0.0f &&
+			BlendFromSampleId != TNumericLimits<uint64>::Max() &&
+			BlendFromSampleId != CutoffSampleId)
+		{
+			BlendFromCutoff = BlendFromSampleId;
+		}
+
+		struct FCutoffBlend
+		{
+			float Alpha = 0.0f;
+			uint64 LowCutoff = 0;
+			uint64 DisplayCutoff = 0;
+			FVector FromTip = FVector::ZeroVector;
+			FVector ToTip = FVector::ZeroVector;
+		};
+
+		// One shaded vertex. The band is evaluated on these so it can be sampled
+		// finer than the history points allow.
+		struct FRunSample
+		{
+			FVector Position = FVector::ZeroVector;
+			FLinearColor Color = FLinearColor::White;
+			float Width = 0.0f;
+			float Scalar = 0.0f;
+			float ArcNorm = 0.0f;
+		};
+
+		// Refreshed per track, consumed by EmitRun.
+		FCutoffBlend TrackBlend;
+		float TrackReveal = 1.0f;
+		float TrackIdleFade = 1.0f;
+		float TrackSpeedRef = 1.0f;
 
 		TArray<const FPathlineNode*> Visible;
 		Visible.Reserve(Settings.HistorySamples + 4);
+		TArray<FRunSample> RunSamples;
 
 		float Order = 0.0f;
 		bool bHasPreviousRun = false;
@@ -639,7 +694,7 @@ struct FJUSYNCPathlineManager::FImpl
 		};
 
 		auto EmitRun = [&](int32 StartIndex, int32 EndIndex,
-			const FPathlineNode* TipNext, float TipBlendAmount)
+			const FCutoffBlend& Blend)
 		{
 			if (EndIndex <= StartIndex)
 			{
@@ -657,6 +712,9 @@ struct FJUSYNCPathlineManager::FImpl
 				EmitPoint(Visible[StartIndex]->Position, 0.0f, FirstColor, 0.0f);
 			}
 
+			RunSamples.Reset();
+			RunSamples.Reserve((EndIndex - StartIndex + 1) * Settings.SegmentSubdiv);
+
 			for (int32 NodeIndex = StartIndex; NodeIndex <= EndIndex; ++NodeIndex)
 			{
 				const FPathlineNode& Node = *Visible[NodeIndex];
@@ -666,39 +724,177 @@ struct FJUSYNCPathlineManager::FImpl
 				ResolvePoint(Node, Width, Color, Scalar);
 
 				FVector Position = Node.Position;
-				if (TipNext && TipBlendAmount > 0.0f && !TipNext->bBreak &&
-					NodeIndex == Visible.Num() - 1)
+				float BlendFade = 1.0f;
+				if (Blend.Alpha > 0.0f && Node.SampleId > Blend.LowCutoff)
 				{
-					Position = FMath::Lerp(Node.Position, TipNext->Position, TipBlendAmount);
+					if (Node.SampleId <= Blend.DisplayCutoff)
+					{
+						// Newly shown: grows out of where the tip used to be.
+						Position = FMath::Lerp(Blend.FromTip, Position, Blend.Alpha);
+					}
+					else
+					{
+						// No longer shown: collapses into the new tip and fades,
+						// so stepping back retracts instead of snapping.
+						Position = FMath::Lerp(Position, Blend.ToTip, Blend.Alpha);
+						BlendFade = 1.0f - Blend.Alpha;
+					}
 				}
-				EmitPoint(Position, Width, Color, Scalar);
+
+				// 0 at the oldest point, 1 at the tip.
+				const float IndexNorm = Visible.Num() > 1
+					? static_cast<float>(NodeIndex) / static_cast<float>(Visible.Num() - 1)
+					: 1.0f;
+
+				// The reveal front sweeps tail to tip: points behind it are fully
+				// drawn, points ahead have zero width, and the front itself is
+				// brightened so a growing trail reads as a stroke being drawn.
+				float RevealMask = 1.0f;
+				float TipGlow = 1.0f;
+				if (TrackReveal < 1.0f)
+				{
+					RevealMask = FMath::Clamp((TrackReveal - IndexNorm) / 0.25f, 0.0f, 1.0f);
+					TipGlow = 1.0f + 6.0f * RevealMask * (1.0f - RevealMask);
+				}
+
+				const FVector& PrevPos = NodeIndex > 0
+					? Visible[NodeIndex - 1]->Position : Node.Position;
+				const FVector& NextPos = NodeIndex + 1 < Visible.Num()
+					? Visible[NodeIndex + 1]->Position : Node.Position;
+				const float SpeedNorm = FMath::Clamp(
+					static_cast<float>(FVector::Dist(PrevPos, Node.Position)) / TrackSpeedRef,
+					0.0f, 1.0f);
+				const float CornerNorm = FMath::Clamp(
+					(1.0f - FVector::DotProduct(
+						(Node.Position - PrevPos).GetSafeNormal(),
+						(NextPos - Node.Position).GetSafeNormal())) * 0.5f,
+					0.0f, 1.0f);
+
+				Width *= FMath::Lerp(1.0f, Settings.SpeedWidthScale, SpeedNorm);
+				Width *= FMath::Lerp(Settings.TailTaper, 1.0f, IndexNorm);
+				Width *= RevealMask * TrackIdleFade * BlendFade;
+				Color *= (1.0f + Settings.CornerBoost * CornerNorm) *
+					TipGlow * (0.35f + 0.65f * RevealMask) * TrackIdleFade * BlendFade;
+
+				FRunSample Sample;
+				Sample.Position = Position;
+				Sample.Color = Color;
+				Sample.Width = Width;
+				Sample.Scalar = Scalar;
+				RunSamples.Add(Sample);
 			}
 
-			PreviousPosition = Visible[EndIndex]->Position;
-			if (TipNext && TipBlendAmount > 0.0f && EndIndex == Visible.Num() - 1)
+			// Measured along the drawn run rather than by node index, so the band
+			// keeps an even speed where samples are unevenly spaced.
+			float RunLength = 0.0f;
+			for (int32 SampleIndex = 1; SampleIndex < RunSamples.Num(); ++SampleIndex)
 			{
-				PreviousPosition = FMath::Lerp(Visible[EndIndex]->Position, TipNext->Position, TipBlendAmount);
+				RunLength += static_cast<float>(FVector::Dist(
+					RunSamples[SampleIndex - 1].Position, RunSamples[SampleIndex].Position));
 			}
-			float UnusedWidth = 0.0f;
-			float UnusedScalar = 0.0f;
-			ResolvePoint(*Visible[EndIndex], UnusedWidth, PreviousColor, UnusedScalar);
+			const float InvRunLength = RunLength > 1e-4f ? 1.0f / RunLength : 0.0f;
+			float Travelled = 0.0f;
+			for (int32 SampleIndex = 0; SampleIndex < RunSamples.Num(); ++SampleIndex)
+			{
+				if (SampleIndex > 0)
+				{
+					Travelled += static_cast<float>(FVector::Dist(
+						RunSamples[SampleIndex - 1].Position, RunSamples[SampleIndex].Position));
+				}
+				RunSamples[SampleIndex].ArcNorm = FMath::Clamp(Travelled * InvRunLength, 0.0f, 1.0f);
+			}
+
+			auto ShadePoint = [&](const FRunSample& Sample)
+			{
+				float Width = Sample.Width;
+				FLinearColor Color = Sample.Color;
+				if (Settings.FlowStrength > 0.0f && Settings.FlowSpeed != 0.0f)
+				{
+					// The head of the band sits where the phase wraps, so it runs
+					// towards the newest sample. Phase is kept in double precision:
+					// at runtime the seconds value is far too large for a float to
+					// resolve a sub-frame step.
+					const double Phase = static_cast<double>(Sample.ArcNorm) *
+						static_cast<double>(Settings.FlowCycles) -
+						NowSeconds * static_cast<double>(Settings.FlowSpeed);
+					const float Cycle =
+						static_cast<float>(Phase - FMath::FloorToDouble(Phase));
+					const float Band = FMath::Pow(
+						Cycle, FMath::Max(Settings.FlowSharpness, 0.01f));
+					Color = FMath::Lerp(Color,
+						Color * (1.0f + Settings.FlowStrength * Band), Band);
+
+					if (Settings.CometArrowWidth > 0.0f)
+					{
+						// Widest a little behind the head and converging to a point at
+						// the head itself, so the front reads as an arrow head rather
+						// than as a blob at the end of the band.
+						const float Span = FMath::Max(Settings.CometArrowSpan, 0.005f);
+						const float Behind = (1.0f - Cycle) / Span;
+						const float Bulge = Behind * FMath::Exp(1.0f - Behind);
+						Width *= 1.0f + Settings.CometArrowWidth * Bulge * Band;
+					}
+				}
+				EmitPoint(Sample.Position, Width, Color, Sample.Scalar);
+			};
+
+			const int32 Subdiv = FMath::Clamp(Settings.SegmentSubdiv, 1, 16);
+			const bool bResample = Subdiv > 1 && Settings.FlowStrength > 0.0f;
+
+			if (!bResample)
+			{
+				for (const FRunSample& Sample : RunSamples)
+				{
+					ShadePoint(Sample);
+				}
+			}
+			else
+			{
+				for (int32 SampleIndex = 1; SampleIndex < RunSamples.Num(); ++SampleIndex)
+				{
+					const FRunSample& A = RunSamples[SampleIndex - 1];
+					const FRunSample& B = RunSamples[SampleIndex];
+					for (int32 Step = 0; Step < Subdiv; ++Step)
+					{
+						const float T = static_cast<float>(Step) / static_cast<float>(Subdiv);
+						FRunSample Sample;
+						Sample.Position = FMath::Lerp(A.Position, B.Position, T);
+						Sample.Color = FMath::Lerp(A.Color, B.Color, T);
+						Sample.Width = FMath::Lerp(A.Width, B.Width, T);
+						Sample.Scalar = FMath::Lerp(A.Scalar, B.Scalar, T);
+						Sample.ArcNorm = FMath::Lerp(A.ArcNorm, B.ArcNorm, T);
+						ShadePoint(Sample);
+					}
+				}
+				const FRunSample Last = RunSamples.Last();
+				ShadePoint(Last);
+			}
+
+			// Kept blended so a following run starts from the tip as drawn.
+			PreviousPosition = RunSamples.Last().Position;
+			PreviousColor = RunSamples.Last().Color;
 			bHasPreviousRun = true;
 		};
 
-		for (const TPair<FPathlineKey, FPathlineTrack>& TrackPair : Element->Tracks)
+		for (TPair<FPathlineKey, FPathlineTrack>& TrackPair : Element->Tracks)
 		{
-			const FPathlineTrack& Track = TrackPair.Value;
+			FPathlineTrack& Track = TrackPair.Value;
 			Visible.Reset();
-			const FPathlineNode* TipNext = nullptr;
 			for (const FPathlineNode& Node : Track.Nodes)
 			{
 				if (Node.SampleId <= CutoffSampleId)
 				{
 					Visible.Add(&Node);
 				}
-				else if (!TipNext)
+				else if (BlendFromCutoff > CutoffSampleId && !Node.bBreak &&
+					Node.SampleId <= BlendFromCutoff)
 				{
-					TipNext = &Node;
+					// Stepping back: keep the nodes that just left the window so
+					// they can retract into the new tip instead of vanishing.
+					Visible.Add(&Node);
+				}
+				else
+				{
 					break;
 				}
 			}
@@ -711,7 +907,79 @@ struct FJUSYNCPathlineManager::FImpl
 				continue;
 			}
 
-			const FPathlineNode& Latest = *Visible.Last();
+			TrackBlend = FCutoffBlend();
+			if (BlendFromCutoff != CutoffSampleId)
+			{
+				const FPathlineNode* FromTip = nullptr;
+				const FPathlineNode* ToTip = nullptr;
+				const uint64 MaxCutoff = FMath::Max(BlendFromCutoff, CutoffSampleId);
+				for (const FPathlineNode& Node : Track.Nodes)
+				{
+					if (Node.SampleId > MaxCutoff)
+					{
+						break;
+					}
+					if (Node.SampleId <= BlendFromCutoff)
+					{
+						FromTip = &Node;
+					}
+					if (Node.SampleId <= CutoffSampleId)
+					{
+						ToTip = &Node;
+					}
+				}
+				if (FromTip && ToTip)
+				{
+					TrackBlend.Alpha = BlendAlpha;
+					TrackBlend.DisplayCutoff = CutoffSampleId;
+					TrackBlend.LowCutoff = FMath::Min(BlendFromCutoff, CutoffSampleId);
+					TrackBlend.FromTip = FromTip->Position;
+					TrackBlend.ToTip = ToTip->Position;
+				}
+			}
+
+			if (Track.FirstSeenSeconds <= 0.0)
+			{
+				Track.FirstSeenSeconds = NowSeconds;
+			}
+			const float StaggerPhase =
+				static_cast<float>(GetTypeHash(Track.Key) % 1000u) / 1000.0f;
+			const float RevealElapsed = static_cast<float>(NowSeconds -
+				Track.FirstSeenSeconds - StaggerPhase * Settings.RevealStaggerSeconds);
+			TrackReveal = Settings.RevealSeconds > 0.0f
+				? FMath::Clamp(RevealElapsed / Settings.RevealSeconds, 0.0f, 1.0f)
+				: 1.0f;
+
+			TrackIdleFade = 1.0f;
+			if (Settings.TrackExpirySamples > 0)
+			{
+				const float Age = static_cast<float>(
+					Element->SampleCounter - Track.LastSeenCounter);
+				const float FadeSpan = FMath::Min(
+					static_cast<float>(Settings.TrackExpirySamples) * 0.5f, 8.0f);
+				TrackIdleFade = FMath::Clamp(
+					(static_cast<float>(Settings.TrackExpirySamples) - Age) /
+					FMath::Max(1.0f, FadeSpan), 0.0f, 1.0f);
+			}
+
+			// Normalising by this track's own longest segment keeps the speed
+			// response independent of world scale and sample cadence.
+			float MaxSegment = 0.0f;
+			for (int32 NodeIndex = 1; NodeIndex < Visible.Num(); ++NodeIndex)
+			{
+				MaxSegment = FMath::Max(MaxSegment, static_cast<float>(FVector::Dist(
+					Visible[NodeIndex - 1]->Position, Visible[NodeIndex]->Position)));
+			}
+			TrackSpeedRef = FMath::Max(MaxSegment, 1e-3f);
+
+			// Retraction nodes sit past the cutoff; filters still describe what is
+			// actually shown at this sample.
+			int32 LatestIndex = Visible.Num() - 1;
+			while (LatestIndex > 0 && Visible[LatestIndex]->SampleId > CutoffSampleId)
+			{
+				--LatestIndex;
+			}
+			const FPathlineNode& Latest = *Visible[LatestIndex];
 			if (Settings.bFilterEnabled)
 			{
 				if (!Latest.bHasScalar ||
@@ -743,11 +1011,11 @@ struct FJUSYNCPathlineManager::FImpl
 			{
 				if (Visible[VisibleIndex]->bBreak)
 				{
-					EmitRun(RunStart, VisibleIndex - 1, nullptr, 0.0f);
+					EmitRun(RunStart, VisibleIndex - 1, TrackBlend);
 					RunStart = VisibleIndex;
 				}
 			}
-			EmitRun(RunStart, Visible.Num() - 1, TipNext, TipBlend);
+			EmitRun(RunStart, Visible.Num() - 1, TrackBlend);
 		}
 
 		Stats.VisibleTracks = OutVisibleTracks;
@@ -966,6 +1234,13 @@ void FJUSYNCPathlineManager::SetSettings(const FJUSYNCPathlineSettings& NewSetti
 			NewSettings.ColorMin != Impl->Settings.ColorMin ||
 			NewSettings.ColorMax != Impl->Settings.ColorMax ||
 			NewSettings.FlatColor != Impl->Settings.FlatColor ||
+			NewSettings.FlowSpeed != Impl->Settings.FlowSpeed ||
+			NewSettings.FlowCycles != Impl->Settings.FlowCycles ||
+			NewSettings.FlowSharpness != Impl->Settings.FlowSharpness ||
+			NewSettings.FlowStrength != Impl->Settings.FlowStrength ||
+			NewSettings.SegmentSubdiv != Impl->Settings.SegmentSubdiv ||
+			NewSettings.CometArrowWidth != Impl->Settings.CometArrowWidth ||
+			NewSettings.CometArrowSpan != Impl->Settings.CometArrowSpan ||
 			NewSettings.Material != Impl->Settings.Material;
 
 		Impl->Settings = NewSettings;
@@ -1129,6 +1404,7 @@ void FJUSYNCPathlineManager::SetDisplaySampleId(uint64 SampleId)
 		FScopeLock Lock(&Impl->StateLock);
 		if (Impl->DisplaySampleId != SampleId)
 		{
+			Impl->BlendFromSampleId = Impl->DisplaySampleId;
 			Impl->DisplaySampleId = SampleId;
 			Impl->TipBlendAlpha = 0.0f;
 			Impl->bTipBlendActive =
@@ -1179,6 +1455,20 @@ void FJUSYNCPathlineManager::TickDisplayBlend()
 			else if (!FMath::IsNearlyEqual(Alpha, Impl->TipBlendAlpha, 0.004f))
 			{
 				Impl->TipBlendAlpha = Alpha;
+				bNeedsRebuild = true;
+			}
+		}
+
+		// The band is evaluated from wall time inside the build, so it only moves
+		// when the arrays are re-emitted. Without this tick a static dataset shows
+		// a frozen gradient and an idle sender shows nothing at all.
+		if (Impl->Settings.bEnabled && Impl->Settings.FlowStrength > 0.0f &&
+			Impl->Settings.FlowSpeed != 0.0f && Impl->Elements.Num() > 0)
+		{
+			const double Now = FPlatformTime::Seconds();
+			if (Now - Impl->LastFlowRebuildSeconds >= FlowRebuildIntervalSeconds)
+			{
+				Impl->LastFlowRebuildSeconds = Now;
 				bNeedsRebuild = true;
 			}
 		}
