@@ -35,6 +35,8 @@ void FreeBuffer_C(unsigned char* buffer);
 }
 #endif
 
+static constexpr int32 ScrubMorphWindowMs = 50;
+
 static bool JUSYNCRequestFileToString(const FString& Filename, int32 Rank, FString& OutBody)
 {
     unsigned char* Data = nullptr;
@@ -113,11 +115,11 @@ static TAutoConsoleVariable<float> CVarJusyncPathlineRadius(
     ECVF_Default);
 
 static TAutoConsoleVariable<float> CVarJusyncPathlineGlow(
-    TEXT("jusync.Pathlines.Glow"), 0.1f,
-    TEXT("Emissive strength of the pathline ribbons: 0 keeps them matte and\n")
-    TEXT("scene-lit only, 20+ makes them bloom. Ribbons are one shared\n")
-    TEXT("material, so the value is applied to MPC_Jusync.PathlineGlow and\n")
-    TEXT("every trail picks it up. The in-game GLOW slider drives this."),
+    TEXT("jusync.Pathlines.Glow"), 1.0f,
+    TEXT("Emissive strength of the pathline ribbons: 0 keeps them invisible, 1\n")
+    TEXT("draws the plain hue, 2+ blooms. Ribbons are one shared material, so the\n")
+    TEXT("value is applied to MPC_Jusync.PathlineGlow and every trail picks it up.\n")
+    TEXT("The in-game GLOW slider drives this."),
     ECVF_Default);
 
 static TAutoConsoleVariable<int32> CVarJusyncPathlineTubeSides(
@@ -569,7 +571,7 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     CloudSteps = 4;  // 0 = legacy instant swap
     CloudBlendMs = 0;
     CloudMaxBlendMs = 200;
-    bCloudFixedSize = true;
+    bCloudFixedSize = false;
     CloudScreenSizePct = 2.7f;
 
     bEnableBenchmarking = true;
@@ -617,6 +619,8 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     PathlineSegmentSubdiv = 6;
     PathlineCometArrowWidth = 3.0f;
     PathlineCometArrowSpan = 0.10f;
+    ElementSpawnRevealSeconds = 0.45f;
+    ElementSpawnRevealScale = 0.15f;
     PathlineSelectionSeed = 1337;
     PathlinePendingTimeoutSeconds = 2.0f;
     PathlineMaterial = nullptr;
@@ -632,7 +636,7 @@ AJUSYNCFileSpawnerActor::AJUSYNCFileSpawnerActor()
     PointCloudHueTolerance = 30.0f;
     PointShape = EJUSYNCPointShape::Square;
     PointOrientation = EJUSYNCPointOrientation::FacingCamera;
-    PointScaling = EJUSYNCPointScaling::FixedScreenSize;
+    PointScaling = EJUSYNCPointScaling::PerNodeAdaptive;
     PointSizeBias = 0.012f;
     GapFillingStrength = 0.0f;
     PointCloudPoolSize = 16;
@@ -1129,6 +1133,14 @@ void AJUSYNCFileSpawnerActor::Tick(float DeltaSeconds)
     if (bInitialSpawnDone)
     {
         FlushHiddenMeshUpdates();
+        TickMeshSpawnReveals();
+
+        UJUSYNCSubsystem* RevealSubsystem = UJUSYNCBlueprintLibrary::GetJUSYNCSubsystem();
+        if (FJUSYNCPointCloudSpawner* RevealPCSpawner =
+                RevealSubsystem ? RevealSubsystem->GetPointCloudSpawner() : nullptr)
+        {
+            RevealPCSpawner->SetSpawnReveal(ElementSpawnRevealSeconds, ElementSpawnRevealScale);
+        }
     }
 
     if (bCommitDiffPending && bInitialSpawnDone && !bSceneDiffInFlight &&
@@ -1712,6 +1724,7 @@ void AJUSYNCFileSpawnerActor::ClearSpawnedActors()
     FileHashHi.Empty();
     GradientPendingMeshes.Empty();
     HiddenPendingMeshUpdates.Empty();
+    MeshSpawnReveals.Reset();
     GradientDeferredMeshes.Empty();
     GradientDeferredReplacementActors.Empty();
     GetWorldTimerManager().ClearTimer(GradientDeferredTimerHandle);
@@ -3612,12 +3625,14 @@ void AJUSYNCFileSpawnerActor::ApplyCachedSample(float NormalizedPosition)
     // after this call returns; saving and restoring the window around the loop
     // below would leave them on the live "auto" value. Keep it applied for as
     // long as playback lasts instead.
-    ApplyPlaybackMorphWindow(bSamplePlaybackActive ? ResolvePlaybackMorphMs() : 0);
+    const bool bScrub = bSamplePlaybackActive && bPlaybackScrubbing;
+    const int32 MorphWindowMs = bScrub ? ScrubMorphWindowMs : ResolvePlaybackMorphMs();
+    ApplyPlaybackMorphWindow(bSamplePlaybackActive ? MorphWindowMs : 0);
 
     if (PathlineManager)
     {
         PathlineManager->SetDisplayTipBlendSeconds(
-            bSamplePlaybackActive ? static_cast<float>(PlaybackMorphWindowMs) / 1000.0f : 0.0f);
+            bSamplePlaybackActive ? static_cast<float>(MorphWindowMs) / 1000.0f : 0.0f);
         PathlineManager->SetDisplaySampleId(SelectedSampleId);
     }
 
@@ -3829,7 +3844,10 @@ void AJUSYNCFileSpawnerActor::SetPlaybackPosition(float NewPosition)
     {
         if (PCSpawner)
         {
-            PCSpawner->EnterPlaybackMode();
+            if (!PCSpawner->IsPlaybackMode())
+            {
+                PCSpawner->EnterPlaybackMode();
+            }
         }
 
         DeferredSpawns.Empty();
@@ -3850,6 +3868,11 @@ void AJUSYNCFileSpawnerActor::SetPlaybackPosition(float NewPosition)
         }
         PlaybackSampleIndex = FMath::Max(0, CachedSampleCount - 1);
     }
+}
+
+void AJUSYNCFileSpawnerActor::SetPlaybackScrubbing(bool bScrubbing)
+{
+    bPlaybackScrubbing = bScrubbing;
 }
 
 void AJUSYNCFileSpawnerActor::PlaybackPreviousSample()
@@ -4001,6 +4024,64 @@ void AJUSYNCFileSpawnerActor::ApplyPointCloudSettingsToSpawner(FJUSYNCPointCloud
             break;
     }
 #endif
+}
+
+void AJUSYNCFileSpawnerActor::BeginMeshSpawnReveal(AActor* Actor)
+{
+    if (!Actor || ElementSpawnRevealSeconds <= 0.0f)
+    {
+        return;
+    }
+
+    FMeshSpawnReveal Reveal;
+    Reveal.Actor = Actor;
+    Reveal.TargetScale = Actor->GetActorScale3D();
+    Reveal.WrittenScale = Reveal.TargetScale;
+    Reveal.StartSeconds = FPlatformTime::Seconds();
+    MeshSpawnReveals.Add(Reveal);
+}
+
+void AJUSYNCFileSpawnerActor::TickMeshSpawnReveals()
+{
+    if (MeshSpawnReveals.Num() == 0)
+    {
+        return;
+    }
+
+    const double NowSeconds = FPlatformTime::Seconds();
+    const float Duration = FMath::Max(ElementSpawnRevealSeconds, 0.001f);
+    const float StartScale = FMath::Clamp(ElementSpawnRevealScale, 0.005f, 1.0f);
+
+    for (int32 Index = MeshSpawnReveals.Num() - 1; Index >= 0; --Index)
+    {
+        FMeshSpawnReveal& Reveal = MeshSpawnReveals[Index];
+        AActor* Actor = Reveal.Actor.Get();
+        if (!Actor || !Actor->IsValidLowLevel())
+        {
+            MeshSpawnReveals.RemoveAtSwap(Index);
+            continue;
+        }
+
+        if (Reveal.bHasWritten && !Actor->GetActorScale3D().Equals(Reveal.WrittenScale, 1e-3))
+        {
+            MeshSpawnReveals.RemoveAtSwap(Index);
+            continue;
+        }
+
+        const float Alpha = FMath::Clamp(
+            static_cast<float>(NowSeconds - Reveal.StartSeconds) / Duration, 0.0f, 1.0f);
+        if (Alpha >= 1.0f)
+        {
+            Actor->SetActorScale3D(Reveal.TargetScale);
+            MeshSpawnReveals.RemoveAtSwap(Index);
+            continue;
+        }
+
+        const float Eased = 1.0f - FMath::Pow(1.0f - Alpha, 3.0f);
+        Reveal.WrittenScale = Reveal.TargetScale * FMath::Lerp(StartScale, 1.0f, Eased);
+        Reveal.bHasWritten = true;
+        Actor->SetActorScale3D(Reveal.WrittenScale);
+    }
 }
 
 void AJUSYNCFileSpawnerActor::FlushHiddenMeshUpdates()
@@ -4274,6 +4355,8 @@ AActor* AJUSYNCFileSpawnerActor::SpawnOrUpdateMesh(FJUSYNCCompactMeshRef& Mesh, 
         {
             Actor->SetActorScale3D(bUseUniformScaling ? FVector(SpawnScale.X) : FVector(SpawnScale));
         }
+
+        BeginMeshSpawnReveal(Actor);
 
         OnFileComplete.Broadcast(Filename, Actor);
         NextSpawnIndex++;

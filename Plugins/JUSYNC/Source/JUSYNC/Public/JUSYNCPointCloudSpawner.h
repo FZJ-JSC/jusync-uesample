@@ -119,6 +119,8 @@ public:
 
     void SetPointHueFilter(bool bEnabled, float HueDeg, float ToleranceDeg);
 
+    void SetSpawnReveal(float Seconds, float StartScale);
+
     void SetGradientColorsEnabled(bool bEnabled);
     bool AreGradientColorsEnabled() const { return bGradientColorsEnabled; }
 
@@ -171,6 +173,17 @@ private:
     float PointHue = 0.0f;
     float PointHueTolerance = 30.0f;
     void ApplyPointCloudsHiddenToActors();
+
+    float SpawnRevealSeconds = 0.0f;
+    float SpawnRevealStartScale = 0.15f;
+    struct FSpawnRevealState
+    {
+        double StartSeconds = 0.0;
+        bool bDone = false;
+    };
+    TMap<TWeakObjectPtr<AActor>, FSpawnRevealState> SpawnRevealStates;
+    float EvaluateSpawnReveal(AActor* Actor, double NowSeconds);
+    static bool HasRenderableCloud(AActor* Actor);
 
 #ifdef WITH_ANARI_USD_MIDDLEWARE
     void ApplyPointHueFilterToCloud(ULidarPointCloud* Cloud);
@@ -257,6 +270,8 @@ private:
     TMap<FString, FCloudRampChain> RampChains;
 
     TMap<FString, TArray<FVector3f>> CloudDisplayPos;
+    TMap<FString, TArray<uint64>> CloudDisplayIds;
+    TMap<FString, TArray<uint64>> CloudSlotIds;
     TMap<FString, double> CloudLastArrival;
 
     struct FCloudSmoothMorph
@@ -283,6 +298,7 @@ private:
     bool ShouldStartCloudRamp(const FString& Key, double NowSeconds) const;
     void KickRampStep(const FString& Key, FCloudRampChain& Chain);
     void AbortDeferredSwap(const FString& Key);
+    void DiscardInFlightCloud(const FString& Key);
     void TickCloudRamps(double NowSeconds);
 
     struct FPlaybackCloudReuse

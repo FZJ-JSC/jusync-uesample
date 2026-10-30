@@ -357,6 +357,14 @@ public:
         meta = (ClampMin = "0.02", ClampMax = "0.5", EditCondition = "bEnablePathlines", EditConditionHides))
     float PathlineCometArrowSpan;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner",
+        meta = (ClampMin = "0.0", ClampMax = "5.0"))
+    float ElementSpawnRevealSeconds;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner",
+        meta = (ClampMin = "0.005", ClampMax = "1.0"))
+    float ElementSpawnRevealScale;
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "JUSYNC|Spawner|Points")
     bool bPointCloudsVisible;
 
@@ -532,6 +540,9 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
     void SetPlaybackPosition(float NewPosition);
+
+    UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
+    void SetPlaybackScrubbing(bool bScrubbing);
 
     UFUNCTION(BlueprintCallable, Category = "JUSYNC|Spawner|Playback")
     void PlaybackPreviousSample();
@@ -726,6 +737,18 @@ private:
     TMap<AActor*, FRecolorMeshEntry> GradientPendingMeshes;
     TMap<AActor*, FRecolorMeshEntry> HiddenPendingMeshUpdates;
 
+    struct FMeshSpawnReveal
+    {
+        TWeakObjectPtr<AActor> Actor;
+        FVector TargetScale = FVector::OneVector;
+        FVector WrittenScale = FVector::OneVector;
+        double StartSeconds = 0.0;
+        bool bHasWritten = false;
+    };
+    TArray<FMeshSpawnReveal> MeshSpawnReveals;
+    void BeginMeshSpawnReveal(AActor* Actor);
+    void TickMeshSpawnReveals();
+
     TMap<FString, TWeakObjectPtr<UTexture2D>> MeshTextureCache;
     TWeakObjectPtr<UTexture2D> ActiveMeshTexture;
     std::atomic<bool> bMeshTextureLoading;
@@ -881,6 +904,7 @@ private:
     int32 ResolvePlaybackMorphMs() const;
     void ApplyPlaybackMorphWindow(int32 WindowMs);
     int32 PlaybackMorphWindowMs = 0;
+    bool bPlaybackScrubbing = false;
     int32 GetMaxSampleCacheCount() const;
     void GetSampleTimeline(TArray<uint64>& OutSampleIds) const;
     double LookupSampleTime(uint64 InSampleId) const;

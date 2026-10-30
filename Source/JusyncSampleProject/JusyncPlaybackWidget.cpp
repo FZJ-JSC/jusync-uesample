@@ -1221,12 +1221,20 @@ void UJusyncPlaybackWidget::HandleSliderChanged(float Value)
 void UJusyncPlaybackWidget::HandleSliderCaptureBegin()
 {
     bDraggingSlider = true;
+    if (Spawner)
+    {
+        Spawner->SetPlaybackScrubbing(true);
+    }
     JusyncHUDFlipbook::Play(ScrubRipple, JusyncHUDFlipbook::EClip::Ripple, 1.0f);
 }
 
 void UJusyncPlaybackWidget::HandleSliderCaptureEnd()
 {
     bDraggingSlider = false;
+    if (Spawner)
+    {
+        Spawner->SetPlaybackScrubbing(false);
+    }
 }
 
 void UJusyncPlaybackWidget::HandlePrevClicked()

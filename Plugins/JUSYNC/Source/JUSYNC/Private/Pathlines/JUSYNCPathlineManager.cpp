@@ -280,6 +280,7 @@ struct FJUSYNCPathlineManager::FImpl
 	// interpolates the nodes between it and DisplaySampleId, which is what makes
 	// the trail advance and retract instead of popping in either direction.
 	uint64 BlendFromSampleId = TNumericLimits<uint64>::Max();
+	uint64 LiveHeadSampleId = TNumericLimits<uint64>::Max();
 	bool bResampleRequested = false;
 	bool bRebuildQueued = false;
 
@@ -298,6 +299,7 @@ struct FJUSYNCPathlineManager::FImpl
 		Stats = FJUSYNCPathlineStats();
 		DisplaySampleId = TNumericLimits<uint64>::Max();
 		BlendFromSampleId = TNumericLimits<uint64>::Max();
+		LiveHeadSampleId = TNumericLimits<uint64>::Max();
 		bTipBlendActive = false;
 		TipBlendAlpha = 0.0f;
 		Generation.fetch_add(1);
@@ -590,6 +592,8 @@ struct FJUSYNCPathlineManager::FImpl
 		{
 			RankPreviousKeys.Add(Pair.Key);
 		}
+
+		LiveHeadSampleId = FMath::Max(LiveHeadSampleId, SampleId);
 
 		RefreshTotalsLocked();
 		Stats.LastIngestMs = (FPlatformTime::Seconds() - StartSeconds) * 1000.0;
@@ -1404,12 +1408,21 @@ void FJUSYNCPathlineManager::SetDisplaySampleId(uint64 SampleId)
 		FScopeLock Lock(&Impl->StateLock);
 		if (Impl->DisplaySampleId != SampleId)
 		{
-			Impl->BlendFromSampleId = Impl->DisplaySampleId;
+			const bool bContinueBlend = Impl->bTipBlendActive &&
+				Impl->TipBlendAlpha > 0.0f && Impl->TipBlendAlpha < 1.0f &&
+				Impl->BlendFromSampleId != TNumericLimits<uint64>::Max() &&
+				SampleId != TNumericLimits<uint64>::Max();
+			if (!bContinueBlend)
+			{
+				Impl->BlendFromSampleId = Impl->DisplaySampleId != TNumericLimits<uint64>::Max()
+					? Impl->DisplaySampleId
+					: Impl->LiveHeadSampleId;
+				Impl->TipBlendAlpha = 0.0f;
+				Impl->TipBlendStartSeconds = FPlatformTime::Seconds();
+			}
 			Impl->DisplaySampleId = SampleId;
-			Impl->TipBlendAlpha = 0.0f;
 			Impl->bTipBlendActive =
 				Impl->TipBlendSeconds > 0.0f && SampleId != TNumericLimits<uint64>::Max();
-			Impl->TipBlendStartSeconds = FPlatformTime::Seconds();
 			bChanged = true;
 		}
 	}
